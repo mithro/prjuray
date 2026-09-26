@@ -331,13 +331,22 @@ def _collect_one(item):
 # (tile type, region), then the pickled index {key: (offset, length, used,
 # empty)} plus stamp, then an 8 byte trailer with the index offset.  A
 # chunk is ([(sorted feature tuple, bit list)] of used tiles, same for
-# empty tiles).  The stamp (inputs' mtimes and sizes) invalidates it.
+# empty tiles).  The stamp (inputs' mtimes and sizes, features.py checksum)
+# invalidates it.
 # (pickle: the cache is private to the build tree and written only here.)
 CACHE_VERSION = 2  # 2: zlib compressed chunks
 
 
+def _code_stamp():
+    """Checksum of the feature extraction code: changing how features are
+    derived from the dumps must invalidate cached samples."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(here, 'features.py'), 'rb') as f:
+        return zlib.crc32(f.read())
+
+
 def _cache_stamp(arch, dn, d):
-    st = [CACHE_VERSION]
+    st = [CACHE_VERSION, _code_stamp()]
     for p in (os.path.join(d, 'bits.npz'),
               os.path.join(d, 'design.features.gz'),
               os.path.join(dieslib.DB, arch, dn, 'tilegrid.json')):
