@@ -74,6 +74,51 @@ proc _df_bidir_dirs {net} {
     return $res
 }
 
+# Direction of all used bidirectional PIPs (given the used PIP names): a
+# dict pip -> 1 (uphill to downhill) or 0 (reversed).  The route tree
+# printed by report_route_status names, for every PIP, the node it drives;
+# nets it cannot be read from fall back to walking the net (_df_bidir_dirs).
+proc _df_bidir_all {pips} {
+    set res [dict create]
+    set bp [list]
+    foreach p $pips {
+        if {[string first "<<->>" $p] >= 0} { lappend bp $p }
+    }
+    if {[llength $bp] == 0} { return $res }
+    foreach net [get_nets -quiet -of_objects [get_pips -quiet $bp]] {
+        if {[catch {report_route_status -of_objects $net -return_string} rep]} {
+            set rep ""
+        }
+        set found [dict create]
+        foreach {- node pip} [regexp -all -inline {(\S+) \(\s*\d+\)\s+(\S+<<->>\S+)} $rep] {
+            dict set found $pip $node
+        }
+        set ok 1
+        set part [dict create]
+        foreach p [get_pips -quiet -of_objects $net -filter {IS_DIRECTIONAL == 0}] {
+            if {![dict exists $found $p]} { set ok 0; break }
+            set sl [string first / $p]
+            set tile [string range $p 0 [expr {$sl - 1}]]
+            set rest [string range $p [expr {[string first . $p $sl] + 1}] end]
+            lassign [split [string map {"<<->>" "\t"} $rest] "\t"] w0 w1
+            set n0 [get_nodes -quiet -of_objects [get_wires -quiet $tile/$w0]]
+            set n1 [get_nodes -quiet -of_objects [get_wires -quiet $tile/$w1]]
+            set to [dict get $found $p]
+            if {$to eq $n1} {
+                dict set part $p 1
+            } elseif {$to eq $n0} {
+                dict set part $p 0
+            } else {
+                set ok 0
+                break
+            }
+        }
+        if {!$ok} { set part [_df_bidir_dirs $net] }
+        set res [dict merge $res $part]
+    }
+    return $res
+}
+
 # get_property over a list of objects, falling back to one query per object
 # when values containing spaces (or empty values) break the returned list.
 proc _df_props {prop objs} {
@@ -102,14 +147,12 @@ proc dump_features {out} {
         }
     }
     set t0 [clock milliseconds]
+    set allpips [lsort -unique [get_pips -quiet -of_objects [get_nets -hierarchical -quiet]]]
     # Direction of used bidirectional PIPs.
-    set bidir [dict create]
-    foreach net [get_nets -quiet -of_objects [get_pips -quiet -of_objects [get_nets -hierarchical -quiet] -filter {IS_DIRECTIONAL == 0}]] {
-        set bidir [dict merge $bidir [_df_bidir_dirs $net]]
-    }
+    set bidir [_df_bidir_all $allpips]
     puts $fp "# t_bidir [expr {[clock milliseconds] - $t0}]"
     # Routing PIPs, including pseudo pips (LUT route-throughs etc).
-    foreach pip [lsort -unique [get_pips -quiet -of_objects [get_nets -hierarchical -quiet]]] {
+    foreach pip $allpips {
         set sl [string first / $pip]
         set tile [string range $pip 0 [expr {$sl - 1}]]
         set name [string range $pip [expr {$sl + 1}] end]
