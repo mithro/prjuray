@@ -16,8 +16,11 @@ proc nl_log {msg} {
 proc nl_init {part} {
     global nl_logfp
     set nl_logfp [open nl.log w]
+    # Wall clock stamps (ms since the epoch) for run time accounting.
+    nl_log "t_start [clock milliseconds]"
     create_project -in_memory -part $part
     link_design -part $part
+    nl_log "t_linked [clock milliseconds]"
     set_param messaging.defaultLimit 100000
     set_param general.maxThreads 2
     create_cell -reference GND nl_gnd
@@ -420,6 +423,7 @@ proc nl_const_offenders {txt} {
 set nl_orphans [list]
 proc nl_finish {{relaxclk 0}} {
     set t0 [clock seconds]
+    nl_log "t_built [clock milliseconds]"
     global nl_orphans
     if {[llength $nl_orphans]} {
         nl_log "orphans [llength $nl_orphans]"
