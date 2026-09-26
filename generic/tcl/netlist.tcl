@@ -143,6 +143,31 @@ proc nl_port {name dir pin} {
     }
 }
 
+# Top level port on the bonded package pin of <site> whose PIN_FUNC matches
+# <func>, connected to cell pin <pin> (dedicated pads of GTs, reference
+# clock buffers, ...).  Without such a pin the cell is removed.
+proc nl_padpin {name pin site func dir} {
+    set p [get_pins -quiet $pin]
+    if {$p eq ""} return
+    set pp ""
+    foreach x [get_package_pins -quiet -of_objects [get_sites -quiet $site]] {
+        if {[regexp $func [get_property PIN_FUNC $x]]} { set pp $x; break }
+    }
+    if {$pp eq "" || [llength [get_ports -quiet -of_objects $pp]]} {
+        nl_log "padless $name $site"
+        catch {remove_cell [get_cells -of_objects $p]}
+        return
+    }
+    if {[catch {
+        create_port -direction $dir $name
+        create_net ${name}_pad
+        connect_net -net ${name}_pad -objects [list [get_ports $name] $p]
+        set_property PACKAGE_PIN $pp [get_ports $name]
+    } e]} {
+        nl_log "padpinerr $name [string range $e 0 200]"
+    }
+}
+
 # Returns generated cell names mentioned in ERROR messages written to
 # vivado.log since the last call.
 set nl_logpos 0
@@ -177,10 +202,21 @@ proc nl_offenders {{extra ""}} {
         } elseif {[regexp {^(INFO|WARNING|CRITICAL WARNING|Phase|Resolution|Time)} $line]} {
             set grab 0
         }
+        # A constant that cannot reach a (possibly unconnected, hence tied)
+        # hard block pin: blame the cells on that site.
+        if {[regexp {(?:Gnd|Vcc) Src -> ([A-Z][A-Z0-9_]*_X\d+Y\d+)/} $line - s]} {
+            foreach c [get_cells -quiet -of_objects [get_sites -quiet $s]] {
+                lappend names [get_property NAME $c]
+            }
+        }
         if {[regexp {Net: (\S+) is not completely routed} $line - n]} {
             lappend nets $n
         }
         if {[regexp {Router will skip net (\S+)} $line - n]} {
+            lappend nets $n
+        }
+        # Unreachable hard block pins: drop the net, keep the block.
+        if {[regexp {router will skip routing of net (\S+?)\.?$} $line - n]} {
             lappend nets $n
         }
         if {[regexp {problem bus\(es\) and/or net\(s\) are (.*)\.$} $line - lst]} {
@@ -215,7 +251,15 @@ proc nl_offenders {{extra ""}} {
             }
         }
     }
-    return [list [lsort -unique $names] [lsort -unique $nets]]
+    # The constant nets cannot be disconnected (their unreachable loads are
+    # blamed above instead).
+    set keep [list]
+    foreach n [lsort -unique $nets] {
+        set net [get_nets -quiet $n]
+        if {$n in {GNDNet VCCNet nl_const0 nl_const1} || ($net ne "" && [get_property TYPE $net] in {GROUND POWER})} continue
+        lappend keep $n
+    }
+    return [list [lsort -unique $names] $keep]
 }
 
 # True if the last log chunk read by nl_offenders mentions pblocks.
@@ -480,6 +524,12 @@ proc nl_finish {{relaxclk 0}} {
     }
     if {$relaxclk} {
         catch {set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets -quiet -hierarchical]}
+        # Except the outputs of clock generators / transceivers: routed
+        # through general interconnect they end in unresolvable overlaps.
+        set gen [get_cells -quiet -hierarchical -filter {REF_NAME =~ MMCM* || REF_NAME =~ PLL* || REF_NAME =~ GT* || REF_NAME =~ IBUFDS_GT*}]
+        if {[llength $gen]} {
+            catch {reset_property CLOCK_DEDICATED_ROUTE [get_nets -quiet -of_objects [get_pins -quiet -of_objects $gen -filter {DIRECTION == OUT}]]}
+        }
     }
     foreach d [get_drc_checks] {
         catch {set_property SEVERITY Warning $d}
@@ -652,7 +702,7 @@ proc nl_iob {name site mode ref stds props} {
         # Bidirectional ports need a bidirectional standard.
         set bi [list]
         foreach sv $stds {
-            if {[regexp {^(LVCMOS|LVTTL|LVDCI)} $sv]} { lappend bi $sv }
+            if {[regexp {^(LVCMOS|LVTTL|LVDCI)|_T_DCI:} $sv]} { lappend bi $sv }
         }
         set stds $bi
     }
@@ -708,7 +758,24 @@ proc nl_iob {name site mode ref stds props} {
             nl_log "properr $name IOSTANDARD $std"
         }
     }
+    set btype [get_property -quiet BANK_TYPE $bank]
     foreach {k v} $props {
+        # Input termination only exists for the SSTL/HSTL/HSUL family and
+        # drive strengths only for LVCMOS/LVTTL (with a per standard / bank
+        # type set): other values fail placement, removing the buffer.
+        if {$k eq "IN_TERM" && ![regexp {^(DIFF_)?(SSTL|HSTL|HSUL|MOBILE_DDR)} $std]} continue
+        if {$k eq "DRIVE"} {
+            if {![regexp {^(LVCMOS|LVTTL)} $std]} continue
+            set ok {4 8 12 16}
+            if {[string match *HIGH_PERFORMANCE* $btype]} {
+                set ok [expr {$std eq "LVCMOS12" ? {2 4 6 8} : {2 4 6 8 12}}]
+            } elseif {$std eq "LVCMOS12"} {
+                set ok {4 8 12}
+            } elseif {$std in {LVTTL LVCMOS18}} {
+                set ok {4 8 12 16 24}
+            }
+            if {$v ni $ok} { set v [lindex $ok [expr {int(rand() * [llength $ok])}]] }
+        }
         if {[catch {set_property $k $v [get_ports ${name}_p]} e]} {
             if {[catch {set_property $k $v [get_cells $name]} e]} {
                 nl_log "properr $name $k $v"
