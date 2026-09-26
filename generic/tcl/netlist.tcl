@@ -528,7 +528,7 @@ proc nl_finish {{relaxclk 0}} {
         # through general interconnect they end in unresolvable overlaps.
         set gen [get_cells -quiet -hierarchical -filter {REF_NAME =~ MMCM* || REF_NAME =~ PLL* || REF_NAME =~ GT* || REF_NAME =~ IBUFDS_GT*}]
         if {[llength $gen]} {
-            catch {reset_property CLOCK_DEDICATED_ROUTE [get_nets -quiet -of_objects [get_pins -quiet -of_objects $gen -filter {DIRECTION == OUT}]]}
+            catch {set_property CLOCK_DEDICATED_ROUTE TRUE [get_nets -quiet -of_objects [get_pins -quiet -of_objects $gen -filter {DIRECTION == OUT}]]}
         }
     }
     foreach d [get_drc_checks] {
@@ -764,6 +764,9 @@ proc nl_iob {name site mode ref stds props} {
         # drive strengths only for LVCMOS/LVTTL (with a per standard / bank
         # type set): other values fail placement, removing the buffer.
         if {$k eq "IN_TERM" && ![regexp {^(DIFF_)?(SSTL|HSTL|HSUL|MOBILE_DDR)} $std]} continue
+        # SLEW MEDIUM: only the SSTL/HSTL/HSUL/POD family (else an error at
+        # every DRC run).
+        if {$k eq "SLEW" && $v eq "MEDIUM" && ![regexp {^(DIFF_)?(SSTL|HSTL|HSUL|POD)} $std]} { set v FAST }
         if {$k eq "DRIVE"} {
             if {![regexp {^(LVCMOS|LVTTL)} $std]} continue
             set ok {4 8 12 16}
