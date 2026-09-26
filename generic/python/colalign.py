@@ -61,6 +61,8 @@ S_MAJ = 2.0  # frame column without any grid column
 S_COL = 3.0  # grid column of an active kind without a frame column
 S_SILENT = 1.0  # same for a silent kind
 MIN_ACT = 2.0  # activity score (~ matching tiles) making a kind active
+SUPPORTED = False  # learn only from activity supported assignments
+SUP_ACT = 3.0  # activity score supporting an assignment
 INIT_EA = False  # leave kinds whose activity neighbours explain out of the
 # initial assignment
 ALPHA = 1.0  # emission smoothing
@@ -606,6 +608,9 @@ def main():
     ap.add_argument('--verbose', action='store_true',
                     help='list frame count mismatches and activity '
                     'disagreements')
+    ap.add_argument('--supported', action='store_true',
+                    help='learn the tables only from assignments the '
+                    'activity supports (not merely does not contradict)')
     ap.add_argument('--init-explained', action='store_true',
                     help='leave kinds whose activity is explained by their '
                     'neighbours out of the initial assignment')
@@ -616,6 +621,7 @@ def main():
     args = ap.parse_args()
     globals()['W_ACT'] = args.w_act
     globals()['INIT_EA'] = args.init_explained
+    globals()['SUPPORTED'] = args.supported
     alldies = dieslib.load()
     base = os.path.join(args.exp, args.arch)
     names = args.dies.split(',') if args.dies else sorted(
@@ -723,6 +729,10 @@ def main():
                 v = sc.get(gx)
                 if j is not None and v is not None and \
                         v.max() >= MIN_ACT and v[j] < 0.5 * v.max():
+                    nf = None
+                if SUPPORTED and j is not None and \
+                        (v is None or v[j] < SUP_ACT):
+                    # only assignments the activity supports
                     nf = None
                 row.append((k, j, nf))
             data.append(row)

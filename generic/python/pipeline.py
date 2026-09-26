@@ -74,7 +74,8 @@ def main():
             sys.executable,
             os.path.join(HERE, 'colalign.py'), '--arch', arch, '--exp',
             os.path.join(dieslib.BUILD, 'db'), '--verbose'
-        ], os.path.join(logdir, f'colalign_{arch}.log'))
+        ] + (['--supported'] if arch != 'Series7' else []),
+            os.path.join(logdir, f'colalign_{arch}.log'))
         print('colalign rc', rc, flush=True)
         with ProcessPoolExecutor(min(len(dlist), 8)) as ex:
             for die, rc in ex.map(tilegrid, [(d, arch) for d in dlist]):
