@@ -151,8 +151,22 @@ def check_registers(path, dbdir):
     return sorted(bits - doc)
 
 
+_CHECK = None
+
+
+def _check_one(item):
+    """Checks one input (collector and database from the parent)."""
+    idx, ids, want_fasm = item
+    col, db = _CHECK
+    fasm = [] if want_fasm else None
+    unowned, unknown = check_ids(col, db, ids, fasm)
+    return unowned, dict(unknown), fasm
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument('--jobs', type=int, default=8,
+                    help='inputs checked in parallel')
     ap.add_argument('--die', required=True)
     ap.add_argument('--bit', action='append', default=[])
     ap.add_argument('--designs', default=None)
@@ -188,9 +202,20 @@ def main():
             print(f'{b}: undocumented register bits {len(und)} {und[:20]}')
             if und:
                 total['REGISTERS'].update(und)
-    for idx, (name, ids) in enumerate(inputs):
-        fasm = [] if (args.fasm and idx == 0) else None
-        unowned, unknown = check_ids(col, db, ids, fasm)
+    global _CHECK
+    _CHECK = (col, db)
+    todo = [(idx, ids, bool(args.fasm and idx == 0))
+            for idx, (_, ids) in enumerate(inputs)]
+    if args.jobs > 1 and len(todo) > 1:
+        # Forked workers share the collector; each loads the database
+        # types it needs.
+        from concurrent.futures import ProcessPoolExecutor
+        ex = ProcessPoolExecutor(min(args.jobs, len(todo)))
+        results = ex.map(_check_one, todo)
+    else:
+        ex = None
+        results = map(_check_one, todo)
+    for (name, ids), (unowned, unknown, fasm) in zip(inputs, results):
         if fasm is not None:
             with open(args.fasm, 'w') as f:
                 f.write('\n'.join(sorted(set(fasm))) + '\n')
@@ -199,6 +224,8 @@ def main():
         total_unowned += unowned
         for tt, c in unknown.items():
             total[tt].update(c)
+    if ex:
+        ex.shutdown()
     print('== undocumented bits by tile type')
     for tt, c in sorted(total.items(), key=lambda x: -sum(x[1].values())):
         print(f'{tt}: {sum(c.values())} ({len(c)} distinct) e.g. '
