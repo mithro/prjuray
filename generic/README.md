@@ -166,3 +166,9 @@ bits onto our region coordinates and lists prjxray bits used by no feature or
 default of ours (candidate undocumented bits), our bits unknown to prjxray, and
 feature correspondences (`INT_L.EE2BEG0.LOGIC_OUTS_L0` =
 `INT_L.LOGIC_OUTS_L0->EE2BEG0`, or identical set bits).
+
+`--tilegrid-only` skips the bits.  With `--arch UltraScalePlus` (or
+`UltraScale`) and `--prjxray-db` pointing at a prjuray-db checkout
+(`https://github.com/SymbiFlow/prjuray-db`, devices named by part, e.g.
+`zynqusp/xczu3eg-sfvc784-1-e` = our die `xazu2eg`) the tile grids are
+compared the same way (tile grid only).
