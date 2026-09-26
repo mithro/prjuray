@@ -79,11 +79,17 @@ def postprocess(die, wdir):
     feat = os.path.join(wdir, 'design.features')
     if not (os.path.exists(bit) and os.path.exists(feat)):
         return 'failed'
+    with open(feat, 'rb') as f:
+        f.seek(max(0, os.path.getsize(feat) - 4096))
+        complete = b'# t_done' in f.read()
+    if not complete:
+        # Vivado died while dumping (the bitstream is there, the feature
+        # dump is truncated): not a usable design.
+        return 'failed dump'
     save_bits(bit, die.arch, os.path.join(wdir, 'bits.npz'))
     with open(feat, 'rb') as fi, gzip.open(feat + '.gz', 'wb') as fo:
         shutil.copyfileobj(fi, fo)
-    if b'# t_done' in open(feat, 'rb').read():
-        open(os.path.join(wdir, 'dump_v2'), 'w').close()
+    open(os.path.join(wdir, 'dump_v2'), 'w').close()
     os.unlink(feat)
     os.unlink(bit)
     for junk in ('run.log', 'clockInfo.txt', 'vivado.log'):
