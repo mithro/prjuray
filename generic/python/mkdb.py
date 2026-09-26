@@ -25,6 +25,7 @@ import argparse
 import collections
 import json
 import os
+import zlib
 
 import numpy as np
 
@@ -101,10 +102,12 @@ class Collector:
 def correlate(samples):
     """samples: list of (features set, bits list).  Returns dict."""
     S = len(samples)
-    fidx, bidx = {}, {}
+    # Features in sorted order: the greedy covers break ties by index, and
+    # the iteration order of sets of strings changes from run to run.
+    fidx = {f: i for i, f in enumerate(sorted(set().union(
+        *(fs for fs, _ in samples))))}
+    bidx = {}
     for fs, bs in samples:
-        for f in fs:
-            fidx.setdefault(f, len(fidx))
         for b in bs:
             bidx.setdefault(b, len(bidx))
     nF, nB = len(fidx), len(bidx)
@@ -292,6 +295,13 @@ def write_db(outdir, ttype, k, res):
 _COLLECTORS = {}
 
 
+def design_seed(d):
+    """Seed of the per design sample thinning: stable across runs and build
+    directory locations (hash() of a string changes every run)."""
+    rel = '/'.join(os.path.normpath(d).split(os.sep)[-3:])  # die/tag/sN
+    return zlib.crc32(rel.encode())
+
+
 def _collect_one(item):
     """Worker: samples of one design (tile type, region, features, bits)."""
     import random
@@ -301,7 +311,7 @@ def _collect_one(item):
         outdir = os.path.join(dieslib.BUILD, 'db', arch)
         tg = json.load(open(os.path.join(outdir, dn, 'tilegrid.json')))
         _COLLECTORS[dn] = Collector(die, tg)
-    rng = random.Random(hash(d) & 0xffffffff)
+    rng = random.Random(design_seed(d))
     return list(_COLLECTORS[dn].samples(d, rng=rng))
 
 
