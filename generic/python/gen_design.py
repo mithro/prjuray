@@ -106,6 +106,7 @@ class Design:
 
     def add_sink(self, pin, site, kind='data', hard=False):
         """pin may be a list of pins that must share a single driver.
+        kind: 'data', 'clock', 'const' (tied to 0 or 1) or 'const0'.
         hard: pin of a hard block (not tied to constants)."""
         gx, gy = self.loc_of(site)
         self.sinks.append((pin, gx, gy, kind if not hard else kind + '_hard'))
@@ -128,6 +129,10 @@ class Design:
             kind = kind.replace('_hard', '')
             if kind == 'clock' and self.clocks:
                 drive[rng.choice(self.clocks)].extend(pins)
+                continue
+            if kind in ('const', 'const0'):
+                (const0 if kind == 'const0' or rng.random() < 0.5
+                 else const1).extend(pins)
                 continue
             r = rng.random()
             if hard and (r < 0.16 or not allsrc):
@@ -263,23 +268,45 @@ def recipe_slice(d, site, slicem):
             d.add_source(f'{m}/O', site)
     for o in lut_out:
         d.add_source(o, site)
-    # Carry chain element, S inputs driven by dedicated LUTs.
+    # Carry chain (1-3 elements), S inputs driven by dedicated LUTs.  CI can
+    # only come from the previous element's last CO (or a constant): a CI
+    # driven from fabric makes Vivado insert CARRY/GND cells it cannot place.
+    # CARRY4 CI and CYINIT are alternatives: the first element takes CYINIT
+    # from fabric with CI = 0, later ones CI from the chain with CYINIT = 0.
+    # CARRY8 (no CYINIT) may take its first CI from fabric (AX).
     if rng.random() < 0.3:
         ref = 'CARRY8' if us else 'CARRY4'
-        props = d.random_params(ref) if us else {}
-        n = cell(ref, props)
-        for direction, pin in pins_of(d.prims, ref):
-            full = f'{n}/{pin}'
-            if direction == 'IN':
-                if pin.startswith('S[') and rng.random() < 0.7:
-                    k = rng.randint(1, 6)
-                    l = cell(f'LUT{k}', d.random_params(f'LUT{k}'))
-                    add_generic_pins(d, f'LUT{k}', l, site, skip=('O', ))
-                    d.connect(f'{l}/O', [full])
+        last_co = 'CO[7]' if us else 'CO[3]'
+        prev = None
+        for _ in range(rng.choice((1, 1, 2, 3))):
+            props = d.random_params(ref) if us else {}
+            n = cell(ref, props)
+            for direction, pin in pins_of(d.prims, ref):
+                full = f'{n}/{pin}'
+                if direction == 'IN':
+                    if pin == 'CI':
+                        if prev:
+                            d.connect(f'{prev}/{last_co}', [full])
+                        else:
+                            d.add_sink(full, site, 'data' if us else 'const0')
+                        continue
+                    if pin == 'CI_TOP' or (pin == 'CYINIT' and prev):
+                        d.add_sink(full, site, 'const0')
+                        continue
+                    if pin.startswith('S[') and rng.random() < 0.7:
+                        k = rng.randint(1, 6)
+                        l = cell(f'LUT{k}', d.random_params(f'LUT{k}'))
+                        add_generic_pins(d, f'LUT{k}', l, site, skip=('O', ))
+                        d.connect(f'{l}/O', [full])
+                        continue
+                    d.add_sink(full, site)
+                elif pin == last_co:
+                    # Kept for the next element of the chain only.
                     continue
-                d.add_sink(full, site)
-            else:
-                d.add_source(full, site)
+                else:
+                    d.add_source(full, site)
+            prev = n
+        d.add_source(f'{prev}/{last_co}', site)
     # Flip flops sharing a control set.
     nff = rng.randint(0, 2 * nletters)
     kind = rng.random()
