@@ -13,6 +13,9 @@ Feature naming (relative to the tile, prefixed by the tile type in the DB):
   <SITEKEY>.<BEL>.<CFG>[i]         bit i of a vector BEL configuration is 1
   <SITEKEY>.<BEL>.<CFG>[i]=0       bit i is 0 (vectors of <= 64 bits)
   <SITEKEY>.<BEL>.INIT[i]          LUT truth table bit (from EQN)
+  <SITEKEY>.BANK.IOSTD=<std>       an I/O standard used in the pad's bank
+  <vector bit feature>@<W>=<v>     vector bit together with a WIDTH setting
+                                   <W> of the same BEL (same port suffix)
 
 SITEKEY is <site prefix>_X<dx>Y<dy>, relative to the lowest coordinates of
 same-prefix sites in the tile.
@@ -127,6 +130,7 @@ def tile_features(path, sitekeys):
     feats = collections.defaultdict(set)
     site_map = {}
     glob_opts = {}
+    bel_cfgs = collections.defaultdict(dict)
     with open_any(path) as f:
         for line in f:
             p = line.rstrip('\n').split(' ')
@@ -152,10 +156,34 @@ def tile_features(path, sitekeys):
             elif kind == 'sp':
                 tile, key = site_map[p[1]]
                 feats[tile].add(f'{key}.{p[2]}.SP.{p[3]}.{p[4]}')
+            elif kind == 'bank':
+                # I/O standards used in the pad's bank (pad may be unused).
+                if len(p) >= 4 and p[1] in sitekeys.key:
+                    tile, key = sitekeys.key[p[1]]
+                    feats[tile].add(f'{key}.BANK.{p[2]}={p[3]}')
             elif kind == 'cfg':
                 tile, key = site_map[p[1]]
                 value = ' '.join(p[4:])
                 feats[tile].update(cfg_features(f'{key}.{p[2]}', p[3], value))
+                bel_cfgs[(tile, f'{key}.{p[2]}')][p[3]] = value
+    # The physical layout of some vector settings depends on a width setting
+    # of the same BEL (e.g. BRAM INIT_A/SRVAL_A are replicated for narrow
+    # READ_WIDTH_A): also name the vector bits together with the width.
+    for (tile, prefix), cfgs in bel_cfgs.items():
+        widths = {k: v for k, v in cfgs.items()
+                  if re.search(r'(^|_)WIDTH(_|$)', k)}
+        if not widths:
+            continue
+        for name, value in cfgs.items():
+            m = _VEC.match(value)
+            if not m or int(m.group(1)) > MAX_ZERO_VEC:
+                continue
+            port = name.rsplit('_', 1)[-1] if '_' in name else ''
+            for wname, wval in widths.items():
+                if len(port) == 1 and not wname.endswith('_' + port):
+                    continue
+                for f in cfg_features(prefix, name, value):
+                    feats[tile].add(f'{f}@{wname}={wval}')
     # Unused pads take the design wide UNUSEDPIN pull setting (Vivado's
     # default is Pulldown, older dumps do not record it).
     glob_opts.setdefault('UNUSEDPIN', 'Pulldown')
