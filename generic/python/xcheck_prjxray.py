@@ -17,7 +17,7 @@ For every prjxray-db device whose die we have a tile grid for, compare:
 
 Usage:
   xcheck_prjxray.py --prjxray-db <path> --out <report.md>
-      [--db build/db/Series7] [--build build]
+      [--db build/db/Series7] [--build build] [--tilegrid-only]
 """
 import argparse
 import collections
@@ -568,6 +568,8 @@ def main():
         'URAY_BUILD', os.path.join(URAY_DIR, 'build')))
     ap.add_argument('--db', help='default: <build>/db/Series7')
     ap.add_argument('--devices', help='comma separated prjxray devices')
+    ap.add_argument('--tilegrid-only', action='store_true',
+                    help='compare the tile grids only (no bits)')
     args = ap.parse_args()
     os.environ['URAY_BUILD'] = args.build
     sys.path.insert(0, HERE)
@@ -611,6 +613,13 @@ def main():
         with open(ours_path) as f:
             ours = json.load(f)
         res = compare_tilegrid(px, ours)
+        nwrong = sum(1 for c in res['cols'].values()
+                     if any(p != o for p, o in c))
+        print(f'summary {dev} {die}: regions {px_regions(res)} identical '
+              f'{res["ok"] + res["ok_frames"]} missing '
+              f'{sum(res["px_only"].values())} different '
+              f'{res["regions"] - res["ok"] - res["ok_frames"]} '
+              f'wrong grid columns {nwrong}', file=sys.stderr)
         tg_results.append(res)
         summary.append((fam, dev, die, res))
         sec = []
@@ -671,6 +680,16 @@ def main():
             w(f'| {tt} | {b} | {c.get("ok", 0)} | {mism} | '
               f'{", ".join(sorted(dies_bad[(tt, b)]))} |')
         w('')
+
+    if args.tilegrid_only:
+        w('## Tile grid details\n')
+        for sec in tg_sections:
+            out.extend(sec)
+        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+        with open(args.out, 'w') as f:
+            f.write('\n'.join(out) + '\n')
+        print(f'wrote {args.out}', file=sys.stderr)
+        return
 
     # Bits.
     print('loading prjxray segbits', file=sys.stderr)

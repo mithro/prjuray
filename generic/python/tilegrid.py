@@ -144,7 +144,17 @@ def frame_columns(dframes):
     return cols
 
 
-def learn(die, design_root, verbose=False):
+def collect(die, design_root, verbose=False):
+    """Design activity evidence for the frame row / frame column learners.
+
+    Returns a dict:
+      crmap:  clock region row -> (block, half, row) of its frames
+      scores: clock region row -> {grid x: {frame column index in the
+              row's block 0 list: score}} (sum over the used tiles of the
+              grid column of their near perfect usage / activity matches)
+      bram1:  (clock region row, grid x) -> Counter(block 1 column)
+      ndesigns: number of designs
+    """
     grid = Grid(die)
     dframes = DD.DieFrames(die)
     wpf = dframes.wpf
@@ -231,26 +241,97 @@ def learn(die, design_root, verbose=False):
             continue
         rowvote[cr][ranked[0][0]] += 1
     crmap = {cr: v.most_common(1)[0][0] for cr, v in rowvote.items()}
-    # 2. Frame column of each grid column: per clock region row, score every
-    # (grid column, frame column) pair, then pick a monotonic assignment.
+    # 2. Score every (grid column, frame column) pair of each clock region
+    # row.
+    scores = {}
+    for t, u, (cr, lo, n) in tiles_used:
+        key = crmap.get(cr)
+        if key is None:
+            continue
+        clist = block0[key]
+        gx = grid.tiles[t]['gx']
+        v = np.array([col_score(u, col, lo, n) for col in clist])
+        row = scores.setdefault(cr, {})
+        acc = row.setdefault(gx, np.zeros(len(clist)))
+        acc += (v >= 0.95) * v
+    # 3. Block RAM content columns (block type 1), same scoring.
+    votes1 = collections.defaultdict(collections.Counter)
+    for t, u, (cr, lo, n) in tiles_used:
+        tt = grid.tiles[t]
+        if not ('RAMB36' in tt['sites'] or 'RAMBFIFO36' in tt['sites']):
+            continue
+        key = crmap.get(cr)
+        if key is None:
+            continue
+        clist = cols.get((1, key[1], key[2]), [])
+        best = None
+        for col in clist:
+            sc = col_score(u, col, lo, n)
+            if best is None or sc > best[0]:
+                best = (sc, col[0])
+        if best and best[0] > 0.9:
+            votes1[(cr, tt['gx'])][best[1]] += 1
+    if verbose:
+        print('frame rows', crmap)
+    return dict(crmap=crmap, scores=scores, bram1=votes1, ndesigns=D)
+
+
+def save_evidence(ev, path):
+    out = dict(
+        ndesigns=ev['ndesigns'],
+        crmap={str(cr): list(k) for cr, k in ev['crmap'].items()},
+        scores={
+            str(cr): {
+                str(gx): {str(j): round(float(x), 4)
+                          for j, x in enumerate(v) if x}
+                for gx, v in row.items()
+            }
+            for cr, row in ev['scores'].items()
+        },
+        bram1=[[cr, gx, dict((str(c), n) for c, n in v.items())]
+               for (cr, gx), v in ev['bram1'].items()])
+    with open(path, 'w') as f:
+        json.dump(out, f, sort_keys=True)
+
+
+def load_evidence(path, cols):
+    """Inverse of save_evidence; score vectors are rebuilt with the length of
+    the row's frame column list."""
+    with open(path) as f:
+        d = json.load(f)
+    crmap = {int(cr): tuple(k) for cr, k in d['crmap'].items()}
+    scores = {}
+    for cr, row in d['scores'].items():
+        cr = int(cr)
+        M = len(cols[crmap[cr]])
+        scores[cr] = {}
+        for gx, sv in row.items():
+            v = np.zeros(M)
+            for j, x in sv.items():
+                v[int(j)] = x
+            scores[cr][int(gx)] = v
+    bram1 = collections.defaultdict(collections.Counter)
+    for cr, gx, v in d['bram1']:
+        bram1[(cr, gx)].update({int(c): n for c, n in v.items()})
+    return dict(crmap=crmap, scores=scores, bram1=bram1,
+                ndesigns=d['ndesigns'])
+
+
+def assign_activity(grid, cols, ev, verbose=False):
+    """Frame column of each grid column from design activity alone: per
+    clock region row a monotonic assignment maximising the activity scores,
+    then propagation between rows and gap filling."""
+    crmap = ev['crmap']
+    block0 = {k: v for k, v in cols.items() if k[0] == 0}
     colmap = {}
-    by_cr = collections.defaultdict(list)
-    for t, u, w in tiles_used:
-        by_cr[w[0]].append((t, u, w))
-    for cr, lst in by_cr.items():
+    for cr, scores in ev['scores'].items():
         key = crmap.get(cr)
         if key is None:
             continue
         clist = block0[key]
         M = len(clist)
-        scores = collections.defaultdict(lambda: np.zeros(M))
-        for t, u, (_, lo, n) in lst:
-            gx = grid.tiles[t]['gx']
-            v = np.array([col_score(u, col, lo, n) for col in clist])
-            scores[gx] += (v >= 0.95) * v
         gxs = sorted(scores)
         # DP: best[j] = best total with last used major <= j.
-        NEG = -1e18
         prev = np.zeros(M)
         choice = []
         for gx in gxs:
@@ -268,37 +349,15 @@ def learn(die, design_root, verbose=False):
             gx = gxs[idx]
             if take[j] >= pm[j] and scores[gx][j] > 0:
                 colmap[(cr, gx)] = clist[j][0]
-            else:
-                pass
             # previous columns must use majors <= j
             j = int(np.argmax(pm[:j + 1] == pm[j])) if pm[j] > 0 else j
     propagate_columns(grid, crmap, colmap, block0, verbose)
     fill_gaps(grid, crmap, colmap, block0, verbose)
-    # Block RAM content columns (block type 1), same scoring.
-    colmap1 = {}
-    votes1 = collections.defaultdict(collections.Counter)
-    for t, u, (cr, lo, n) in tiles_used:
-        tt = grid.tiles[t]
-        if not ('RAMB36' in tt['sites'] or 'RAMBFIFO36' in tt['sites']):
-            continue
-        key = crmap.get(cr)
-        if key is None:
-            continue
-        clist = cols.get((1, key[1], key[2]), [])
-        best = None
-        for col in clist:
-            sc = col_score(u, col, lo, n)
-            if best is None or sc > best[0]:
-                best = (sc, col[0])
-        if best and best[0] > 0.9:
-            votes1[(cr, tt['gx'])][best[1]] += 1
-    for k, v in votes1.items():
-        colmap1[k] = v.most_common(1)[0][0]
-    learn.colmap1 = colmap1
+    colmap1 = {k: v.most_common(1)[0][0] for k, v in ev['bram1'].items()}
     if verbose:
         print('frame rows', crmap)
         print('columns', len(colmap))
-    return grid, dframes, crmap, colmap, cols
+    return colmap, colmap1
 
 
 def propagate_columns(grid, crmap, colmap, block0, verbose=False):
@@ -364,9 +423,12 @@ def fill_gaps(grid, crmap, colmap, block0, verbose=False):
                       'columns', free_g)
 
 
-def build(die, design_root, verbose=False):
-    """Returns the tilegrid dict: tile -> {type, gx, gy, bits: [...]}"""
-    grid, dframes, crmap, colmap, cols = learn(die, design_root, verbose)
+def build(grid, dframes, cols, crmap, colmap, colmap1, verbose=False):
+    """Returns the tilegrid dict: tile -> {type, gx, gy, bits: [...]}.
+    crmap: clock region row -> (block, half, row); colmap: (clock region
+    row, grid x) -> block 0 frame column; colmap1: (clock region row, grid
+    x) -> block 1 (BRAM content) frame column learnt from activity (used when
+    the BRAM columns cannot be mapped by rank)."""
     colinfo = {}
     for key, clist in cols.items():
         for col, first, nfr in clist:
@@ -411,7 +473,7 @@ def build(die, design_root, verbose=False):
                 print('bram column mismatch', cr, len(b1), len(gxs))
             # Learned columns (any clock region row) as a constant shift of
             # the BRAM grid column rank.
-            c1 = getattr(learn, 'colmap1', {})
+            c1 = colmap1
             idx = {c[0]: i for i, c in enumerate(b1)}
             shifts = collections.Counter(
                 idx[c] - all_bram_gx.index(gx) for (_, gx), c in c1.items()
@@ -446,11 +508,38 @@ def build(die, design_root, verbose=False):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--die', required=True)
-    ap.add_argument('--designs', required=True)
+    ap.add_argument('--designs', help='design roots (comma separated); '
+                    'collects the activity evidence')
+    ap.add_argument('--evidence', help='evidence file: written when '
+                    '--designs is given, read otherwise')
+    ap.add_argument('--colmap', help='frame column assignment from '
+                    'colalign.py (default: activity only)')
     ap.add_argument('--out', required=True)
     args = ap.parse_args()
     die = dieslib.load()[args.die]
-    tg = build(die, args.designs, True)
+    grid = Grid(die)
+    dframes = DD.DieFrames(die)
+    cols = frame_columns(dframes)
+    if args.designs:
+        ev = collect(die, args.designs, True)
+        if args.evidence:
+            save_evidence(ev, args.evidence)
+            ev = load_evidence(args.evidence, cols)
+    elif args.evidence:
+        ev = load_evidence(args.evidence, cols)
+    else:
+        ap.error('--designs or --evidence required')
+    if args.colmap:
+        with open(args.colmap) as f:
+            cm = json.load(f)
+        crmap = {int(cr): tuple(k) for cr, k in cm['crmap'].items()}
+        colmap = {(cr, gx): col for cr, gx, col in cm['colmap']}
+        colmap1 = {k: v.most_common(1)[0][0]
+                   for k, v in ev['bram1'].items()}
+    else:
+        crmap = ev['crmap']
+        colmap, colmap1 = assign_activity(grid, cols, ev, True)
+    tg = build(grid, dframes, cols, crmap, colmap, colmap1, True)
     with open(args.out, 'w') as f:
         json.dump(tg, f, indent=0, sort_keys=True)
     nb = sum(1 for t in tg.values() if t['bits'])
