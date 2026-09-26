@@ -163,7 +163,7 @@ def _check_one(item):
     col, db = _CHECK
     fasm = [] if want_fasm else None
     unowned, unknown = check_ids(col, db, ids, fasm)
-    return unowned, dict(unknown), fasm
+    return unowned, dict(unknown), fasm, check_ids.undocumented_bits
 
 
 def main():
@@ -218,14 +218,14 @@ def main():
     else:
         ex = None
         results = map(_check_one, todo)
-    for (name, ids), (unowned, unknown, fasm) in zip(inputs, results):
+    for (name, ids), (unowned, unknown, fasm, nbits) in zip(inputs, results):
         if fasm is not None:
             with open(args.fasm, 'w') as f:
                 f.write('\n'.join(sorted(set(fasm))) + '\n')
         n = sum(sum(c.values()) for c in unknown.values())
         # n counts a bit once per owning tile; distinct bits too
         print(f'{name}: set {len(ids)} unowned {unowned} undocumented {n} '
-              f'bits {check_ids.undocumented_bits}')
+              f'bits {nbits}')
         total_unowned += unowned
         for tt, c in unknown.items():
             total[tt].update(c)
