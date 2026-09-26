@@ -51,6 +51,8 @@ import tilegrid as TG
 # Scoring weights (natural log units).
 ECAP = 8.0  # |emission| cap
 W_ACT = 3.0  # activity bonus weight
+W_VERT = 3.0  # bonus for the frame column of the same grid column in the
+# best aligned clock region row
 S_MAJ = 2.0  # frame column without any grid column
 S_COL = 3.0  # grid column of an active kind without a frame column
 S_SILENT = 1.0  # same for a silent kind
@@ -247,7 +249,7 @@ class Model:
             p0={str(k): round(v, 4) for k, v in sorted(self.p0.items())})
 
 
-def align_row(model, kinds, nfs, act, skip, gxs, voids):
+def align_row(model, kinds, nfs, act, skip, gxs, voids, extra=None):
     """kinds: grid column kinds (left to right) at grid x gxs, nfs: frame
     counts of the frame columns, act: per column activity vector (or None),
     skip: cost of leaving each grid column unassigned, voids: grid x of the
@@ -272,6 +274,8 @@ def align_row(model, kinds, nfs, act, skip, gxs, voids):
         E[i] = [model.emission(k, nf) for nf in nfs]
         if act[i] is not None:
             E[i] += W_ACT * act[i]
+    if extra is not None:
+        E += extra
     dp = np.full((n, M), NEG)
     back = {}
     jidx = np.arange(M)
@@ -314,6 +318,54 @@ def align_row(model, kinds, nfs, act, skip, gxs, voids):
             break
         i, j = int(ip), int(jp)
     return out, total
+
+
+def align_die(model, dr, d, active):
+    """Aligns every clock region row of a die.  The column structure
+    repeats vertically: rows left with more unused frame columns (e.g. where
+    the PS replaces part of the fabric, so that many frame columns have no
+    grid column) are aligned again with a bonus for the frame column the
+    same grid column has in the best aligned row (fewest unused frame
+    columns)."""
+    def run(cr, ref=None):
+        m = dr.majors(cr)
+        s = dr.rows[cr]
+        kinds = [k for _, k in s]
+        act = [dr.activity(cr, gx, len(m)) for gx, _ in s]
+        skip = [S_COL if k in active else S_SILENT for k in kinds]
+        extra = None
+        if ref:
+            extra = np.zeros((len(s), len(m)))
+            for i, (gx, k) in enumerate(s):
+                if (gx, k) in ref:
+                    for j, c in enumerate(m):
+                        if (c[0], c[2]) == ref[(gx, k)]:
+                            extra[i, j] = W_VERT
+        out, _ = align_row(model, kinds, [c[2] for c in m], act, skip,
+                           [gx for gx, _ in s], dr.voids.get(cr, []), extra)
+        return {gx: j for (gx, _), j in zip(s, out) if j is not None}
+
+    res = {}
+    crs = [cr for cr in dr.rows if dr.majors(cr)]
+    for cr in crs:
+        res[cr] = run(cr)
+
+    def unused(cr):
+        return len(dr.majors(cr)) - len(set(res[cr].values()))
+
+    order = sorted(crs, key=lambda cr: (unused(cr), -len(res[cr])))
+    if order:
+        best = unused(order[0])
+        ref = {}
+        for cr in order:
+            m = dr.majors(cr)
+            kinds = dict(dr.rows[cr])
+            for gx, j in res[cr].items():
+                ref.setdefault((gx, kinds[gx]), (m[j][0], m[j][2]))
+        for cr in order:
+            if unused(cr) > best:
+                res[cr] = run(cr, ref)
+    return {(d, cr): asg for cr, asg in res.items()}
 
 
 def attach_silent(rows_all, assigned, model=None, maxdist=16):
@@ -534,21 +586,10 @@ def main():
         new = {}
         changed = 0
         for d, dr in rows.items():
-            for cr in dr.rows:
-                m = dr.majors(cr)
-                if not m:
-                    continue
-                s = seqs(dr, cr)
-                kinds = [k for _, k in s]
-                act = [dr.activity(cr, gx, len(m)) for gx, _ in s]
-                skip = [S_COL if k in active else S_SILENT for k in kinds]
-                out, _ = align_row(model, kinds, [c[2] for c in m], act,
-                                   skip, [gx for gx, _ in s],
-                                   dr.voids.get(cr, []))
-                asg = {gx: j for (gx, _), j in zip(s, out) if j is not None}
-                if asg != cur.get((d, cr)):
-                    changed += 1
-                new[(d, cr)] = asg
+            new.update(align_die(model, dr, d, active))
+        for k, asg in new.items():
+            if asg != cur.get(k):
+                changed += 1
         cur = new
         print(f'iteration {it}: rows changed {changed}', flush=True)
         if not changed:
