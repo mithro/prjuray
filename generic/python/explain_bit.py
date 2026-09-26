@@ -28,7 +28,7 @@ def main():
     args = ap.parse_args()
     die = dieslib.load()[args.die]
     tg = json.load(
-        open(os.path.join(dieslib.BUILD, 'db', die.arch, die.name,
+        open(os.path.join(dieslib.DB, die.arch, die.name,
                           'tilegrid.json')))
     col = BD.Collector(die, tg)
     nb = nnb = 0

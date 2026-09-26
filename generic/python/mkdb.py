@@ -286,7 +286,7 @@ def _collect_one(item):
     arch, dn, d = item
     if dn not in _COLLECTORS:
         die = dieslib.load()[dn]
-        outdir = os.path.join(dieslib.BUILD, 'db', arch)
+        outdir = os.path.join(dieslib.DB, arch)
         tg = json.load(open(os.path.join(outdir, dn, 'tilegrid.json')))
         _COLLECTORS[dn] = Collector(die, tg)
     rng = random.Random(hash(d) & 0xffffffff)
@@ -304,7 +304,7 @@ def main():
     args = ap.parse_args()
     import random
     rng = random.Random(0)
-    outdir = os.path.join(dieslib.BUILD, 'db', args.arch)
+    outdir = os.path.join(dieslib.DB, args.arch)
     os.makedirs(outdir, exist_ok=True)
     per_type = collections.defaultdict(list)
     alldies = dieslib.load()

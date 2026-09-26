@@ -23,7 +23,7 @@ def main():
                     default=os.path.join(dieslib.URAY_DIR, 'database',
                                          'generic'))
     args = ap.parse_args()
-    src = os.path.join(dieslib.BUILD, 'db')
+    src = dieslib.DB
     devices = {}
     for die in dieslib.load().values():
         tg = os.path.join(src, die.arch, die.name, 'tilegrid.json')

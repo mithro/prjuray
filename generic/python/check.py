@@ -164,7 +164,7 @@ def main():
                     help='write decoded features of the (first) input here')
     args = ap.parse_args()
     die = dieslib.load()[args.die]
-    dbdir = os.path.join(dieslib.BUILD, 'db', die.arch)
+    dbdir = os.path.join(dieslib.DB, die.arch)
     tg = json.load(open(os.path.join(dbdir, die.name, 'tilegrid.json')))
     col = mkdb.Collector(die, tg)
     db = Database(dbdir)

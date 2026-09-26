@@ -75,7 +75,7 @@ def main():
             samples.append((feats, bits))
     print('bitstreams', len(samples))
     res = mkdb.correlate(samples)
-    outdir = os.path.join(dieslib.BUILD, 'db', args.arch)
+    outdir = os.path.join(dieslib.DB, args.arch)
     os.makedirs(outdir, exist_ok=True)
     with open(os.path.join(outdir, 'registers.db'), 'w') as f:
         for feat in sorted(res['feat_bits']):
