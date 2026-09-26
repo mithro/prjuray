@@ -289,9 +289,45 @@ proc nl_utlz_offenders {txt} {
     return [lsort -unique $names]
 }
 
+# Carry chains must be removed as a whole: a chain cut in the middle leaves
+# a CARRY cell whose CI is tied to a constant, which Vivado legalises with
+# inserted GND/CARRY cells the placer then rejects.
+proc nl_carry_chains {cells} {
+    set todo [get_cells -quiet $cells -filter {REF_NAME =~ CARRY*}]
+    if {[llength $todo] == 0} { return $cells }
+    set seen [dict create]
+    foreach c $todo { dict set seen [get_property NAME $c] 1 }
+    while {[llength $todo]} {
+        set c [lindex $todo end]
+        set todo [lrange $todo 0 end-1]
+        set pins [get_pins -quiet -of_objects $c -filter {REF_PIN_NAME =~ CO* || REF_PIN_NAME == CI || REF_PIN_NAME =~ CI_TOP}]
+        foreach n [get_nets -quiet -of_objects $pins] {
+            if {[get_property TYPE $n] in {GROUND POWER}} continue
+            foreach p [get_pins -quiet -of_objects $n -filter {REF_PIN_NAME =~ CO* || REF_PIN_NAME == CI || REF_PIN_NAME =~ CI_TOP}] {
+                set o [get_cells -quiet -of_objects $p]
+                if {[get_property REF_NAME $o] ni {CARRY4 CARRY8}} continue
+                set on [get_property NAME $o]
+                if {![dict exists $seen $on]} {
+                    dict set seen $on 1
+                    lappend todo $o
+                }
+            }
+        }
+    }
+    return [lsort -unique [concat [get_property NAME [get_cells -quiet $cells]] [dict keys $seen]]]
+}
+
 proc nl_remove {names} {
+    # Only ever remove our own cells: removing cells Vivado inserted (e.g.
+    # legalisation CARRY4/GND cells) corrupts its placer database (segfault).
+    set names [lsearch -all -inline -regexp [nl_carry_chains $names] {^(?:c|io)\d+$}]
     set cells [get_cells -quiet $names]
     if {[llength $cells] == 0} { return 0 }
+    # ... together with the cells Vivado inserted for them (e.g. the
+    # ZHOLD_DELAY "<cell>_OPT_INSERTED"), which would be left dangling.
+    foreach n $names {
+        foreach c [get_cells -quiet "${n}_OPT_INSERTED*"] { lappend cells $c }
+    }
     nl_log "removing [llength $cells] cells: [lrange $names 0 20]"
     # Remove IO ports attached to removed IO buffers as well.
     foreach c $cells {
@@ -300,7 +336,10 @@ proc nl_remove {names} {
         }
     }
     set onets [get_nets -quiet -of_objects [get_pins -quiet -of_objects $cells -filter {DIRECTION == OUT}]]
-    catch {unplace_cell $cells}
+    # The design is always placed again after a removal: unplace everything
+    # so no stale placement refers to removed cells.
+    catch {route_design -unroute}
+    catch {place_design -unplace}
     if {[catch {remove_cell $cells} e]} { nl_log "removeerr $e" }
     # Nets left without a driver: detach their loads.
     set dangling [list]
@@ -412,7 +451,17 @@ proc nl_const_offenders {txt} {
     foreach {- c} [regexp -all -inline {Instance\s+(\S+) of type (?:GND|VCC) is not Placeable} $txt] {
         foreach n [get_nets -quiet -of_objects [get_pins -quiet -of_objects [get_cells -quiet $c]]] {
             foreach l [get_cells -quiet -of_objects [get_pins -quiet -of_objects $n -filter {DIRECTION == IN}]] {
-                lappend cells [get_property NAME $l]
+                set ln [get_property NAME $l]
+                if {[regexp {^(?:c|io)\d+$} $ln]} { lappend cells $ln; continue }
+                # A cell Vivado inserted (removing it corrupts the placer
+                # database): blame our cells connected to it instead.
+                foreach nn [get_nets -quiet -of_objects [get_pins -quiet -of_objects $l]] {
+                    if {[get_property TYPE $nn] in {GROUND POWER}} continue
+                    foreach o [get_cells -quiet -of_objects [get_pins -quiet -of_objects $nn]] {
+                        set on [get_property NAME $o]
+                        if {[regexp {^(?:c|io)\d+$} $on]} { lappend cells $on }
+                    }
+                }
             }
         }
     }
