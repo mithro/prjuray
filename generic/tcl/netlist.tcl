@@ -13,16 +13,29 @@ proc nl_log {msg} {
     flush $nl_logfp
 }
 
+# Vivado log read back by nl_offenders (a shared Vivado process running
+# several designs, see nl_server.tcl, passes its log in NL_VIVADO_LOG).
+set nl_vivado_log vivado.log
+if {[info exists ::env(NL_VIVADO_LOG)]} { set nl_vivado_log $::env(NL_VIVADO_LOG) }
+
 proc nl_init {part} {
-    global nl_logfp
+    global nl_logfp nl_vivado_log nl_logpos
     set nl_logfp [open nl.log w]
     # Wall clock stamps (ms since the epoch) for run time accounting.
     nl_log "t_start [clock milliseconds]"
+    # Per design state left by a previous design of the same Vivado process.
+    foreach v {nl_props nl_was_reset nl_bank_std} {
+        global $v
+        unset -nocomplain $v
+    }
+    if {[file exists $nl_vivado_log]} { set nl_logpos [file size $nl_vivado_log] }
     create_project -in_memory -part $part
     link_design -part $part
     nl_log "t_linked [clock milliseconds]"
     set_param messaging.defaultLimit 100000
-    set_param general.maxThreads 2
+    set threads 2
+    if {[info exists ::env(NL_THREADS)]} { set threads $::env(NL_THREADS) }
+    set_param general.maxThreads $threads
     create_cell -reference GND nl_gnd
     create_cell -reference VCC nl_vcc
     create_net nl_const0
@@ -186,11 +199,11 @@ proc nl_port {name dir pin} {
 # vivado.log since the last call.
 set nl_logpos 0
 proc nl_offenders {{extra ""}} {
-    global nl_logpos
+    global nl_logpos nl_vivado_log
     set names [list]
     set nets [list]
     if {[catch {
-        set lf [open vivado.log r]
+        set lf [open $nl_vivado_log r]
         seek $lf $nl_logpos
         set txt [read $lf]
         set nl_logpos [tell $lf]
