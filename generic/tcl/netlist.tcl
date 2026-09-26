@@ -595,6 +595,18 @@ proc nl_finish {{relaxclk 0}} {
                 nl_log "route_design failed: [string range $e 0 200]"
                 lassign [nl_offenders "ERROR: $e"] names nets
                 catch {route_design -unroute}
+                global nl_lasttxt nl_unrelaxed
+                if {[string match "*Fixed routes overlap*" $nl_lasttxt] && ![info exists nl_unrelaxed]} {
+                    # Clock nets routed through the fabric (relaxed dedicated
+                    # routes) conflict with the global clock routes: go back
+                    # to dedicated clock routing and place again.
+                    set nl_unrelaxed 1
+                    nl_log "fixed routes overlap: dedicated clock routes again"
+                    catch {set_property CLOCK_DEDICATED_ROUTE TRUE [get_nets -quiet -hierarchical -filter {CLOCK_DEDICATED_ROUTE == FALSE}]}
+                    catch {place_design -unplace}
+                    set stage place
+                    continue
+                }
                 if {[llength $nets]} {
                     # Placement is unchanged: route again directly (unless
                     # cells had to be removed).
@@ -730,7 +742,7 @@ proc nl_iob {name site mode ref stds props} {
         # Bidirectional ports need a bidirectional standard.
         set bi [list]
         foreach sv $stds {
-            if {[regexp {^(LVCMOS|LVTTL|LVDCI)|_T_DCI:} $sv]} { lappend bi $sv }
+            if {[regexp {^(LVCMOS|LVTTL|LVDCI)|_T_DCI:} $sv] && ![string match LVCMOS10:* $sv]} { lappend bi $sv }
         }
         set stds $bi
     }
@@ -788,7 +800,12 @@ proc nl_iob {name site mode ref stds props} {
     }
     foreach p $ports {
         if {[catch {set_property IOSTANDARD $std [get_ports $p]} e]} {
-            nl_log "properr $name IOSTANDARD $std"
+            # Left at the default standard the buffer conflicts with the
+            # bank VCCO chosen here: drop it.
+            nl_log "ioberr $name IOSTANDARD $std"
+            foreach q $ports { catch {remove_port [get_ports $q]} }
+            catch {remove_cell [get_cells $name]}
+            return 0
         }
     }
     set btype [get_property -quiet BANK_TYPE $bank]
