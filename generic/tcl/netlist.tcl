@@ -105,7 +105,7 @@ proc nl_net {name pins} {
     }
     if {[llength $loads] == 0} {
         set c [get_cells -of_objects $drv]
-        if {[regexp {^(IDDR|ODDR|ISERDES|OSERDES|IDELAY|ODELAY)} [get_property REF_NAME $c]]} {
+        if {[regexp {^(IDDR|ODDR|ISERDES|OSERDES|IDELAY|ODELAY|TX_BITSLICE$|RXTX_BITSLICE)} [get_property REF_NAME $c]]} {
             global nl_orphans
             lappend nl_orphans [get_property NAME $c]
         }
