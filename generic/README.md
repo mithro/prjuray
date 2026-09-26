@@ -99,3 +99,24 @@ bits (unused pin pulls, configuration pin pulls, ...) are found by
 in `segbits_opt_<tile type>.db` (`<TYPE>.BITSTREAM.<option>=<value>`).
 
 `python/check.py --registers` checks register writes as well as frames.
+
+## Cross-check against prjxray-db (Series7)
+
+`python/xcheck_prjxray.py` compares the Series7 results with a prjxray-db
+checkout (e.g. the openXC7 fork `https://github.com/openXC7/prjxray-db`, the
+revision pinned by openXC7's toolchain-nix / toolchain-installer):
+
+```
+python3 generic/python/xcheck_prjxray.py --prjxray-db <prjxray-db> \
+    --out build/xcheck/prjxray.md [--build build] [--db build/db/Series7]
+```
+
+For every prjxray device whose die (`python/dies.py`) has a tile grid it
+compares each tile's CLB_IO_CLK / BLOCK_RAM `baseaddr/frames/offset/words`
+with our region (offset and size x 32 bits), listing mismatches per tile type,
+regions missing in ours and grid columns / clock region rows whose frame
+address differs.  It then maps the prjxray `segbits_<type>[.block_ram].db`
+bits onto our region coordinates and lists prjxray bits used by no feature or
+default of ours (candidate undocumented bits), our bits unknown to prjxray, and
+feature correspondences (`INT_L.EE2BEG0.LOGIC_OUTS_L0` =
+`INT_L.LOGIC_OUTS_L0->EE2BEG0`, or identical set bits).

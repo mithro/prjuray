@@ -16,8 +16,11 @@ proc nl_log {msg} {
 proc nl_init {part} {
     global nl_logfp
     set nl_logfp [open nl.log w]
+    # Wall clock stamps (ms since the epoch) for run time accounting.
+    nl_log "t_start [clock milliseconds]"
     create_project -in_memory -part $part
     link_design -part $part
+    nl_log "t_linked [clock milliseconds]"
     set_param messaging.defaultLimit 100000
     set_param general.maxThreads 2
     create_cell -reference GND nl_gnd
@@ -354,13 +357,17 @@ proc nl_remove {names} {
     return [llength $cells]
 }
 
+# Detach the loads of unroutable nets.  Returns the number of nets handled
+# (0 when none of them could be found or they are constant nets).
 proc nl_unroutable {bad} {
     nl_log "disconnecting [llength $bad] unroutable nets"
+    set done 0
     foreach n $bad {
         set net [get_nets -quiet $n]
         if {$net eq ""} continue
         # Never tear down the global constant nets.
         if {[get_property TYPE $net] in {GROUND POWER} || $n in {nl_const0 nl_const1}} continue
+        incr done
         set loads [get_pins -quiet -of_objects $net -filter {DIRECTION == IN}]
         catch {disconnect_net -net $net -objects $loads}
         # Fabric cells need their pins connected: tie them to ground.
@@ -376,6 +383,44 @@ proc nl_unroutable {bad} {
             }
         }
     }
+    return $done
+}
+
+# Cells to blame for nets that cannot be repaired by disconnecting them:
+# the net's drivers, or for a net internal to a macro (e.g. "io12/I" of an
+# OBUFDS, not visible to get_nets) the macro cell named before the "/".
+proc nl_net_cells {nets} {
+    set cells [list]
+    foreach n $nets {
+        set net [get_nets -quiet $n]
+        if {$net ne ""} {
+            foreach c [get_cells -quiet -of_objects [get_pins -quiet -of_objects $net -filter {DIRECTION == OUT}]] {
+                lappend cells [get_property NAME $c]
+            }
+        }
+        while {[string first / $n] >= 0} {
+            set n [string range $n 0 [expr {[string last / $n] - 1}]]
+            if {[get_cells -quiet $n] ne ""} { lappend cells $n; break }
+        }
+    }
+    return [lsort -unique $cells]
+}
+
+# Disconnect unroutable nets; when that changes nothing or the same nets
+# failed before, remove the cells driving them instead.  Returns 0 when
+# nothing could be repaired.
+set nl_seen_bad [dict create]
+proc nl_repair_nets {nets} {
+    global nl_seen_bad
+    set again 0
+    foreach n $nets {
+        if {[dict exists $nl_seen_bad $n]} { set again 1 }
+        dict set nl_seen_bad $n 1
+    }
+    if {!$again && [nl_unroutable $nets] > 0} { return 1 }
+    set cells [nl_net_cells $nets]
+    nl_log "removing [llength $cells] cells driving unrepairable nets"
+    return [nl_remove $cells]
 }
 
 # Tie every unconnected input pin of fabric cells to ground (removed cells
@@ -403,9 +448,26 @@ proc nl_fix_dangling {} {
     }
 }
 
+# "Instance GND of type GND is not Placeable": constant cells inserted by
+# Vivado (e.g. for the CI pin of a carry chain whose neighbour was removed)
+# that cannot be placed.  Blame the cells they drive.
+proc nl_const_offenders {txt} {
+    set cells [list]
+    foreach {- c} [regexp -all -inline {Instance\s+(\S+) of type (?:GND|VCC) is not Placeable} $txt] {
+        foreach n [get_nets -quiet -of_objects [get_pins -quiet -of_objects [get_cells -quiet $c]]] {
+            foreach l [get_cells -quiet -of_objects [get_pins -quiet -of_objects $n -filter {DIRECTION == IN}]] {
+                lappend cells [get_property NAME $l]
+            }
+        }
+    }
+    if {[llength $cells]} { nl_log "blaming loads of unplaceable constants: [llength $cells] cells" }
+    return [lsort -unique $cells]
+}
+
 set nl_orphans [list]
 proc nl_finish {{relaxclk 0}} {
     set t0 [clock seconds]
+    nl_log "t_built [clock milliseconds]"
     global nl_orphans
     if {[llength $nl_orphans]} {
         nl_log "orphans [llength $nl_orphans]"
@@ -440,6 +502,7 @@ proc nl_finish {{relaxclk 0}} {
                 nl_log "place_design failed: [string range $e 0 200]"
                 lassign [nl_offenders "ERROR: $e"] names nets
                 global nl_lasttxt
+                if {[llength $names] == 0} { set names [nl_const_offenders $nl_lasttxt] }
                 if {[llength $names] == 0} { set names [nl_utlz_offenders $nl_lasttxt] }
                 if {[llength [get_pblocks -quiet]] && [nl_pblock_trouble]} {
                     nl_log "dropping pblocks (pblock errors)"
@@ -469,8 +532,11 @@ proc nl_finish {{relaxclk 0}} {
                 lassign [nl_offenders "ERROR: $e"] names nets
                 catch {route_design -unroute}
                 if {[llength $nets]} {
-                    # Placement is unchanged: route again directly.
-                    nl_unroutable $nets
+                    # Placement is unchanged: route again directly (unless
+                    # cells had to be removed).
+                    set nfab [llength [get_cells -quiet -hierarchical]]
+                    if {[nl_repair_nets $nets] == 0} { return }
+                    if {[llength [get_cells -quiet -hierarchical]] != $nfab} { set stage place }
                     continue
                 } elseif {[nl_remove $names] == 0} {
                     nl_log "route: nothing to repair"
@@ -510,7 +576,7 @@ proc nl_finish {{relaxclk 0}} {
                 }
                 if {[llength $nets]} {
                     catch {route_design -unroute}
-                    nl_unroutable $nets
+                    if {[nl_repair_nets $nets] == 0} { return }
                     set stage place
                     continue
                 }

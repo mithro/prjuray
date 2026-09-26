@@ -19,6 +19,9 @@ ARCH_OF_FAMILY = {
     'kintexuplus': 'UltraScalePlus',
     'zynquplus': 'UltraScalePlus',
     'artixuplus': 'UltraScalePlus',
+    'virtexuplus': 'UltraScalePlus',
+    'virtexuplusHBM': 'UltraScalePlus',
+    'virtexuplus58g': 'UltraScalePlus',
 }
 
 
