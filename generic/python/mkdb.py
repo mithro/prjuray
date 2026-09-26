@@ -322,7 +322,7 @@ def _collect_one(item):
 # chunk is ([(sorted feature tuple, bit list)] of used tiles, same for
 # empty tiles).  The stamp (inputs' mtimes and sizes) invalidates it.
 # (pickle: the cache is private to the build tree and written only here.)
-CACHE_VERSION = 1
+CACHE_VERSION = 2  # 2: zlib compressed chunks
 
 
 def _cache_stamp(arch, dn, d):
@@ -346,7 +346,7 @@ def _read_index(path):
 def _read_chunk(path, off, n):
     with open(path, 'rb') as f:
         f.seek(off)
-        return pickle.loads(f.read(n))
+        return pickle.loads(zlib.decompress(f.read(n)))
 
 
 def _cache_one(item):
@@ -371,7 +371,7 @@ def _cache_one(item):
     keys = []
     with open(tmp, 'wb') as f:
         for key, c in chunks.items():
-            data = pickle.dumps(c, protocol=pickle.HIGHEST_PROTOCOL)
+            data = zlib.compress(pickle.dumps(c, protocol=pickle.HIGHEST_PROTOCOL), 1)
             keys.append((key, (f.tell(), len(data), len(c[0]), len(c[1]))))
             f.write(data)
         off = f.tell()
