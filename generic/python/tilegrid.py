@@ -50,8 +50,13 @@ class Grid:
         self.rows_per_cr = g['rows']
         self.bpr = g['bpr']
         self.centre = g['centre']
+        self.frame_bits = bitstream.ARCHES[die.arch]['words'] * 32
         self.tiles = {}
         self.at = {}
+        # tile type -> (first bit, end bit) relative to the tile's grid row
+        # (row_bit), overriding the structural window (see windows.py)
+        self.type_windows = {}
+        self.probe = False
         for line in open(die.tiles_tsv):
             p = line.split()
             if p[0] != 'tile':
@@ -114,7 +119,25 @@ class Grid:
         return None
 
     def tile_window(self, name):
-        """(clock region row, first bit, number of bits) or None."""
+        """(clock region row, first bit, number of bits) or None: the
+        structural window, widened to the learnt window of the tile type
+        (type_windows, clipped to the frame unless probing)."""
+        w = self.structural_window(name)
+        t = self.tiles[name]
+        tw = self.type_windows.get(t['type'])
+        base = self.row_bit(t['gy'])
+        if tw is None or base is None:
+            return w
+        lo, hi = base + tw[0], base + tw[1]
+        if w is not None:
+            lo, hi = min(lo, w[1]), max(hi, w[1] + w[2])
+        if not self.probe:
+            lo, hi = max(lo, 0), min(hi, self.frame_bits)
+        return self.crrow[t['gy']], lo, hi - lo
+
+    def structural_window(self, name):
+        """The tile's INT row and the empty grid rows above it; the centre
+        bits for HCLK / RCLK tiles in the centre row."""
         t = self.tiles[name]
         if t['type'] == 'NULL':
             return None
@@ -140,6 +163,29 @@ class Grid:
             off += self.centre
         end = (r + h) * self.bpr + (self.centre if r + h > half else 0)
         return cr, off, end - off
+
+
+def probe_types(grid):
+    """Tile types (with sites) whose structural window is doubtful: taller
+    than one INT row, in the centre (HCLK / RCLK) row, or without a window
+    although the tile has a grid row with bits; only hard blocks (at most
+    PROBE_PER_ROW tiles per clock region row on average), whose windows are
+    cheap to learn and which the structural rule does not describe."""
+    out = collections.Counter()
+    for name, t in grid.tiles.items():
+        if t['type'] == 'NULL' or t['sites'] == '-':
+            continue
+        w = grid.structural_window(name)
+        if w is None:
+            if grid.row_bit(t['gy']) is not None:
+                out[t['type']] += 1
+        elif w[2] > grid.bpr or CENTRE_TYPES.match(t['type']):
+            out[t['type']] += 1
+    nrows = len(set(grid.crrow.values()))
+    return sorted(t for t, n in out.items() if n <= PROBE_PER_ROW * nrows)
+
+
+PROBE_PER_ROW = 3
 
 
 def frame_columns(dframes):
@@ -570,10 +616,28 @@ def main():
                     '--designs is given, read otherwise')
     ap.add_argument('--colmap', help='frame column assignment from '
                     'colalign.py (default: activity only)')
+    ap.add_argument('--windows', help='tile type windows (windows.py '
+                    '--merge output)')
+    ap.add_argument('--probe', help='comma separated tile types (or "auto": '
+                    'tall and windowless ones) given a window of +-'
+                    '--probe-span bits around their grid row, to learn their '
+                    'windows from a bit database built with it')
+    ap.add_argument('--probe-span', type=int, default=None)
     ap.add_argument('--out', required=True)
     args = ap.parse_args()
     die = dieslib.load()[args.die]
     grid = Grid(die)
+    if args.windows:
+        with open(args.windows) as f:
+            grid.type_windows = {t: tuple(w) for t, w in json.load(f).items()}
+    if args.probe:
+        span = args.probe_span or grid.rows_per_cr * grid.bpr + grid.centre
+        types = probe_types(grid) if args.probe == 'auto' else \
+            args.probe.split(',')
+        grid.probe = True
+        for t in types:
+            grid.type_windows[t] = (-span, span)
+        print('probe', ' '.join(sorted(types)))
     dframes = DD.DieFrames(die)
     cols = frame_columns(dframes)
     if args.designs:

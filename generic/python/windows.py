@@ -116,22 +116,92 @@ def learn(die, design_root, tg, verbose=False):
     return out
 
 
+def from_probe(dbdir, grid, span, types, mincount=3, minshare=0.02):
+    """Windows from a bit database built with probe windows (tilegrid.py
+    --probe: +-span bits around the tile's grid row): the hull of the rows
+    (bits per row units) holding bits of at least max(3, minshare x
+    features) features of the type.  Only features seen at least mincount
+    times, and not spread over more than half a clock region (e.g. bank
+    wide settings replicated in every row), count.  Returns {type: (first
+    bit, end bit)} relative to the tile's grid row."""
+    import os
+    bpr = grid.bpr
+    maxspread = grid.rows_per_cr // 2
+    out = {}
+    for tt in types:
+        suf = tt.lower()
+        path = os.path.join(dbdir, f'segbits_{suf}.db')
+        if not os.path.exists(path):
+            continue
+        counts = {}
+        for line in open(os.path.join(dbdir, f'counts_{suf}.txt')):
+            p = line.split()
+            counts[p[0]] = int(p[1])
+        rows = collections.Counter()
+        nf = 0
+        for line in open(path):
+            p = line.split()
+            if counts.get(p[0], 0) < mincount:
+                continue
+            r = {(int(b.split('_')[1]) - span) // bpr for b in p[1:]
+                 if not b.startswith('!')}
+            if not r or max(r) - min(r) > maxspread:
+                continue
+            nf += 1
+            rows.update(r)
+        need = max(3, minshare * nf)
+        keep = [r for r, n in rows.items() if n >= need]
+        if keep:
+            out[tt] = (min(keep) * bpr, (max(keep) + 1) * bpr)
+    return out
+
+
+def merge(paths):
+    """Hull of the windows of several files."""
+    out = {}
+    for p in paths:
+        with open(p) as f:
+            for tt, (lo, hi) in json.load(f).items():
+                if tt in out:
+                    lo, hi = min(lo, out[tt][0]), max(hi, out[tt][1])
+                out[tt] = (lo, hi)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--die', required=True)
-    ap.add_argument('--designs', required=True)
-    ap.add_argument('--tilegrid', required=True)
+    ap.add_argument('--designs')
+    ap.add_argument('--tilegrid')
+    ap.add_argument('--probe-db', help='bit database directory built with '
+                    'the probe tile grid of the die')
+    ap.add_argument('--probe-span', type=int)
+    ap.add_argument('--probe-types', help='comma separated')
+    ap.add_argument('--merge', nargs='*', help='window files to merge')
     ap.add_argument('--out', required=True)
     args = ap.parse_args()
     die = dieslib.load()[args.die]
-    with open(args.tilegrid) as f:
-        tg = json.load(f)
-    out = learn(die, args.designs, tg, True)
+    if args.merge:
+        out = merge(args.merge)
+    elif args.probe_db:
+        grid = TG.Grid(die)
+        span = args.probe_span or grid.rows_per_cr * grid.bpr + grid.centre
+        out = from_probe(args.probe_db, grid, span,
+                         args.probe_types.split(','))
+    else:
+        with open(args.tilegrid) as f:
+            tg = json.load(f)
+        out = learn(die, args.designs, tg, True)
+        with open(args.out, 'w') as f:
+            json.dump(out, f, indent=1, sort_keys=True)
+        for tt, w in sorted(out.items()):
+            print(f'{tt}: {w["lo"]}..{w["hi"]} tiles {w["tiles"]} '
+                  f'bits {w["bits"]}')
+        return
     with open(args.out, 'w') as f:
         json.dump(out, f, indent=1, sort_keys=True)
-    for tt, w in sorted(out.items()):
-        print(f'{tt}: {w["lo"]}..{w["hi"]} tiles {w["tiles"]} '
-              f'bits {w["bits"]}')
+    for tt, (lo, hi) in sorted(out.items()):
+        print(f'{tt}: {lo}..{hi}')
 
 
 if __name__ == '__main__':
