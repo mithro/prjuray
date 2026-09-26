@@ -958,7 +958,8 @@ _GT_REFCLK = re.compile(r'^GTREFCLK\d\d?$')
 _GT_PLLIN = re.compile(r'^(Q?PLL\d?)(REF)?CLK$')
 _GT_PLLOUT = re.compile(r'^(Q?PLL\d?)OUT(REF)?CLK$')
 _GT_CLKIN = re.compile(r'CLK\d?$')
-_GT_SKIP = re.compile(r'^(GT(NORTH|SOUTH|EAST|WEST|G)REFCLK|.*RSVD)')
+# (RXRECCLK*SEL: common outputs without a physical pin.)
+_GT_SKIP = re.compile(r'^(GT(NORTH|SOUTH|EAST|WEST|G)REFCLK|.*RSVD|RXRECCLK\d_?SEL)')
 
 
 def gt_clock_buffer(d, site, driver):
