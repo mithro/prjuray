@@ -941,23 +941,26 @@ def gt_clock_buffer(d, site, driver):
 
 
 def gt_quad_buffers(d, site):
-    """CE / CLR of the BUFG_GTs of a quad: all BUFG_GTs of one GT must
-    share them (Vivado Opt 31-214/215), through a BUFG_GT_SYNC or directly
-    from the fabric (constants cannot reach them)."""
+    """CE / CLR of the BUFG_GTs of a quad: the BUFG_GTs of one GT clock
+    output share them (Vivado Opt 31-214/215) through their BUFG_GT_SYNC
+    (as the transceiver IP does; otherwise Vivado inserts one it often
+    cannot place), or directly from the fabric (constants cannot reach
+    them)."""
     bufs, d.gt_bufs = d.gt_bufs, []
-    if not bufs:
-        return
-    if 'BUFG_GT_SYNC' in d.prims and len({v for _, v in bufs}) == 1 and \
-            d.rng.random() < 0.7:
-        sy = d.cell('BUFG_GT_SYNC')
-        d.connect(bufs[0][1], [f'{sy}/CLK'])
-        d.add_sink(f'{sy}/CE', site, 'fabric')
-        d.add_sink(f'{sy}/CLR', site, 'fabric')
-        d.connect(f'{sy}/CESYNC', [f'{b}/CE' for b, _ in bufs])
-        d.connect(f'{sy}/CLRSYNC', [f'{b}/CLR' for b, _ in bufs])
-    else:
-        d.add_sink([f'{b}/CE' for b, _ in bufs], site, 'fabric')
-        d.add_sink([f'{b}/CLR' for b, _ in bufs], site, 'fabric')
+    groups = collections.defaultdict(list)
+    for b, drv in bufs:
+        groups[drv].append(b)
+    for drv, bl in groups.items():
+        if 'BUFG_GT_SYNC' in d.prims and d.rng.random() < 0.8:
+            sy = d.cell('BUFG_GT_SYNC')
+            d.connect(drv, [f'{sy}/CLK'])
+            d.add_sink(f'{sy}/CE', site, 'fabric')
+            d.add_sink(f'{sy}/CLR', site, 'fabric')
+            d.connect(f'{sy}/CESYNC', [f'{b}/CE' for b in bl])
+            d.connect(f'{sy}/CLRSYNC', [f'{b}/CLR' for b in bl])
+        else:
+            d.add_sink([f'{b}/CE' for b in bl], site, 'fabric')
+            d.add_sink([f'{b}/CLR' for b in bl], site, 'fabric')
 
 
 def gt_block_pins(d, site, n, ref, refclks, common, chsite=None):
@@ -1060,6 +1063,8 @@ def recipe_gt(d, site, ref):
         sel = [site] + [c for c in chans if c != site and rng.random() < 0.4]
     else:
         sel = [c for c in chans if rng.random() < 0.5]
+        if not sel and cn is None and chans:
+            sel = [rng.choice(chans)]
     for ch in sel:
         chref = d.die.sites[ch][0]
         if chref in d.prims:
@@ -1300,6 +1305,9 @@ def recipe_io(d, site, stype):
         # (Bitslices need their BITSLICE_CONTROL: see recipe_native.)
         opts = (['IDDRE1', 'ISERDESE3', 'IDELAYE3'] if us else
                 ['IDDR', 'IDDR_2CLK', 'ISERDESE2', 'IDELAYE2'])
+        if stype.startswith('HDIOB'):
+            # HD banks: only IDDR (no delays / SERDES).
+            opts = ['IDDRE1']
         opts = [o for o in opts if o in d.prims]
         if rng.random() < 0.5 and opts:
             ref2 = rng.choice(opts)
@@ -1340,6 +1348,8 @@ def recipe_io(d, site, stype):
         d.add_sink(f'{name}/T', site, hard=True)
     else:
         opts = (['ODDRE1', 'OSERDESE3'] if us else ['ODDR', 'OSERDESE2'])
+        if stype.startswith('HDIOB'):
+            opts = ['ODDRE1']
         opts = [o for o in opts if o in d.prims]
         if rng.random() < 0.5 and opts:
             ref2 = rng.choice(opts)
