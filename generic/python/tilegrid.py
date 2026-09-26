@@ -455,19 +455,25 @@ def build(grid, dframes, cols, crmap, colmap, colmap1, verbose=False):
         out[name] = entry
     # Block RAM content frames (block type 1): the k-th BRAM column of a
     # clock region row owns the k-th block type 1 frame column of that row.
-    # Frame columns exist for every BRAM grid column of the die, even in
-    # rows where other blocks (e.g. the PS) replace the BRAM tiles.
-    all_bram_gx = sorted({
-        t['gx']
-        for t in grid.tiles.values()
-        if 'RAMB36' in t['sites'] or 'RAMBFIFO36' in t['sites']
-    })
+    # Frame columns may also exist for BRAM grid columns of other rows (or
+    # none: e.g. where the PS replaces the BRAM tiles); then the die wide
+    # BRAM column list is used, or a constant shift learnt from activity.
+    def is_bram(t):
+        return 'RAMB36' in t['sites'] or 'RAMBFIFO36' in t['sites']
+
+    all_bram_gx = sorted({t['gx'] for t in grid.tiles.values() if is_bram(t)})
+    row_bram_gx = collections.defaultdict(set)
+    for t in grid.tiles.values():
+        if is_bram(t):
+            row_bram_gx[grid.crrow[t['gy']]].add(t['gx'])
     for cr in sorted(set(grid.crrow.values())):
         key = crmap.get(cr)
         if key is None:
             continue
         b1 = cols.get((1, key[1], key[2]), [])
-        gxs = all_bram_gx
+        gxs = sorted(row_bram_gx.get(cr, ()))
+        if len(b1) != len(gxs):
+            gxs = all_bram_gx
         if len(b1) != len(gxs):
             if verbose:
                 print('bram column mismatch', cr, len(b1), len(gxs))
