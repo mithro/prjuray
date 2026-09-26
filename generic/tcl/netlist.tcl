@@ -13,16 +13,29 @@ proc nl_log {msg} {
     flush $nl_logfp
 }
 
+# Vivado log read back by nl_offenders (a shared Vivado process running
+# several designs, see nl_server.tcl, passes its log in NL_VIVADO_LOG).
+set nl_vivado_log vivado.log
+if {[info exists ::env(NL_VIVADO_LOG)]} { set nl_vivado_log $::env(NL_VIVADO_LOG) }
+
 proc nl_init {part} {
-    global nl_logfp
+    global nl_logfp nl_vivado_log nl_logpos
     set nl_logfp [open nl.log w]
     # Wall clock stamps (ms since the epoch) for run time accounting.
     nl_log "t_start [clock milliseconds]"
+    # Per design state left by a previous design of the same Vivado process.
+    foreach v {nl_props nl_was_reset nl_bank_std} {
+        global $v
+        unset -nocomplain $v
+    }
+    if {[file exists $nl_vivado_log]} { set nl_logpos [file size $nl_vivado_log] }
     create_project -in_memory -part $part
     link_design -part $part
     nl_log "t_linked [clock milliseconds]"
     set_param messaging.defaultLimit 100000
-    set_param general.maxThreads 2
+    set threads 2
+    if {[info exists ::env(NL_THREADS)]} { set threads $::env(NL_THREADS) }
+    set_param general.maxThreads $threads
     create_cell -reference GND nl_gnd
     create_cell -reference VCC nl_vcc
     create_net nl_const0
@@ -34,6 +47,7 @@ proc nl_init {part} {
 # Create a cell with parameters.  Parameters Vivado rejects are logged and
 # left at their defaults.
 proc nl_cell {name ref {props {}} {loc {}} {bel {}}} {
+    nl_flush_nets
     if {[catch {create_cell -reference $ref $name} e]} {
         nl_log "cellerr $name $ref $e"
         return 0
@@ -111,17 +125,54 @@ proc nl_net {name pins} {
         }
         return
     }
-    if {[catch {create_net $name} e]} {
-        nl_log "neterr $name $e"
-        return
+    # Nets are created and connected in batches (one create_net and one
+    # connect_net call per batch is much faster than one per net).
+    global nl_pending
+    lappend nl_pending $name [concat $drv $loads]
+    if {[llength $nl_pending] >= 4000} { nl_flush_nets }
+}
+
+# Create and connect the nets queued by nl_net.  A failing batch is redone
+# net by net so that errors are logged per net as before.
+set nl_pending [list]
+proc nl_flush_nets {} {
+    global nl_pending
+    if {[llength $nl_pending] == 0} return
+    set batch $nl_pending
+    set nl_pending [list]
+    set names [list]
+    foreach {n -} $batch { lappend names $n }
+    if {[catch {create_net $names}]} {
+        set ok [list]
+        foreach {n objs} $batch {
+            if {[llength [get_nets -quiet $n]]} {
+                nl_log "neterr $n exists"
+            } elseif {[catch {create_net $n} e]} {
+                nl_log "neterr $n $e"
+            } else {
+                lappend ok $n $objs
+            }
+        }
+        set batch $ok
     }
-    if {[catch {connect_net -net $name -objects [concat $drv $loads]} e]} {
-        nl_log "connerr $name [string range $e 0 200]"
+    if {[catch {connect_net -net_object_list $batch}]} {
+        foreach {n objs} $batch {
+            set have [get_pins -quiet -of_objects [get_nets -quiet $n]]
+            set todo [list]
+            foreach o $objs {
+                if {[lsearch -exact $have $o] < 0} { lappend todo $o }
+            }
+            if {[llength $todo] == 0} continue
+            if {[catch {connect_net -net $n -objects [get_pins -quiet $todo]} e]} {
+                nl_log "connerr $n [string range $e 0 200]"
+            }
+        }
     }
 }
 
 # Connect pins to an existing net (e.g. the constant nets).
 proc nl_conn {net pins} {
+    nl_flush_nets
     set objs [get_pins -quiet $pins]
     if {[llength $objs] == 0} return
     if {[catch {connect_net -net $net -objects $objs} e]} {
@@ -131,6 +182,7 @@ proc nl_conn {net pins} {
 
 # Create a top level port with an I/O buffer attached to <pin>.
 proc nl_port {name dir pin} {
+    nl_flush_nets
     if {[catch {create_port -direction $dir $name} e]} {
         nl_log "porterr $name $e"
         return
@@ -173,11 +225,11 @@ proc nl_padpin {name pin site func dir} {
 # vivado.log since the last call.
 set nl_logpos 0
 proc nl_offenders {{extra ""}} {
-    global nl_logpos
+    global nl_logpos nl_vivado_log
     set names [list]
     set nets [list]
     if {[catch {
-        set lf [open vivado.log r]
+        set lf [open $nl_vivado_log r]
         seek $lf $nl_logpos
         set txt [read $lf]
         set nl_logpos [tell $lf]
@@ -209,6 +261,11 @@ proc nl_offenders {{extra ""}} {
             foreach c [get_cells -quiet -of_objects [get_sites -quiet $s]] {
                 lappend names [get_property NAME $c]
             }
+        }
+        # I/O placer reports list the terminals on continuation lines far
+        # below the ERROR ("Term: io12_p", "occupied by term: io13_n").
+        foreach {- n} [regexp -all -inline -nocase {\mterm: ((?:c|io)\d+)(?![0-9])} $line] {
+            lappend names $n
         }
         if {[regexp {Net: (\S+) is not completely routed} $line - n]} {
             lappend nets $n
@@ -244,6 +301,11 @@ proc nl_offenders {{extra ""}} {
             # Errors naming sites (e.g. bitgen): take the cells placed there.
             foreach {- s} [regexp -all -inline {\m([A-Z][A-Z0-9_]*_X\d+Y\d+)\M} $line] {
                 set site [get_sites -quiet $s]
+                if {$site eq "" && ![regexp {^(CLE|CLB|INT)} $s]} {
+                    # A tile (e.g. bitgen "VEAM exception in tile
+                    # BRAM_X56Y125"): the cells of its hard block sites.
+                    set site [get_sites -quiet -of_objects [get_tiles -quiet $s]]
+                }
                 if {$site ne "" && ![string match SLICE_* $s]} {
                     foreach c [get_cells -quiet -of_objects $site] {
                         lappend names [get_property NAME $c]
@@ -520,6 +582,7 @@ proc nl_const_offenders {txt} {
 
 set nl_orphans [list]
 proc nl_finish {{relaxclk 0}} {
+    nl_flush_nets
     set t0 [clock seconds]
     nl_log "t_built [clock milliseconds]"
     global nl_orphans
@@ -585,6 +648,18 @@ proc nl_finish {{relaxclk 0}} {
                 nl_log "route_design failed: [string range $e 0 200]"
                 lassign [nl_offenders "ERROR: $e"] names nets
                 catch {route_design -unroute}
+                global nl_lasttxt nl_unrelaxed
+                if {[string match "*Fixed routes overlap*" $nl_lasttxt] && ![info exists nl_unrelaxed]} {
+                    # Clock nets routed through the fabric (relaxed dedicated
+                    # routes) conflict with the global clock routes: go back
+                    # to dedicated clock routing and place again.
+                    set nl_unrelaxed 1
+                    nl_log "fixed routes overlap: dedicated clock routes again"
+                    catch {set_property CLOCK_DEDICATED_ROUTE TRUE [get_nets -quiet -hierarchical -filter {CLOCK_DEDICATED_ROUTE == FALSE}]}
+                    catch {place_design -unplace}
+                    set stage place
+                    continue
+                }
                 if {[llength $nets]} {
                     # Placement is unchanged: route again directly (unless
                     # cells had to be removed).
@@ -656,6 +731,7 @@ proc nl_finish {{relaxclk 0}} {
 
 # Constrain cells to a region.
 proc nl_pblock {name range cells} {
+    nl_flush_nets
     if {[catch {
         set pb [create_pblock $name]
         resize_pblock $pb -add $range
@@ -673,6 +749,7 @@ proc nl_pblock {name range cells} {
 #   props: random buffer/port properties to try
 set nl_bank_vcco [dict create]
 proc nl_iob {name site mode ref stds props} {
+    nl_flush_nets
     global nl_bank_vcco
     set s [get_sites -quiet $site]
     if {$s eq ""} { nl_log "ioberr $name nosite"; return 0 }
@@ -690,6 +767,11 @@ proc nl_iob {name site mode ref stds props} {
         return 0
     }
     set pair [get_property -quiet DIFF_PAIR_PIN $pin]
+    # (The N side of a differential buffer must not land on them either.)
+    if {[string match diff* $mode] && $pair ne "" && [regexp {VRP|VREF} [get_property -quiet PIN_FUNC [get_package_pins -quiet $pair]]]} {
+        nl_log "ioberr $name vref"
+        return 0
+    }
     if {[string match diff* $mode] && $pair ne "" && [llength [get_ports -quiet -of_objects [get_package_pins -quiet $pair]]]} {
         set mode [dict get {diffin in diffout out difftri tri} $mode]
         set ref [dict get {in IBUF out OBUF tri OBUFT} $mode]
@@ -715,7 +797,7 @@ proc nl_iob {name site mode ref stds props} {
         # Bidirectional ports need a bidirectional standard.
         set bi [list]
         foreach sv $stds {
-            if {[regexp {^(LVCMOS|LVTTL|LVDCI)|_T_DCI:} $sv]} { lappend bi $sv }
+            if {[regexp {^(LVCMOS|LVTTL|LVDCI)|_T_DCI:} $sv] && ![string match LVCMOS10:* $sv]} { lappend bi $sv }
         }
         set stds $bi
     }
@@ -773,7 +855,12 @@ proc nl_iob {name site mode ref stds props} {
     }
     foreach p $ports {
         if {[catch {set_property IOSTANDARD $std [get_ports $p]} e]} {
-            nl_log "properr $name IOSTANDARD $std"
+            # Left at the default standard the buffer conflicts with the
+            # bank VCCO chosen here: drop it.
+            nl_log "ioberr $name IOSTANDARD $std"
+            foreach q $ports { catch {remove_port [get_ports $q]} }
+            catch {remove_cell [get_cells $name]}
+            return 0
         }
     }
     set btype [get_property -quiet BANK_TYPE $bank]
@@ -818,6 +905,7 @@ proc nl_iob {name site mode ref stds props} {
 # generator with nl_want_pip and applied by nl_finish before routing.
 set nl_wanted_pips [list]
 proc nl_want_pip {net pip} {
+    nl_flush_nets
     global nl_wanted_pips
     lappend nl_wanted_pips $net $pip
 }

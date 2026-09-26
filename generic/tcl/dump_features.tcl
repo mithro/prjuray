@@ -119,6 +119,21 @@ proc _df_bidir_all {pips} {
     return $res
 }
 
+# The nets whose routing is dumped: the signal nets plus one ground and one
+# power net.  All constant nets (thousands where Vivado inserted constants)
+# share the routing of the global ground/power net, so querying all of them
+# returns that routing once per net (up to hundreds of millions of PIPs:
+# "max size for a Tcl value exceeded").
+proc _df_route_nets {} {
+    set names [get_property NAME [get_nets -hierarchical -quiet -filter {TYPE != GROUND && TYPE != POWER}]]
+    foreach t {GROUND POWER} {
+        set ns [get_nets -hierarchical -quiet -filter "TYPE == $t"]
+        if {[llength $ns]} { lappend names [get_property NAME [lindex $ns 0]] }
+    }
+    # A collection again (commands taking -of_objects reject plain names).
+    return [get_nets -quiet $names]
+}
+
 # get_property over a list of objects, falling back to one query per object
 # when values containing spaces (or empty values) break the returned list.
 proc _df_props {prop objs} {
@@ -147,7 +162,7 @@ proc dump_features {out} {
         }
     }
     set t0 [clock milliseconds]
-    set allpips [lsort -unique [get_pips -quiet -of_objects [get_nets -hierarchical -quiet]]]
+    set allpips [lsort -unique [get_pips -quiet -of_objects [_df_route_nets]]]
     # Direction of used bidirectional PIPs.
     set bidir [_df_bidir_all $allpips]
     puts $fp "# t_bidir [expr {[clock milliseconds] - $t0}]"
@@ -180,7 +195,7 @@ proc dump_features {out} {
     # Used sites, plus sites only used for routing (e.g. LUTs generating
     # constants, route-throughs), found through their connected site pins.
     set sites [get_sites -quiet -filter {IS_USED}]
-    set sites [lsort -unique [concat $sites [get_sites -quiet -of_objects [get_site_pins -quiet -of_objects [get_nets -hierarchical -quiet]]]]]
+    set sites [lsort -unique [concat $sites [get_sites -quiet -of_objects [get_site_pins -quiet -of_objects [_df_route_nets]]]]]
     puts $fp "# t_sitelist [expr {[clock milliseconds] - $t0}]"
     # Vectorised queries (one Tcl call per property over many objects).
     if {[llength $sites]} {

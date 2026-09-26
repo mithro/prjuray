@@ -119,8 +119,18 @@ class Design:
         self.gt_quads = set()
         self.gt_bufs = []  # (BUFG_GT, driver) of the current GT quad
         self.config_done = False
+        self.nclkbuf = 0
         self.native_used = set()
         self.sites_used = set()  # hard sites taken by recipes
+
+    def take_clock_buffer(self):
+        # Account one more recipe clock buffer; False once there are as
+        # many as the clock tracks of a clock region can carry (else the
+        # global clock router fails, after a long time).
+        if self.nclkbuf >= (16 if is_us(self.die) else 10):
+            return False
+        self.nclkbuf += 1
+        return True
 
     def die_arch(self):
         return {'kintexu': 'UltraScale', 'kintexuplus': 'UltraScalePlus',
@@ -761,7 +771,10 @@ def clockgen_params(ref, params, rng):
 def global_buffer(d, site, driver, export=True):
     """A global clock buffer (placed by Vivado) on <driver>; with export its
     output becomes a clock of the design.  (Regional BUFH buffers conflict
-    with the slice pblocks.)"""
+    with the slice pblocks.)  None once the design has its maximum number
+    of clock buffers."""
+    if not d.take_clock_buffer():
+        return None
     ref = 'BUFGCE' if is_us(d.die) else 'BUFG'
     if ref not in d.prims:
         ref = 'BUFG'
@@ -800,8 +813,8 @@ def recipe_clockgen(d, site, ref):
              if v in ('ZHOLD', 'BUF_IN', 'AUTO')] or ['INTERNAL'])
     n = d.cell(ref, site, None, props)
     pins = {p: dr for dr, p in pins_of(d.prims, ref)}
-    if fbbuf:
-        b = global_buffer(d, site, f'{n}/CLKFBOUT', export=False)
+    b = fbbuf and global_buffer(d, site, f'{n}/CLKFBOUT', export=False)
+    if b:
         d.connect(f'{b}/O', [f'{n}/CLKFBIN'])
     else:
         d.connect(f'{n}/CLKFBOUT', [f'{n}/CLKFBIN'])
@@ -931,6 +944,8 @@ def gt_clock_buffer(d, site, driver):
     rng = d.rng
     if 'BUFG_GT' not in d.prims:
         return global_buffer(d, site, driver)
+    if not d.take_clock_buffer():
+        return None
     b = d.cell('BUFG_GT', None, None, d.random_params('BUFG_GT'))
     d.connect(driver, [f'{b}/I'])
     for p in ('CEMASK', 'CLRMASK', 'DIV[0]', 'DIV[1]', 'DIV[2]'):
@@ -941,23 +956,26 @@ def gt_clock_buffer(d, site, driver):
 
 
 def gt_quad_buffers(d, site):
-    """CE / CLR of the BUFG_GTs of a quad: all BUFG_GTs of one GT must
-    share them (Vivado Opt 31-214/215), through a BUFG_GT_SYNC or directly
-    from the fabric (constants cannot reach them)."""
+    """CE / CLR of the BUFG_GTs of a quad: the BUFG_GTs of one GT clock
+    output share them (Vivado Opt 31-214/215) through their BUFG_GT_SYNC
+    (as the transceiver IP does; otherwise Vivado inserts one it often
+    cannot place), or directly from the fabric (constants cannot reach
+    them)."""
     bufs, d.gt_bufs = d.gt_bufs, []
-    if not bufs:
-        return
-    if 'BUFG_GT_SYNC' in d.prims and len({v for _, v in bufs}) == 1 and \
-            d.rng.random() < 0.7:
-        sy = d.cell('BUFG_GT_SYNC')
-        d.connect(bufs[0][1], [f'{sy}/CLK'])
-        d.add_sink(f'{sy}/CE', site, 'fabric')
-        d.add_sink(f'{sy}/CLR', site, 'fabric')
-        d.connect(f'{sy}/CESYNC', [f'{b}/CE' for b, _ in bufs])
-        d.connect(f'{sy}/CLRSYNC', [f'{b}/CLR' for b, _ in bufs])
-    else:
-        d.add_sink([f'{b}/CE' for b, _ in bufs], site, 'fabric')
-        d.add_sink([f'{b}/CLR' for b, _ in bufs], site, 'fabric')
+    groups = collections.defaultdict(list)
+    for b, drv in bufs:
+        groups[drv].append(b)
+    for drv, bl in groups.items():
+        if 'BUFG_GT_SYNC' in d.prims and d.rng.random() < 0.8:
+            sy = d.cell('BUFG_GT_SYNC')
+            d.connect(drv, [f'{sy}/CLK'])
+            d.add_sink(f'{sy}/CE', site, 'fabric')
+            d.add_sink(f'{sy}/CLR', site, 'fabric')
+            d.connect(f'{sy}/CESYNC', [f'{b}/CE' for b in bl])
+            d.connect(f'{sy}/CLRSYNC', [f'{b}/CLR' for b in bl])
+        else:
+            d.add_sink([f'{b}/CE' for b in bl], site, 'fabric')
+            d.add_sink([f'{b}/CLR' for b in bl], site, 'fabric')
 
 
 def gt_block_pins(d, site, n, ref, refclks, common, chsite=None):
@@ -1060,6 +1078,8 @@ def recipe_gt(d, site, ref):
         sel = [site] + [c for c in chans if c != site and rng.random() < 0.4]
     else:
         sel = [c for c in chans if rng.random() < 0.5]
+        if not sel and cn is None and chans:
+            sel = [rng.choice(chans)]
     for ch in sel:
         chref = d.die.sites[ch][0]
         if chref in d.prims:
@@ -1300,6 +1320,9 @@ def recipe_io(d, site, stype):
         # (Bitslices need their BITSLICE_CONTROL: see recipe_native.)
         opts = (['IDDRE1', 'ISERDESE3', 'IDELAYE3'] if us else
                 ['IDDR', 'IDDR_2CLK', 'ISERDESE2', 'IDELAYE2'])
+        if stype.startswith('HDIOB'):
+            # HD banks: only IDDR (no delays / SERDES).
+            opts = ['IDDRE1']
         opts = [o for o in opts if o in d.prims]
         if rng.random() < 0.5 and opts:
             ref2 = rng.choice(opts)
@@ -1340,6 +1363,8 @@ def recipe_io(d, site, stype):
         d.add_sink(f'{name}/T', site, hard=True)
     else:
         opts = (['ODDRE1', 'OSERDESE3'] if us else ['ODDR', 'OSERDESE2'])
+        if stype.startswith('HDIOB'):
+            opts = ['ODDRE1']
         opts = [o for o in opts if o in d.prims]
         if rng.random() < 0.5 and opts:
             ref2 = rng.choice(opts)
