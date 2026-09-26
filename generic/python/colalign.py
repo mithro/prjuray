@@ -215,6 +215,10 @@ class Model:
                     # no pair across it either
                     prev = None
                     continue
+                if nf is None:
+                    # contradicted by activity: not learnt from
+                    prev = None
+                    continue
                 self.emit[kind][nf] += 1
                 if prev is not None:
                     x = int(prev[1] != j)
@@ -681,13 +685,23 @@ def main():
                     if kinds[gx] not in dropped}
     model = Model()
     for it in range(args.iters):
+        # Frame counts are learnt from assignments the activity does not
+        # contradict (an alignment must not reinforce its own mistakes).
         data = []
         for (d, cr), asg in cur.items():
             dr = rows[d]
             m = dr.majors(cr)
-            data.append([(k, asg.get(gx),
-                          m[asg[gx]][2] if gx in asg else None)
-                         for gx, k in seqs(dr, cr)])
+            sc = dr.ev['scores'].get(cr, {})
+            row = []
+            for gx, k in seqs(dr, cr):
+                j = asg.get(gx)
+                nf = m[j][2] if j is not None else None
+                v = sc.get(gx)
+                if j is not None and v is not None and \
+                        v.max() >= MIN_ACT and v[j] < 0.5 * v.max():
+                    nf = None
+                row.append((k, j, nf))
+            data.append(row)
         model.fit(data, nf_all, silent)
         new = {}
         changed = 0
