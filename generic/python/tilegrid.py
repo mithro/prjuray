@@ -423,6 +423,31 @@ def fill_gaps(grid, crmap, colmap, block0, verbose=False):
                       'columns', free_g)
 
 
+def virtual_bram_shift(clist, colmap, cr, gxs, extra):
+    """A clock region row with more BRAM content frame columns than BRAM
+    grid columns (e.g. the PS replaces part of the fabric): the extra frame
+    columns belong to frame columns of block 0 without grid columns whose
+    frame count is that of the BRAM columns' frame columns.  Returns the
+    number of extra columns before the first BRAM grid column when that is
+    unambiguous (all candidates on one side), else None."""
+    idx = {c[0]: j for j, c in enumerate(clist)}
+    real = [idx.get(colmap.get((cr, gx))) for gx in gxs]
+    if None in real:
+        return None
+    nfs = {clist[j][2] for j in real}
+    used = {idx[m] for (c, _), m in colmap.items() if c == cr and m in idx}
+    cand = [j for j, c in enumerate(clist) if j not in used and c[2] in nfs]
+    left = [j for j in cand if j < min(real)]
+    right = [j for j in cand if j > max(real)]
+    if len(left) + len(right) != len(cand):
+        return None
+    if len(left) >= extra and not right:
+        return extra
+    if len(right) >= extra and not left:
+        return 0
+    return None
+
+
 def build(grid, dframes, cols, crmap, colmap, colmap1, verbose=False):
     """Returns the tilegrid dict: tile -> {type, gx, gy, bits: [...]}.
     crmap: clock region row -> (block, half, row); colmap: (clock region
@@ -472,6 +497,11 @@ def build(grid, dframes, cols, crmap, colmap, colmap1, verbose=False):
             continue
         b1 = cols.get((1, key[1], key[2]), [])
         gxs = sorted(row_bram_gx.get(cr, ()))
+        if len(b1) > len(gxs) and gxs:
+            shift = virtual_bram_shift(cols[key], colmap, cr, gxs,
+                                       len(b1) - len(gxs))
+            if shift is not None:
+                b1 = b1[shift:shift + len(gxs)]
         if len(b1) != len(gxs):
             gxs = all_bram_gx
         if len(b1) != len(gxs):
