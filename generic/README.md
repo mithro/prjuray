@@ -20,6 +20,29 @@ the bitstream.
 | Bit database | `python/mkdb.py` | `build/db/<arch>/segbits_<tiletype>.db`, `defaults_<tiletype>.db` |
 | Checking / decoding | `python/check.py` | undocumented bit report, FASM |
 
+### Running designs
+
+`python/run_designs.py --die <dies> --tag <tag> --seeds <a:b> --jobs <n>`
+runs the seeds of the dies with `n` designs in parallel.  Options for
+throughput:
+
+* `--reuse N`: one Vivado process (`tcl/nl_server.tcl`) runs up to N
+  designs of a die in turn, saving the Vivado start-up and most of the
+  device load and bitgen data loading of every design (xa7s15: ~26 s of
+  ~225 s per design).
+* `--threads T`: Vivado `general.maxThreads` (default 2).  Vivado runs
+  mostly single threaded; T=1 uses the same CPU time per design.
+
+For long campaigns and several machines, `python/scheduler.py` keeps the
+work items as files in a queue directory (`submit` them, start any number
+of `work` runners on machines sharing the file system, `status`,
+`requeue`).
+
+Every design directory gets `run.stats` (wall and CPU seconds, status) and
+`nl.log` wall clock stamps; `python/runstats.py <roots>` prints the success
+rate, successful designs per core hour, the phase split and a histogram of
+failure causes with the time they cost.
+
 ### Features
 
 `tcl/dump_features.tcl` dumps, for a routed design, every used PIP, every used
