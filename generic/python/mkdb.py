@@ -30,6 +30,7 @@ import zlib
 
 import numpy as np
 
+import bitstream
 import designdata as DD
 import dies as dieslib
 import features as featlib
@@ -77,13 +78,23 @@ class Collector:
         return out
 
     def unowned(self, ids):
+        """Set bits in no tile's region.  self.hidden counts those of them
+        in frame rows without any tile region (e.g. frame rows of fabric
+        the device does not expose, configured but without tiles)."""
+        if not hasattr(self, "_hidden_frame"):
+            key = [bitstream.far_fields(self.die.arch, f)[:3]
+                   for f in self.df.frames]
+            used = {key[f] for f in self.by_frame}
+            self._hidden_frame = [k not in used for k in key]
         fis = ids // self.nbf
         offs = ids % self.nbf
         n = 0
+        self.hidden = 0
         for f, o in zip(fis.tolist(), offs.tolist()):
             if not any(off <= o < off + k
                        for off, k, _ in self.by_frame.get(f, ())):
                 n += 1
+                self.hidden += self._hidden_frame[f]
         return n
 
     def samples(self, design_dir, empty_keep=0.2, rng=None):
