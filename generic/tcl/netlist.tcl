@@ -158,6 +158,7 @@ proc nl_padpin {name pin site func dir} {
         catch {remove_cell [get_cells -of_objects $p]}
         return
     }
+    if {$dir eq "CHECK"} return
     if {[catch {
         create_port -direction $dir $name
         create_net ${name}_pad

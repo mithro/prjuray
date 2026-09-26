@@ -609,6 +609,7 @@ DEDICATED = {
     'XADC': {'VP', 'VN'} | {f'VAUX{s}[{i}]' for s in 'PN' for i in range(16)},
     'SYSMONE1': {'VP', 'VN'} |
                 {f'VAUX{s}[{i}]' for s in 'PN' for i in range(16)},
+    'HPIO_VREF': {'VREF'},
     'SYSMONE4': {'VP', 'VN'} |
                 {f'VAUX{s}[{i}]' for s in 'PN' for i in range(16)},
 }
@@ -644,6 +645,11 @@ def _fmt(x):
 # Pins (by regexp) that only connect to package pads or other hard blocks.
 DEDICATED_RE = {
     'PS8': re.compile(r'_PAD_'),
+}
+# Clock outputs of hard blocks that must drive a given clock buffer.
+CLOCK_OUT_BUFFERS = {
+    'PS8': (re.compile(r'^(PLCLK\[\d\]|DP(AUDIO|VIDEO)REFCLK|FMIO\w*TOPLBUFG|'
+                       r'OSCRTCCLK)$'), 'BUFG_PS'),
 }
 
 
@@ -833,6 +839,12 @@ def recipe_hard(d, site, ref, pconn=0.6):
         return
     props = d.random_params(ref)
     n = d.cell(ref, site, None, props)
+    npins = len(pins_of(d.prims, ref))
+    if npins > 500:
+        # Huge blocks (PS, PCIe, CMAC, VCU): thousands of random nets make
+        # placement / routing take longer than the time budget.
+        pconn = max(0.1, min(pconn, 300.0 / npins))
+    clkbuf = CLOCK_OUT_BUFFERS.get(ref)
     shared = set()
     if props.get('CLOCK_DOMAINS') == 'COMMON' or props.get('EN_SYN') == 'TRUE':
         pins = {p for _, p in pins_of(d.prims, ref)}
@@ -859,7 +871,13 @@ def recipe_hard(d, site, ref, pconn=0.6):
                     continue
                 d.add_sink(full, site, kind, hard=True)
         elif direction == 'OUT':
-            if rng.random() < pconn:
+            if clkbuf and clkbuf[0].search(pin):
+                # Clock outputs that only reach a dedicated buffer.
+                if clkbuf[1] in d.prims and rng.random() < 0.5:
+                    b = d.cell(clkbuf[1])
+                    d.connect(full, [f'{b}/I'])
+                    d.clocks.append(f'{b}/O')
+            elif rng.random() < pconn:
                 d.add_source(full, site)
 
 
@@ -907,8 +925,9 @@ _GT_SKIP = re.compile(r'^(GT(NORTH|SOUTH|EAST|WEST|G)REFCLK|.*RSVD)')
 
 
 def gt_clock_buffer(d, site, driver):
-    """Clock buffer on a GT clock output: BUFG_GT (sometimes with a
-    BUFG_GT_SYNC) on UltraScale, BUFG/BUFH on 7-series."""
+    """Clock buffer on a GT clock output: BUFG_GT on UltraScale (CE / CLR
+    shared by all BUFG_GTs of the quad, see gt_quad_buffers), BUFG on
+    7-series."""
     rng = d.rng
     if 'BUFG_GT' not in d.prims:
         return global_buffer(d, site, driver)
@@ -916,19 +935,29 @@ def gt_clock_buffer(d, site, driver):
     d.connect(driver, [f'{b}/I'])
     for p in ('CEMASK', 'CLRMASK', 'DIV[0]', 'DIV[1]', 'DIV[2]'):
         d.tie(f'{b}/{p}', int(rng.random() < 0.3))
-    if 'BUFG_GT_SYNC' in d.prims and rng.random() < 0.5:
-        sy = d.cell('BUFG_GT_SYNC')
-        d.connect(driver, [f'{sy}/CLK'])
-        d.add_sink(f'{sy}/CE', site, 'fabric')
-        d.add_sink(f'{sy}/CLR', site, 'fabric')
-        d.connect(f'{sy}/CESYNC', [f'{b}/CE'])
-        d.connect(f'{sy}/CLRSYNC', [f'{b}/CLR'])
-    else:
-        # CE / CLR: the constant tie-offs cannot reach them.
-        d.add_sink(f'{b}/CE', site, 'fabric')
-        d.add_sink(f'{b}/CLR', site, 'fabric')
+    d.gt_bufs.append((b, driver))
     d.clocks.append(f'{b}/O')
     return b
+
+
+def gt_quad_buffers(d, site):
+    """CE / CLR of the BUFG_GTs of a quad: all BUFG_GTs of one GT must
+    share them (Vivado Opt 31-214/215), through a BUFG_GT_SYNC or directly
+    from the fabric (constants cannot reach them)."""
+    bufs, d.gt_bufs = d.gt_bufs, []
+    if not bufs:
+        return
+    if 'BUFG_GT_SYNC' in d.prims and len({v for _, v in bufs}) == 1 and \
+            d.rng.random() < 0.7:
+        sy = d.cell('BUFG_GT_SYNC')
+        d.connect(bufs[0][1], [f'{sy}/CLK'])
+        d.add_sink(f'{sy}/CE', site, 'fabric')
+        d.add_sink(f'{sy}/CLR', site, 'fabric')
+        d.connect(f'{sy}/CESYNC', [f'{b}/CE' for b, _ in bufs])
+        d.connect(f'{sy}/CLRSYNC', [f'{b}/CLR' for b, _ in bufs])
+    else:
+        d.add_sink([f'{b}/CE' for b, _ in bufs], site, 'fabric')
+        d.add_sink([f'{b}/CLR' for b, _ in bufs], site, 'fabric')
 
 
 def gt_block_pins(d, site, n, ref, refclks, common, chsite=None):
@@ -942,9 +971,12 @@ def gt_block_pins(d, site, n, ref, refclks, common, chsite=None):
         m = _GT_PAD.match(p)
         if m:
             if chsite:
+                # 7-series: Vivado inserts I/O buffers on GT pad ports (that
+                # then fail placement): only check the pads are bonded.
                 d.padpin(f'{n}_{p.lower()}', full, chsite,
                          f'^MGT[A-Z]*{m.group(1)}{m.group(2)}\\d',
-                         'IN' if dr == 'IN' else 'OUT')
+                         ('IN' if dr == 'IN' else 'OUT') if is_us(d.die)
+                         else 'CHECK')
             continue
         if _GT_SKIP.match(p):
             continue
@@ -1033,6 +1065,7 @@ def recipe_gt(d, site, ref):
         if chref in d.prims:
             n = d.cell(chref, ch, None, d.random_params(chref))
             gt_block_pins(d, site, n, chref, refclks, cn, ch)
+    gt_quad_buffers(d, site)
 
 
 # Configuration primitives (one site each on 7-series, BELs of the single
