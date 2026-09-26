@@ -841,6 +841,29 @@ def recipe_clockgen(d, site, ref):
                        else 'data', hard=True)
 
 
+def pin_mapped(ref, props, pin):
+    """False for logical pins without a physical pin in the configuration
+    given by props (their nets are unroutable: "Pin mapping failure, cannot
+    reach driver pin").  UltraScale FIFOs: the upper data outputs exist
+    only at the widest read width, the counters have fewer bits for wider
+    ports."""
+    m = re.match(r'^(DOUTP?|RDCOUNT|WRCOUNT)\[(\d+)\]$', pin)
+    if not m or ref not in ('FIFO18E2', 'FIFO36E2'):
+        return True
+    wide = 36 if ref == 'FIFO18E2' else 72
+    i = int(m.group(2))
+    if m.group(1).startswith('DOUT'):
+        if props.get('READ_WIDTH', '4') == str(wide):
+            return True
+        return i < {('DOUT', 36): 16, ('DOUTP', 36): 2,
+                    ('DOUT', 72): 32, ('DOUTP', 72): 4}[(m.group(1), wide)]
+    w = int(props.get('READ_WIDTH' if m.group(1) == 'RDCOUNT'
+                      else 'WRITE_WIDTH', '4'))
+    widths = [4, 9, 18, 36, 72] if wide == 72 else [4, 9, 18, 36]
+    nbits = 9 + len(widths) - 1 - widths.index(w) if w in widths else 9
+    return i < nbits
+
+
 def recipe_hard(d, site, ref, pconn=0.6):
     """One primitive LOCed onto a hard site, random parameters, random
     connections (clock-like pins preferably to global clocks)."""
@@ -869,7 +892,8 @@ def recipe_hard(d, site, ref, pconn=0.6):
         full = f'{n}/{pin}'
         if CASCADE_PINS.search(pin) or pin in DEDICATED.get(ref, ()) or \
                 pin in shared or (ref in DEDICATED_RE and
-                                  DEDICATED_RE[ref].search(pin)):
+                                  DEDICATED_RE[ref].search(pin)) or \
+                not pin_mapped(ref, props, pin):
             continue
         if direction == 'IN':
             if rng.random() < pconn or CLOCK_BUFFERS.match(ref):
