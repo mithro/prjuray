@@ -671,13 +671,26 @@ IO_PROPS = [
     ('DCI_CASCADE', []),
 ]
 IO_REFS = {
-    'in': ['IBUF'],
+    'in': ['IBUF', 'IBUF', 'IBUF_IBUFDISABLE', 'IBUF_INTERMDISABLE'],
     'out': ['OBUF'],
-    'tri': ['OBUFT'],
-    'inout': ['IOBUF'],
+    'tri': ['OBUFT', 'OBUFT', 'OBUFT_DCIEN'],
+    'inout': ['IOBUF', 'IOBUF', 'IOBUF_INTERMDISABLE', 'IOBUF_DCIEN'],
     'diffin': ['IBUFDS'],
     'diffout': ['OBUFDS'],
-    'difftri': ['OBUFTDS'],
+    'difftri': ['OBUFTDS', 'OBUFTDS', 'OBUFTDS_DCIEN'],
+}
+# Buffers that are macros (not in the primitive library dump) on some
+# architectures (e.g. IBUF = INBUF + IBUFCTRL on UltraScale).
+IO_MACROS = {'IBUF', 'IBUFDS', 'IOBUF', 'IBUF_IBUFDISABLE',
+             'IBUF_INTERMDISABLE', 'IOBUF_INTERMDISABLE', 'IOBUF_DCIEN'}
+# Buffer control inputs (input buffer / termination disable).
+IO_CTRL_PINS = {
+    'IBUF_IBUFDISABLE': ['IBUFDISABLE'],
+    'IBUF_INTERMDISABLE': ['IBUFDISABLE', 'INTERMDISABLE'],
+    'IOBUF_INTERMDISABLE': ['IBUFDISABLE', 'INTERMDISABLE'],
+    'IOBUF_DCIEN': ['IBUFDISABLE', 'DCITERMDISABLE'],
+    'OBUFT_DCIEN': ['DCITERMDISABLE'],
+    'OBUFTDS_DCIEN': ['DCITERMDISABLE'],
 }
 
 
@@ -689,19 +702,38 @@ def recipe_io(d, site, stype):
         modes += ['diffin', 'diffout', 'difftri']
     mode = rng.choice(modes)
     ref = rng.choice(IO_REFS[mode])
-    if ref not in d.prims and ref != 'IOBUF':
+    if ref not in d.prims and ref not in IO_MACROS:
         return
     stds = diff if mode.startswith('diff') else se
+    if mode in ('diffout', 'difftri'):
+        # Receiver only standards.
+        stds = [s for s in stds if not s.startswith('SLVS') and not (
+            stype.startswith('HPIOB') and s.startswith('LVDS_25'))]
+    if mode != 'inout':
+        # *_T_DCI (split termination) standards are bidirectional only.
+        stds = [s for s in stds if '_T_DCI' not in s]
     props = []
     us = is_us(d.die)
+    if ref in IO_CTRL_PINS and 'IBUFDISABLE' in IO_CTRL_PINS[ref]:
+        props += ['USE_IBUFDISABLE', rng.choice(['TRUE', 'FALSE'])]
     for k, vals in IO_PROPS:
         if k == 'SLEW' and not stype.startswith('HPIOB'):
             vals = ['SLOW', 'FAST']
+        if k == 'IN_TERM' and not (stype.startswith(('IOB33', 'HRIO')) and
+                                   mode in ('in', 'inout', 'diffin')):
+            # Input termination: High Range banks, inputs only.
+            continue
+        if k == 'IOBDELAY' and us:
+            # UltraScale has no IOB delay: Vivado inserts a ZHOLD_DELAY
+            # the device does not support, failing the whole design.
+            continue
         if vals and rng.random() < 0.35:
             props += [k, rng.choice(vals)]
     name = d.name('io')
     d.lines.append(f'nl_iob {name} {site} {mode} {ref} {{{" ".join(stds)}}} '
                    f'{{{" ".join(props)}}}')
+    for p in IO_CTRL_PINS.get(ref, ()):
+        d.add_sink(f'{name}/{p}', site, hard=True)
     if mode in ('in', 'diffin'):
         r = rng.random()
         opts = (['IDDRE1', 'ISERDESE3', 'IDELAYE3', 'RX_BITSLICE',

@@ -562,7 +562,7 @@ proc nl_iob {name site mode ref stds props} {
         # Bidirectional ports need a bidirectional standard.
         set bi [list]
         foreach sv $stds {
-            if {[regexp {^(LVCMOS|LVTTL|LVDCI)} $sv]} { lappend bi $sv }
+            if {[regexp {^(LVCMOS|LVTTL|LVDCI)|_T_DCI:} $sv]} { lappend bi $sv }
         }
         set stds $bi
     }
@@ -618,7 +618,24 @@ proc nl_iob {name site mode ref stds props} {
             nl_log "properr $name IOSTANDARD $std"
         }
     }
+    set btype [get_property -quiet BANK_TYPE $bank]
     foreach {k v} $props {
+        # Input termination only exists for the SSTL/HSTL/HSUL family and
+        # drive strengths only for LVCMOS/LVTTL (with a per standard / bank
+        # type set): other values fail placement, removing the buffer.
+        if {$k eq "IN_TERM" && ![regexp {^(DIFF_)?(SSTL|HSTL|HSUL|MOBILE_DDR)} $std]} continue
+        if {$k eq "DRIVE"} {
+            if {![regexp {^(LVCMOS|LVTTL)} $std]} continue
+            set ok {4 8 12 16}
+            if {[string match *HIGH_PERFORMANCE* $btype]} {
+                set ok [expr {$std eq "LVCMOS12" ? {2 4 6 8} : {2 4 6 8 12}}]
+            } elseif {$std eq "LVCMOS12"} {
+                set ok {4 8 12}
+            } elseif {$std in {LVTTL LVCMOS18}} {
+                set ok {4 8 12 16 24}
+            }
+            if {$v ni $ok} { set v [lindex $ok [expr {int(rand() * [llength $ok])}]] }
+        }
         if {[catch {set_property $k $v [get_ports ${name}_p]} e]} {
             if {[catch {set_property $k $v [get_cells $name]} e]} {
                 nl_log "properr $name $k $v"
