@@ -1198,6 +1198,9 @@ def recipe_io(d, site, stype):
         modes += ['diffin', 'diffout', 'difftri']
     mode = rng.choice(modes)
     ref = rng.choice(IO_REFS[mode])
+    if ref.endswith('_DCIEN') and not stype.startswith(('IOB18', 'HPIOB')):
+        # DCI only exists in High Performance banks.
+        ref = IO_REFS[mode][0]
     if ref not in d.prims and ref not in IO_MACROS:
         return
     stds = diff if mode.startswith('diff') else se
@@ -1561,6 +1564,10 @@ def generate(die, prims, seed, out, density, hard=True, pips=None,
         for st in chosen:
             p = rng.choice([0.1, 0.3, 0.6, 1.0])
             cap = len(die.by_type[st])
+            if cap <= 4:
+                # Blocks with one or a few sites (PCIe, PS, SYSMON, CMAC,
+                # configuration, ...): mostly used once the type is chosen.
+                p = max(p, 0.7)
             if re.match(r'^(ILOGIC|OLOGIC|IDELAY|ODELAY|IOB|HPIOB|HRIO|HDIOB|'
                         r'BITSLICE|IN_FIFO|OUT_FIFO)', st):
                 cap = min(cap, io_cap // 3)
