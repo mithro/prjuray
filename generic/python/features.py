@@ -11,6 +11,7 @@ Feature naming (relative to the tile, prefixed by the tile type in the DB):
   <SITEKEY>.<BEL>.SP.<from>.<to>   site pip (routing BEL input selection)
   <SITEKEY>.<BEL>.<CFG>=<value>    enumerated BEL configuration
   <SITEKEY>.<BEL>.<CFG>[i]         bit i of a vector BEL configuration is 1
+  <SITEKEY>.<BEL>.<CFG>[i]=0       bit i is 0 (vectors of <= 64 bits)
   <SITEKEY>.<BEL>.INIT[i]          LUT truth table bit (from EQN)
 
 SITEKEY is <site prefix>_X<dx>Y<dy>, relative to the lowest coordinates of
@@ -25,6 +26,9 @@ import numpy as np
 _XY = re.compile(r'^(.*)_X(\d+)Y(\d+)$')
 _VEC = re.compile(r"^(\d+)'([bh])([0-9a-fA-F_]+)$")
 
+
+# Widest vector configuration whose 0 bits are features too.
+MAX_ZERO_VEC = 64
 
 PAD_SITE = re.compile(r'^(IOB|HPIOB|HRIO|HDIOB|IOPAD|IPAD|OPAD)')
 
@@ -101,7 +105,14 @@ def cfg_features(prefix, name, value):
         width = int(m.group(1))
         digits = m.group(3).replace('_', '')
         v = int(digits, 2 if m.group(2) == 'b' else 16)
-        return [f'{prefix}.{name}[{i}]' for i in range(width) if (v >> i) & 1]
+        out = [f'{prefix}.{name}[{i}]' for i in range(width) if (v >> i) & 1]
+        # Many attributes are stored inverted (a bit set when the value bit
+        # is 0, e.g. BRAM INIT_A/SRVAL_A): name the 0 bits of short vectors
+        # too.  Long content vectors (BRAM INIT_xx) are stored plainly.
+        if width <= MAX_ZERO_VEC:
+            out += [f'{prefix}.{name}[{i}]=0' for i in range(width)
+                    if not (v >> i) & 1]
+        return out
     return [f'{prefix}.{name}={value}']
 
 

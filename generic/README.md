@@ -34,7 +34,9 @@ per-tile feature names:
 <SITE>.TYPE.<site type>            site in use with this site type
 <SITE>.<BEL>.SP.<from>.<to>        routing BEL input selection
 <SITE>.<BEL>.<CFG>=<value>         enumerated BEL configuration
-<SITE>.<BEL>.<CFG>[i]              bit i of a vector BEL configuration
+<SITE>.<BEL>.<CFG>[i]              bit i of a vector BEL configuration is 1
+<SITE>.<BEL>.<CFG>[i]=0            bit i is 0 (vectors up to 64 bits; many
+                                   attributes are stored inverted)
 <SITE>.<BEL>.INIT[i]               LUT truth table bit (from the LUT equation)
 ```
 
