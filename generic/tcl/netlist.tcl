@@ -174,10 +174,21 @@ proc nl_offenders {{extra ""}} {
         } elseif {[regexp {^(INFO|WARNING|CRITICAL WARNING|Phase|Resolution|Time)} $line]} {
             set grab 0
         }
+        # A constant that cannot reach a (possibly unconnected, hence tied)
+        # hard block pin: blame the cells on that site.
+        if {[regexp {(?:Gnd|Vcc) Src -> ([A-Z][A-Z0-9_]*_X\d+Y\d+)/} $line - s]} {
+            foreach c [get_cells -quiet -of_objects [get_sites -quiet $s]] {
+                lappend names [get_property NAME $c]
+            }
+        }
         if {[regexp {Net: (\S+) is not completely routed} $line - n]} {
             lappend nets $n
         }
         if {[regexp {Router will skip net (\S+)} $line - n]} {
+            lappend nets $n
+        }
+        # Unreachable hard block pins: drop the net, keep the block.
+        if {[regexp {router will skip routing of net (\S+?)\.?$} $line - n]} {
             lappend nets $n
         }
         if {[regexp {problem bus\(es\) and/or net\(s\) are (.*)\.$} $line - lst]} {
@@ -212,7 +223,15 @@ proc nl_offenders {{extra ""}} {
             }
         }
     }
-    return [list [lsort -unique $names] [lsort -unique $nets]]
+    # The constant nets cannot be disconnected (their unreachable loads are
+    # blamed above instead).
+    set keep [list]
+    foreach n [lsort -unique $nets] {
+        set net [get_nets -quiet $n]
+        if {$n in {GNDNet VCCNet nl_const0 nl_const1} || ($net ne "" && [get_property TYPE $net] in {GROUND POWER})} continue
+        lappend keep $n
+    }
+    return [list [lsort -unique $names] $keep]
 }
 
 # True if the last log chunk read by nl_offenders mentions pblocks.
@@ -369,6 +388,12 @@ proc nl_finish {{relaxclk 0}} {
     }
     if {$relaxclk} {
         catch {set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets -quiet -hierarchical]}
+        # Except the outputs of clock generators / transceivers: routed
+        # through general interconnect they end in unresolvable overlaps.
+        set gen [get_cells -quiet -hierarchical -filter {REF_NAME =~ MMCM* || REF_NAME =~ PLL* || REF_NAME =~ GT* || REF_NAME =~ IBUFDS_GT*}]
+        if {[llength $gen]} {
+            catch {reset_property CLOCK_DEDICATED_ROUTE [get_nets -quiet -of_objects [get_pins -quiet -of_objects $gen -filter {DIRECTION == OUT}]]}
+        }
     }
     foreach d [get_drc_checks] {
         catch {set_property SEVERITY Warning $d}
