@@ -56,6 +56,14 @@ def budget_of(die):
     return 900 if n < 40000 else (1800 if n < 100000 else 3000)
 
 
+def timeout_of(die):
+    """Hard wall clock limit of a design: the repair budget is only checked
+    between attempts, and a single place/route can run for hours on an
+    unroutable design.  Twice the budget plus 10 minutes kept 99.5% of the
+    successful designs of the r1-r7 batches."""
+    return 2 * budget_of(die) + 600
+
+
 def generate(die, seed, wdir, gen_args):
     """Writes design.tcl (and design.meta); returns False on failure."""
     os.makedirs(wdir, exist_ok=True)
@@ -338,6 +346,8 @@ def run_one(die, seed, wdir, gen_args, timeout, threads, pool=None):
     stats = {'start': t0, 'host': socket.gethostname(), 'threads': threads,
              'reuse': pool.reuse if pool else 1}
     status, cpu = 'generror', 0.0
+    if not timeout:
+        timeout = timeout_of(die)
     if generate(die, seed, wdir, gen_args):
         if pool:
             vstatus, cpu = pool.get(die).run(wdir, timeout)
@@ -382,7 +392,8 @@ def main():
     ap.add_argument('--tag', default='fabric')
     ap.add_argument('--seeds', required=True, help='first:last')
     ap.add_argument('--jobs', type=int, default=16)
-    ap.add_argument('--timeout', type=int, default=7200)
+    ap.add_argument('--timeout', type=int, default=None,
+                    help='seconds per design (default: 2 x repair budget + 600)')
     ap.add_argument('--threads', type=int, default=2,
                     help='Vivado general.maxThreads')
     ap.add_argument('--reuse', type=int, default=1,

@@ -209,14 +209,14 @@ def main():
     s.add_argument('--prio', type=int, default=50,
                    help='lower runs first (0-999)')
     s.add_argument('--workdir', default=None)
-    s.add_argument('--timeout', type=int, default=7200)
+    s.add_argument('--timeout', type=int, default=None)
     s.add_argument('gen_args', nargs='*')
     w = sub.add_parser('work')
     w.add_argument('--queue', required=True)
     w.add_argument('--jobs', type=int, default=16)
     w.add_argument('--reuse', type=int, default=1)
     w.add_argument('--threads', type=int, default=2)
-    w.add_argument('--timeout', type=int, default=7200)
+    w.add_argument('--timeout', type=int, default=None)
     w.add_argument('--wait', action='store_true',
                    help='keep polling for new work (stop: touch <queue>/STOP)')
     st = sub.add_parser('status')
