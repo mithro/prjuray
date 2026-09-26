@@ -166,6 +166,21 @@ python3 generic/python/tilegrid.py --die <die> \
     --colmap <dir>/<arch>/<die>/colmap.json --out tilegrid.json
 ```
 
+The bits of a tile within its frame column (its *window*) are structural
+for fabric tiles: its INT row and the empty grid rows above it.  Hard blocks
+(CMT, CFG, clock rows, GT, IO bank tiles, ...) whose windows are doubtful
+(taller than one INT row, in the centre row, or without an INT row) get
+learnt windows: `tilegrid.py --probe auto` gives these tile types a window
+of +-one clock region around their grid row, a bit database of these types
+built with that tile grid (`mkdb.py --types`, `URAY_DB` pointing at a probe
+directory) shows the rows their features use, and `windows.py --probe-db`
+turns that into per tile type windows relative to the tile's grid row;
+`windows.py --merge` takes the median over the dies and `tilegrid.py
+--windows` widens the structural windows with them (regions may overlap;
+a bit is documented when any owner documents it).  `pipeline.py
+--probe-windows` does all of this.  `check.py` reports distinct undocumented
+bits (`bits N`) next to the per owner count.
+
 Block RAM content (block type 1) columns map in order onto the BRAM grid
 columns of the clock region row; when the row has more of them (BRAM columns
 replaced by the PS) the extra ones are placed on the side of the unused
