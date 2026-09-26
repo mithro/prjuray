@@ -184,6 +184,14 @@ def tile_features(path, sitekeys):
                     continue
                 for f in cfg_features(prefix, name, value):
                     feats[tile].add(f'{f}@{wname}={wval}')
+    # Older dumps report a chain carry input (PRECYINIT CIN) even when
+    # Vivado routed CI through AX; the real PRECYINIT site pip wins.
+    for tile, fs in feats.items():
+        cin = [f for f in fs if f.endswith('.PRECYINIT.SP.CIN.OUT')]
+        for f in cin:
+            pre = f[:-len('CIN.OUT')]
+            if any(g.startswith(pre) and g != f for g in fs):
+                fs.discard(f)
     # Unused pads take the design wide UNUSEDPIN pull setting (Vivado's
     # default is Pulldown, older dumps do not record it).
     glob_opts.setdefault('UNUSEDPIN', 'Pulldown')

@@ -360,6 +360,9 @@ proc dump_features {out} {
         set ccells [filter -quiet [get_cells -quiet -of_objects $cis] {REF_NAME == CARRY4 || REF_NAME == CARRY8}]
         foreach ref [_df_props REF_NAME $ccells] site [_df_props SITE $ccells] {
             if {$site eq ""} continue
+            # Only when the dedicated COUT -> CIN path is used (a driver
+            # that is not the carry directly below is routed through AX).
+            if {[llength [get_nets -quiet -of_objects [get_site_pins -quiet $site/CIN]]] == 0} continue
             if {$ref eq "CARRY4"} {
                 puts $fp "sp $site PRECYINIT CIN OUT"
             } else {
