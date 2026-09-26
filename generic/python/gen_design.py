@@ -811,7 +811,8 @@ def recipe_pips(d, targets, n=300):
         k += 1
 
 
-def generate(die, prims, seed, out, density, hard=True, pips=None):
+def generate(die, prims, seed, out, density, hard=True, pips=None,
+             focus=None):
     rng = random.Random(seed)
     if density is None:
         density = rng.uniform(0.02, 0.35)
@@ -852,14 +853,17 @@ def generate(die, prims, seed, out, density, hard=True, pips=None):
             avail = [st for st in avail if not re.match(
                 r'^(GT|IBUFDS_GTE|PCIE|BUFG_GT|CMAC|ILKN)', st)]
         io_cap = max(8, int(0.8 * res.get('io', 10**6)))
-        io_used = rng.random() < 0.6
+        io_used = rng.random() < 0.6 and not focus
         if io_used:
             # I/O logic sites are used through the I/O buffers then.
             avail = [st for st in avail if not re.match(
                 r'^(ILOGIC|OLOGIC|IDELAY|ODELAY|BITSLICE|HDIOLOGIC)', st)]
         chosen = rng.sample(avail, min(len(avail), rng.randint(1, 4)))
+        if focus:
+            # Experiments: only the site types matching the focus pattern.
+            chosen = [st for st in avail if re.search(focus, st)]
         # Core blocks (block RAM, DSP) in about half of the designs.
-        for st in avail:
+        for st in avail if not focus else ():
             if re.match(r'^(RAMB|RAMBFIFO|DSP|URAM)', st) and \
                     st not in chosen and rng.random() < 0.5:
                 chosen.append(st)
@@ -928,12 +932,15 @@ def main():
     ap.add_argument('--out', required=True)
     ap.add_argument('--part', default=None)
     ap.add_argument('--pips', default=None, help='target pip list')
+    ap.add_argument('--focus', default=None,
+                    help='regexp: only use hard site types matching it')
     args = ap.parse_args()
     die = Die(args.tiles)
     if args.part:
         die.part = args.part
     prims = primlib.load(args.prims)
-    generate(die, prims, args.seed, args.out, args.density, pips=args.pips)
+    generate(die, prims, args.seed, args.out, args.density, pips=args.pips,
+             focus=args.focus)
 
 
 if __name__ == '__main__':
