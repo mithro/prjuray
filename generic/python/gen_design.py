@@ -54,6 +54,49 @@ class Die:
 BAD_VALUES = {('CE_TYPE', 'HARDSYNC')}
 
 
+def _fix_iserdese2(p, rng):
+    """Legal ISERDESE2 mode / rate / width combinations (UG471): others
+    fail bitgen and end up at the defaults, so the width bits never vary."""
+    it = p.get('INTERFACE_TYPE', 'MEMORY')
+    if it == 'NETWORKING':
+        p['DATA_RATE'] = rng.choice(['SDR', 'DDR'])
+        p['DATA_WIDTH'] = rng.choice(['2', '3', '4', '5', '6', '7', '8']
+                                     if p['DATA_RATE'] == 'SDR' else
+                                     ['4', '6', '8'])
+    else:
+        p['DATA_RATE'] = 'DDR'
+        p['DATA_WIDTH'] = rng.choice(['4', '8']) \
+            if it == 'MEMORY_DDR3' else '4'
+    # Width expansion (SLAVE) and OFB need dedicated neighbour connections.
+    p['SERDES_MODE'] = 'MASTER'
+    p['OFB_USED'] = 'FALSE'
+
+
+def _fix_oserdese2(p, rng):
+    """Legal OSERDESE2 rate / width / tristate combinations (UG471)."""
+    p['DATA_RATE_OQ'] = rng.choice(['SDR', 'DDR'])
+    if p['DATA_RATE_OQ'] == 'SDR':
+        p['DATA_WIDTH'] = rng.choice(['2', '3', '4', '5', '6', '7', '8'])
+    else:
+        p['DATA_WIDTH'] = rng.choice(['4', '6', '8'])
+    if p['DATA_RATE_OQ'] == 'DDR' and p['DATA_WIDTH'] == '4' and \
+            rng.random() < 0.5:
+        p['DATA_RATE_TQ'], p['TRISTATE_WIDTH'] = 'DDR', '4'
+    else:
+        p['DATA_RATE_TQ'] = rng.choice(['SDR', 'BUF'])
+        p['TRISTATE_WIDTH'] = '1'
+    p['SERDES_MODE'] = 'MASTER'
+    if rng.random() < 0.8:
+        p['TBYTE_CTL'] = p['TBYTE_SRC'] = 'FALSE'
+
+
+# Per primitive adjustment of random parameters to legal combinations.
+PARAM_FIXUPS = {
+    'ISERDESE2': _fix_iserdese2,
+    'OSERDESE2': _fix_oserdese2,
+}
+
+
 class Design:
     def __init__(self, die, prims, rng):
         self.die = die
@@ -83,6 +126,8 @@ class Design:
             v = primlib.random_value(self.rng, default, values)
             if v is not None:
                 out[k] = v
+        if ref in PARAM_FIXUPS:
+            PARAM_FIXUPS[ref](out, self.rng)
         if overrides:
             out.update(overrides)
         return out
