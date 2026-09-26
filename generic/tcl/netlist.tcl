@@ -210,6 +210,11 @@ proc nl_offenders {{extra ""}} {
                 lappend names [get_property NAME $c]
             }
         }
+        # I/O placer reports list the terminals on continuation lines far
+        # below the ERROR ("Term: io12_p", "occupied by term: io13_n").
+        foreach {- n} [regexp -all -inline -nocase {\mterm: ((?:c|io)\d+)(?![0-9])} $line] {
+            lappend names $n
+        }
         if {[regexp {Net: (\S+) is not completely routed} $line - n]} {
             lappend nets $n
         }
@@ -695,6 +700,11 @@ proc nl_iob {name site mode ref stds props} {
         return 0
     }
     set pair [get_property -quiet DIFF_PAIR_PIN $pin]
+    # (The N side of a differential buffer must not land on them either.)
+    if {[string match diff* $mode] && $pair ne "" && [regexp {VRP|VREF} [get_property -quiet PIN_FUNC [get_package_pins -quiet $pair]]]} {
+        nl_log "ioberr $name vref"
+        return 0
+    }
     if {[string match diff* $mode] && $pair ne "" && [llength [get_ports -quiet -of_objects [get_package_pins -quiet $pair]]]} {
         set mode [dict get {diffin in diffout out difftri tri} $mode]
         set ref [dict get {in IBUF out OBUF tri OBUFT} $mode]
