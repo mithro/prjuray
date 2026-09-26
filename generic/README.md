@@ -16,7 +16,9 @@ the bitstream.
 | Device metadata | `tcl/dump_tiles.tcl`, `tcl/dump_types.tcl`, `tcl/dump_prims.tcl`, `tcl/baseline.tcl` | `build/meta/` |
 | Die grouping (devices sharing one tile grid) | `python/die_groups.py` | `build/meta/die_groups.json` |
 | Random designs | `python/gen_design.py` + `tcl/netlist.tcl`, run by `python/run_designs.py` | `build/designs/<die>/<tag>/s<seed>/{bits.npz,design.features.gz,nl.log}` |
-| Tile grid | `python/tilegrid.py` | `build/db/<arch>/<die>/tilegrid.json` |
+| Tile grid evidence | `python/tilegrid.py --designs ... --evidence` | `<dir>/<arch>/<die>/evidence.json` |
+| Frame column alignment (all dies of an arch) | `python/colalign.py` | `<dir>/<arch>/<die>/colmap.json`, `<dir>/<arch>/model.json` |
+| Tile grid | `python/tilegrid.py --evidence ... --colmap ...` | `build/db/<arch>/<die>/tilegrid.json` |
 | Bit database | `python/mkdb.py` | `build/db/<arch>/segbits_<tiletype>.db`, `defaults_<tiletype>.db` |
 | Checking / decoding | `python/check.py` | undocumented bit report, FASM |
 
@@ -82,10 +84,69 @@ half); tiles in the HCLK/RCLK row own the centre bits:
 | UltraScale | 60 | 64 | 96 | 123 |
 | UltraScalePlus | 60 | 48 | 96 | 93 |
 
-The frame row of each clock region row and the frame column of each grid
-column are learnt from the designs (a tile's usage pattern matches the change
-pattern of its window), with a monotonic assignment per row.  Block RAM
-content (block type 1) columns map in order onto the BRAM grid columns.
+The frame row of each clock region row is learnt from the designs (a tile's
+usage pattern matches the change pattern of its window).  `tilegrid.py
+--designs <roots> --evidence <file>` saves this and, for every clock region
+row, a score of every (grid column, frame column) pair.
+
+The frame column ("major") of each grid column is structural
+(`python/colalign.py`): frame columns follow the grid columns from left to
+right, each covers a run of neighbouring grid columns, and its frame count
+(from the frame address enumeration of the bitstream) is characteristic of
+the tile columns it covers.  Each grid column gets a *kind* (its tile type
+with sites, else the most common tile type with PIPs, among the tiles with a
+bit window); the ordered kinds of a clock region row are aligned with the
+ordered frame columns by dynamic programming (a monotonic HMM) scoring
+
+* log P(frame count | kind) (Witten-Bell smoothed; kinds seen with several
+  frame counts, e.g. interconnect sharing its neighbour's frame column, have
+  no preference against unseen ones),
+* log P(new frame column | previous kind, kind) (unseen pairs back off to the
+  kinds' left / right statistics, then to the architecture's overall rate),
+* the design activity score as a bonus (a tie breaker; activity a column
+  shares with a more active adjacent column is explained away: tiles used
+  together with their neighbour, e.g. interface tiles, show its changes),
+* a cost for grid columns left out and for frame columns without grid
+  columns (free up to the frame columns the void grid columns there stand
+  for, e.g. feed through columns or the PS),
+* vertical consistency: clock region rows with more unused frame columns
+  than the die's best rows are realigned with a bonus for the frame column
+  the same grid column (of the same kind) has in the best rows, whose frame
+  columns also give the void allowance.
+
+The tables are learnt by hard EM over all dies of an architecture starting
+from the activity supported assignment; frame counts and transitions are
+only learnt from assignments the activity does not contradict, and not for
+*silent* kinds (activity below `MIN_ACT` on every die), which take part in
+the alignment without a frame count preference, so that an alignment does
+not reinforce its own mistakes.  The learnt table is printed (Series7: CLB
+36, BRAM / DSP 28, IO 42, CMT / CLK / CFG 30, GT 32 frames; INT and
+interface kinds take the count of their neighbour; UltraScale+: INT 76, CLE
+16, BRAM 6, DSP 8, ...).  Silent columns left out join their nearest
+neighbour's frame column.  Hard block tiles over part of another kind's
+column (e.g. PCIE) take the frame column of their neighbours in their grid
+row when the other columns of their column's frame column are absent there.
+Clock region rows without activity get their frame row from the frame row
+order learnt on the other dies (e.g. dies with few designs).  The report
+lists per die unused frame columns, rare (kind, frame count) pairs and
+columns placed against strong activity (`--verbose`: each of them;
+`--show <die>`: the alignment), the self-consistency check for
+architectures without a reference database.
+
+```
+python3 generic/python/tilegrid.py --die <die> --designs <roots> \
+    --evidence <dir>/<arch>/<die>/evidence.json --out <activity tilegrid>
+python3 generic/python/colalign.py --arch <arch> --exp <dir> [--verbose] \
+    [--show <die>]
+python3 generic/python/tilegrid.py --die <die> \
+    --evidence <dir>/<arch>/<die>/evidence.json \
+    --colmap <dir>/<arch>/<die>/colmap.json --out tilegrid.json
+```
+
+Block RAM content (block type 1) columns map in order onto the BRAM grid
+columns of the clock region row; when the row has more of them (BRAM columns
+replaced by the PS) the extra ones are placed on the side of the unused
+block 0 frame columns with the BRAM frame count.
 
 `tilegrid.json` maps each tile to a list of regions:
 `{"block", "half", "row", "col", "base" (frame address of minor 0),
@@ -147,3 +208,9 @@ bits onto our region coordinates and lists prjxray bits used by no feature or
 default of ours (candidate undocumented bits), our bits unknown to prjxray, and
 feature correspondences (`INT_L.EE2BEG0.LOGIC_OUTS_L0` =
 `INT_L.LOGIC_OUTS_L0->EE2BEG0`, or identical set bits).
+
+`--tilegrid-only` skips the bits.  With `--arch UltraScalePlus` (or
+`UltraScale`) and `--prjxray-db` pointing at a prjuray-db checkout
+(`https://github.com/SymbiFlow/prjuray-db`, devices named by part, e.g.
+`zynqusp/xczu3eg-sfvc784-1-e` = our die `xazu2eg`) the tile grids are
+compared the same way (tile grid only).

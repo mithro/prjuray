@@ -188,11 +188,23 @@ def correlate(samples):
     qidx = np.random.RandomState(0).choice(W, min(W, 8), replace=False)
     PFq = PF[:, qidx]
 
+    # A feature seen n times implies a bit that is set in a fraction p of
+    # all samples by chance with probability p**n: only accept implications
+    # less likely than this to be coincidences (rare features otherwise
+    # pick up frequently set bits as noise).
+    CHANCE = 1e-3
+    lognf = nf.astype(np.float64)
+
     def implying(pb, clear, nmax=None):
         """Features f with f => bit set (clear=False) or f => bit clear."""
         ok = nf > 0
         if nmax is not None:
             ok &= nf <= nmax
+        p = popcount(pb) / S
+        if clear:
+            p = 1.0 - p
+        if 0.0 < p < 1.0:
+            ok &= lognf * np.log(p) < np.log(CHANCE)
         q = pb[qidx]
         viol = (PFq & q) if clear else (PFq & ~q)
         ok &= ~np.any(viol, axis=1)
@@ -262,7 +274,9 @@ def write_db(outdir, ttype, k, res):
     suffix = ttype.lower() + (f'.{k}' if k else '')
     with open(os.path.join(outdir, f'segbits_{suffix}.db'), 'w') as f:
         for feat in sorted(res['feat_bits']):
-            bits = sorted(res['feat_bits'][feat], key=lambda b: b.lstrip('!'))
+            # A bit can be assigned twice (single cover, then pair cover).
+            bits = sorted(set(res['feat_bits'][feat]),
+                          key=lambda b: b.lstrip('!'))
             f.write(f'{ttype}.{feat} {" ".join(bits)}\n')
     with open(os.path.join(outdir, f'defaults_{suffix}.db'), 'w') as f:
         for b in sorted(res['defaults']):

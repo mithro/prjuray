@@ -195,6 +195,21 @@ proc dump_features {out} {
                 puts $fp "sp [lindex $n 0] $bel $f $to"
             }
         }
+        # A carry input taken from the chain (CIN) is not a site pip: report
+        # it as one (7-series PRECYINIT CIN, UltraScale CARRY8 CIN).
+        foreach c [get_cells -quiet -hierarchical -filter {REF_NAME == CARRY4 || REF_NAME == CARRY8}] {
+            set ci [get_pins -quiet $c/CI]
+            if {$ci eq ""} continue
+            set drv [get_pins -quiet -leaf -of_objects [get_nets -quiet -of_objects $ci] -filter {DIRECTION == OUT}]
+            if {[llength $drv] != 1 || [get_property REF_NAME [get_cells -of_objects $drv]] ni {CARRY4 CARRY8}} continue
+            set site [get_property SITE [get_cells $c]]
+            if {$site eq ""} continue
+            if {[get_property REF_NAME [get_cells $c]] eq "CARRY4"} {
+                puts $fp "sp $site PRECYINIT CIN OUT"
+            } else {
+                puts $fp "sp $site CARRY8 CIN CI"
+            }
+        }
         set used [get_sites -quiet -filter {IS_USED}]
         set bels [get_bels -quiet -of_objects $used -filter {IS_USED}]
         # Routing-only sites: all their BELs (unconfigured ones are skipped).
