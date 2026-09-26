@@ -244,6 +244,11 @@ proc nl_offenders {{extra ""}} {
             # Errors naming sites (e.g. bitgen): take the cells placed there.
             foreach {- s} [regexp -all -inline {\m([A-Z][A-Z0-9_]*_X\d+Y\d+)\M} $line] {
                 set site [get_sites -quiet $s]
+                if {$site eq "" && ![regexp {^(CLE|CLB|INT)} $s]} {
+                    # A tile (e.g. bitgen "VEAM exception in tile
+                    # BRAM_X56Y125"): the cells of its hard block sites.
+                    set site [get_sites -quiet -of_objects [get_tiles -quiet $s]]
+                }
                 if {$site ne "" && ![string match SLICE_* $s]} {
                     foreach c [get_cells -quiet -of_objects $site] {
                         lappend names [get_property NAME $c]
