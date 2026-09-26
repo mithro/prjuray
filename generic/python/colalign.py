@@ -56,6 +56,10 @@ W_VERT = 3.0  # bonus for the frame column of the same grid column in the
 S_MAJ = 2.0  # frame column without any grid column
 S_COL = 3.0  # grid column of an active kind without a frame column
 S_SILENT = 1.0  # same for a silent kind
+S_OWN = 0.0  # a silent column ending a frame column (disabled)
+MIN_ACT = 2.0  # activity score (~ matching tiles) making a kind active
+INIT_EA = False  # leave kinds whose activity neighbours explain out of the
+# initial assignment
 ALPHA = 1.0  # emission smoothing
 BETA = 1.0  # transition smoothing
 MAXSKIP = 8  # consecutive unassigned grid columns
@@ -126,6 +130,14 @@ class DieRows:
         self.crmap = dict(self.ev['crmap'])
         self.structural_rows()
 
+    @property
+    def ratio(self):
+        """Grid columns (with bits) per frame column."""
+        crs = [cr for cr in self.rows if self.majors(cr)]
+        nc = sum(len(self.rows[cr]) for cr in crs)
+        nm = sum(len(self.majors(cr)) for cr in crs)
+        return max(1.0, nc / nm) if nm else 1.0
+
     def structural_rows(self):
         """Clock region rows without an activity learnt frame row get the
         frame row left over when the learnt rows are removed, if the order
@@ -184,9 +196,11 @@ class Model:
         self.p0 = {}
         self.psplit = 0.5
 
-    def fit(self, assignments, nf_all):
+    def fit(self, assignments, nf_all, noemit=()):
         """assignments: list of rows, each a list of (kind, frame column
-        index or None, frame count or None)."""
+        index or None, frame count or None).  Kinds in noemit (silent
+        kinds, placed by the alignment alone) are left out of the tables,
+        so that an alignment does not reinforce itself."""
         self.emit.clear()
         self.pair.clear()
         self.left.clear()
@@ -194,7 +208,7 @@ class Model:
         for row in assignments:
             prev = None
             for kind, j, nf in row:
-                if j is None:
+                if j is None or kind in noemit:
                     continue
                 self.emit[kind][nf] += 1
                 if prev is not None:
@@ -222,6 +236,10 @@ class Model:
         T = len(c)
         if nf in c:
             p = c[nf] / (n + T)
+        elif n - max(c.values()) >= 0.05 * n:
+            # Flexible kind (e.g. interconnect sharing its neighbour's
+            # frame column): no preference against unseen frame counts.
+            return 0.0
         else:
             rest = sum(v for k, v in self.p0.items() if k not in c)
             p = T / (n + T) * p0 / max(rest, 1e-6)
@@ -249,21 +267,35 @@ class Model:
             p0={str(k): round(v, 4) for k, v in sorted(self.p0.items())})
 
 
-def align_row(model, kinds, nfs, act, skip, gxs, voids, extra=None):
+def align_row(model, kinds, nfs, act, skip, gxs, voids, extra=None,
+              ratio=1.0, refcol=None):
     """kinds: grid column kinds (left to right) at grid x gxs, nfs: frame
     counts of the frame columns, act: per column activity vector (or None),
     skip: cost of leaving each grid column unassigned, voids: grid x of the
-    void columns of the row.  Frame columns left without a grid column cost S_MAJ
-    each, except as many as there are void grid columns at that place (a
-    frame column of a column without configurable tiles, e.g. feed through
-    columns replacing fabric).  Returns the frame column index (or None) of
-    every grid column."""
+    void columns of the row, ratio: grid columns per frame column of the
+    die.  Frame columns left without a grid column cost S_MAJ each, except
+    as many as the void grid columns at that place would make (a frame
+    column of columns without configurable tiles, e.g. feed through columns
+    replacing fabric; with refcol, grid x -> frame column in the die's
+    best aligned row, the distinct frame columns of the void columns there).
+    Returns the frame column index (or None) of every grid column."""
     n, M = len(kinds), len(nfs)
     vv = np.array(voids, dtype=float)
+    refcol = refcol or {}
 
     def nvoid(a, b):
-        """void columns strictly between grid x a and b"""
-        return int(np.searchsorted(vv, b) - np.searchsorted(vv, a, 'right'))
+        """frame columns the void columns strictly between grid x a and b
+        can stand for"""
+        lo = int(np.searchsorted(vv, a, 'right'))
+        hi = int(np.searchsorted(vv, b))
+        cols = set()
+        other = 0
+        for g in voids[lo:hi]:
+            if g in refcol:
+                cols.add(refcol[g])
+            else:
+                other += 1
+        return len(cols) + int(other / ratio)
 
     cs = np.concatenate([[0.0], np.cumsum(skip)])  # cs[i] = sum skip[:i]
     if n == 0 or M == 0:
@@ -290,6 +322,10 @@ def align_row(model, kinds, nfs, act, skip, gxs, voids, extra=None):
         for ip in range(max(0, i - 1 - MAXSKIP), i):
             skipped = cs[i] - cs[ip + 1]
             ls, lt = model.transition(kinds[ip], kinds[i])
+            if skip[ip] == S_SILENT:
+                # A silent column ending a frame column: less likely than
+                # sharing the next one (it would own no evidence).
+                lt -= S_OWN
             same = dp[ip] + ls - skipped
             a = nvoid(gxs[ip], gxs[i])
             val = np.where(valid, dp[ip][None, :] -
@@ -320,6 +356,30 @@ def align_row(model, kinds, nfs, act, skip, gxs, voids, extra=None):
     return out, total
 
 
+def explain_away(dr, cr, s, M):
+    """Activity vectors of the grid columns s of a clock region row.  A
+    column whose best frame column is also the best one of a directly
+    adjacent column with more activity gets no activity bonus there: tiles
+    used together with their neighbour (e.g. interface tiles next to the
+    interconnect) show the neighbour's bit changes, so their activity does
+    not tell which frame column they own."""
+    raw = [dr.ev['scores'].get(cr, {}).get(gx) for gx, _ in s]
+    out = [dr.activity(cr, gx, M) for gx, _ in s]
+    for i, (gx, _) in enumerate(s):
+        v = raw[i]
+        if v is None or not v.max():
+            continue
+        j = int(np.argmax(v))
+        for k in (i - 1, i + 1):
+            if 0 <= k < len(s) and abs(s[k][0] - gx) == 1 and \
+                    raw[k] is not None and int(np.argmax(raw[k])) == j \
+                    and raw[k][j] > v[j]:
+                out[i] = out[i].copy()
+                out[i][j] = 0.0
+                break
+    return out
+
+
 def align_die(model, dr, d, active):
     """Aligns every clock region row of a die.  The column structure
     repeats vertically: rows left with more unused frame columns (e.g. where
@@ -327,11 +387,11 @@ def align_die(model, dr, d, active):
     grid column) are aligned again with a bonus for the frame column the
     same grid column has in the best aligned row (fewest unused frame
     columns)."""
-    def run(cr, ref=None):
+    def run(cr, ref=None, refcol=None):
         m = dr.majors(cr)
         s = dr.rows[cr]
         kinds = [k for _, k in s]
-        act = [dr.activity(cr, gx, len(m)) for gx, _ in s]
+        act = explain_away(dr, cr, s, len(m))
         skip = [S_COL if k in active else S_SILENT for k in kinds]
         extra = None
         if ref:
@@ -342,7 +402,8 @@ def align_die(model, dr, d, active):
                         if (c[0], c[2]) == ref[(gx, k)]:
                             extra[i, j] = W_VERT
         out, _ = align_row(model, kinds, [c[2] for c in m], act, skip,
-                           [gx for gx, _ in s], dr.voids.get(cr, []), extra)
+                           [gx for gx, _ in s], dr.voids.get(cr, []), extra,
+                           dr.ratio, refcol)
         return {gx: j for (gx, _), j in zip(s, out) if j is not None}
 
     res = {}
@@ -357,14 +418,16 @@ def align_die(model, dr, d, active):
     if order:
         best = unused(order[0])
         ref = {}
+        refcol = {}
         for cr in order:
             m = dr.majors(cr)
             kinds = dict(dr.rows[cr])
             for gx, j in res[cr].items():
                 ref.setdefault((gx, kinds[gx]), (m[j][0], m[j][2]))
+                refcol.setdefault(gx, m[j][0])
         for cr in order:
             if unused(cr) > best:
-                res[cr] = run(cr, ref)
+                res[cr] = run(cr, ref, refcol)
     return {(d, cr): asg for cr, asg in res.items()}
 
 
@@ -497,12 +560,16 @@ def main():
     ap.add_argument('--verbose', action='store_true',
                     help='list frame count mismatches and activity '
                     'disagreements')
+    ap.add_argument('--init-explained', action='store_true',
+                    help='leave kinds whose activity is explained by their '
+                    'neighbours out of the initial assignment')
     ap.add_argument('--show', help='comma separated dies whose alignment '
                     'is printed')
     ap.add_argument('--init-dies', help='dies whose activity assignment '
                     'initialises the model (default: all)')
     args = ap.parse_args()
     globals()['W_ACT'] = args.w_act
+    globals()['INIT_EA'] = args.init_explained
     alldies = dieslib.load()
     base = os.path.join(args.exp, args.arch)
     names = args.dies.split(',') if args.dies else sorted(
@@ -543,8 +610,10 @@ def main():
             sc = dr.ev['scores'].get(cr, {})
             for gx, k in lst:
                 v = sc.get(gx)
-                if v is not None and v.max() > 0:
+                if v is not None and v.max() >= MIN_ACT:
                     active.add(k)
+    silent = {k for dr in rows.values() for lst in dr.rows.values()
+              for _, k in lst} - active
     nf_all = collections.Counter()
     for dr in rows.values():
         for cr in dr.rows:
@@ -555,24 +624,43 @@ def main():
     def seqs(dr, cr):
         return dr.rows[cr]
 
-    # Initial assignment: activity only.
+    # Initial assignment: activity only, directly supported (no
+    # propagation between rows or gap filling).  Kinds whose activity is
+    # (almost) always explained by a more active adjacent column (tiles used
+    # together with their neighbour) are left out: their activity does not
+    # tell which frame column they own.
     cur = {}
     init = set(args.init_dies.split(',')) if args.init_dies else set(names)
+    raw = {}
+    explained = collections.defaultdict(lambda: [0, 0])
     for d, dr in rows.items():
         if d not in init:
             continue
-        # Only assignments the activity supports directly (no propagation
-        # between rows or gap filling).
         colmap, _ = TG.assign_activity(dr.grid, dr.cols, dr.ev, fill=False)
         for cr in dr.rows:
             m = dr.majors(cr)
             if not m:
                 continue
             idx = {c[0]: j for j, c in enumerate(m)}
-            cur[(d, cr)] = {gx: idx[colmap[(cr, gx)]]
-                            for gx, _ in seqs(dr, cr)
-                            if (cr, gx) in colmap
-                            and colmap[(cr, gx)] in idx}
+            s = seqs(dr, cr)
+            act = explain_away(dr, cr, s, len(m))
+            asg = {}
+            for (gx, k), a in zip(s, act):
+                j = idx.get(colmap.get((cr, gx)))
+                v = dr.ev['scores'].get(cr, {}).get(gx)
+                if j is None or v is None or v[j] < MIN_ACT:
+                    continue
+                asg[gx] = j
+                explained[k][int(a is None or a[j] == 0)] += 1
+            raw[(d, cr)] = (s, asg)
+    dropped = {k for k, (n0, n1) in explained.items()
+               if n1 >= 0.9 * (n0 + n1)} if INIT_EA else set()
+    if dropped:
+        print('activity explained by neighbours:', ' '.join(sorted(dropped)))
+    for key, (s, asg) in raw.items():
+        kinds = dict(s)
+        cur[key] = {gx: j for gx, j in asg.items()
+                    if kinds[gx] not in dropped}
     model = Model()
     for it in range(args.iters):
         data = []
@@ -582,7 +670,7 @@ def main():
             data.append([(k, asg.get(gx),
                           m[asg[gx]][2] if gx in asg else None)
                          for gx, k in seqs(dr, cr)])
-        model.fit(data, nf_all)
+        model.fit(data, nf_all, silent)
         new = {}
         changed = 0
         for d, dr in rows.items():
@@ -594,17 +682,22 @@ def main():
         print(f'iteration {it}: rows changed {changed}', flush=True)
         if not changed:
             break
-    model.fit([[(k, cur[(d, cr)].get(gx),
-                 rows[d].majors(cr)[cur[(d, cr)][gx]][2]
-                 if gx in cur[(d, cr)] else None)
-                for gx, k in seqs(rows[d], cr)]
-               for (d, cr) in cur], nf_all)
+    final = [[(k, cur[(d, cr)].get(gx),
+               rows[d].majors(cr)[cur[(d, cr)][gx]][2]
+               if gx in cur[(d, cr)] else None)
+              for gx, k in seqs(rows[d], cr)]
+             for (d, cr) in cur]
+    model.fit(final, nf_all, silent)
     with open(os.path.join(base, 'model.json'), 'w') as f:
         json.dump(model.to_json(), f, indent=1)
-    print('frame count table (kind: frame count x grid columns):')
-    for k, c in sorted(model.emit.items()):
-        print(f'  {k}: ' + ', '.join(f'{nf} x{n}' for nf, n in
-                                     sorted(c.items(), key=lambda x: -x[1])))
+    table = Model()
+    table.fit(final, nf_all)
+    print('frame count table (kind: frame count x grid columns; silent '
+          'kinds marked *):')
+    for k, c in sorted(table.emit.items()):
+        mark = '*' if k in silent else ''
+        print(f'  {k}{mark}: ' + ', '.join(
+            f'{nf} x{n}' for nf, n in sorted(c.items(), key=lambda x: -x[1])))
     # Output + self-consistency.
     for d, dr in rows.items():
         colmap = []
