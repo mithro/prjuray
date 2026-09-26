@@ -101,6 +101,18 @@ class Grid:
         self.centre_rows = centre_rows
         self.int_rows = int_rows
 
+    def row_bit(self, gy):
+        """First bit of grid row gy within its clock region row's frames:
+        INT rows by their index, the centre (HCLK / RCLK) row at the centre
+        bits; None for other rows (e.g. breaks between clock regions)."""
+        half = self.rows_per_cr // 2
+        if gy in self.rowidx:
+            r = self.rowidx[gy]
+            return r * self.bpr + (self.centre if r >= half else 0)
+        if gy in self.centre_rows:
+            return half * self.bpr
+        return None
+
     def tile_window(self, name):
         """(clock region row, first bit, number of bits) or None."""
         t = self.tiles[name]
@@ -144,6 +156,37 @@ def frame_columns(dframes):
     return cols
 
 
+def activity(die, dframes, design_root, maxd=192):
+    """Design activity: (act, use, number of designs).
+    act[frame index, bit offset, word] = mask of the designs in which that
+    bit differs from the baseline; use[tile] = mask of the designs using the
+    tile.  Up to maxd designs, newest tags first (later tags use larger
+    parts of the die and better generators)."""
+    sk = featlib.SiteKeys(die.tiles_tsv)
+    roots = design_root.split(',') if isinstance(design_root, str) \
+        else list(design_root)
+    dirs = []
+    for r in reversed(roots):
+        dirs += DD.design_dirs(r)
+    dirs = dirs[:maxd]
+    D = len(dirs)
+    NW = max(1, (D + 63) // 64)
+    act = np.zeros((len(dframes.frames), dframes.wpf * 32, NW),
+                   dtype=np.uint64)
+    flat = act.reshape(-1, NW)
+    use = collections.defaultdict(int)
+    for i, d in enumerate(dirs):
+        b = DD.load_bits(dframes, d)
+        diff = np.setxor1d(b, dframes.base, assume_unique=True)
+        flat[diff, i // 64] |= np.uint64(1 << (i % 64))
+        for t, fs in DD.load_features(d, sk).items():
+            # Design wide pseudo features (unused pad pulls) do not mean the
+            # tile is used.
+            if any('.UNUSEDPIN=' not in f for f in fs):
+                use[t] |= 1 << i
+    return act, use, D
+
+
 def collect(die, design_root, verbose=False):
     """Design activity evidence for the frame row / frame column learners.
 
@@ -157,35 +200,8 @@ def collect(die, design_root, verbose=False):
     """
     grid = Grid(die)
     dframes = DD.DieFrames(die)
-    wpf = dframes.wpf
-    sk = featlib.SiteKeys(die.tiles_tsv)
-    # Up to MAXD designs (one bit each in the activity masks), newest tags
-    # first (later tags use larger parts of the die and better generators).
-    roots = design_root.split(',') if isinstance(design_root, str) \
-        else list(design_root)
-    dirs = []
-    for r in reversed(roots):
-        dirs += DD.design_dirs(r)
-    MAXD = 192
-    dirs = dirs[:MAXD]
-    D = len(dirs)
-    NW = (D + 63) // 64
-    nbits_frame = wpf * 32
-    # Activity: act[frame index, bit offset, word] = mask of designs in which
-    # that bit differs from the baseline.
-    act = np.zeros((len(dframes.frames), nbits_frame, max(1, NW)),
-                   dtype=np.uint64)
-    flat = act.reshape(-1, max(1, NW))
-    use = collections.defaultdict(int)
-    for i, d in enumerate(dirs):
-        b = DD.load_bits(dframes, d)
-        diff = np.setxor1d(b, dframes.base, assume_unique=True)
-        flat[diff, i // 64] |= np.uint64(1 << (i % 64))
-        for t, fs in DD.load_features(d, sk).items():
-            # Design wide pseudo features (unused pad pulls) do not mean the
-            # tile is used.
-            if any('.UNUSEDPIN=' not in f for f in fs):
-                use[t] |= 1 << i
+    act, use, D = activity(die, dframes, design_root)
+    NW = act.shape[2]
 
     def to_int(words):
         v = 0
