@@ -74,6 +74,21 @@ proc _df_bidir_dirs {net} {
     return $res
 }
 
+# The nets whose routing is dumped: the signal nets plus one ground and one
+# power net.  All constant nets (thousands where Vivado inserted constants)
+# share the routing of the global ground/power net, so querying all of them
+# returns that routing once per net (up to hundreds of millions of PIPs:
+# "max size for a Tcl value exceeded").
+proc _df_route_nets {} {
+    set names [get_property NAME [get_nets -hierarchical -quiet -filter {TYPE != GROUND && TYPE != POWER}]]
+    foreach t {GROUND POWER} {
+        set ns [get_nets -hierarchical -quiet -filter "TYPE == $t"]
+        if {[llength $ns]} { lappend names [get_property NAME [lindex $ns 0]] }
+    }
+    # A collection again (commands taking -of_objects reject plain names).
+    return [get_nets -quiet $names]
+}
+
 # Direction of all used bidirectional PIPs (given the used PIP names): a
 # dict pip -> 1 (uphill to downhill) or 0 (reversed).  The route tree
 # printed by report_route_status names, for every PIP, the node it drives;
@@ -119,30 +134,117 @@ proc _df_bidir_all {pips} {
     return $res
 }
 
-# The nets whose routing is dumped: the signal nets plus one ground and one
-# power net.  All constant nets (thousands where Vivado inserted constants)
-# share the routing of the global ground/power net, so querying all of them
-# returns that routing once per net (up to hundreds of millions of PIPs:
-# "max size for a Tcl value exceeded").
-proc _df_route_nets {} {
-    set names [get_property NAME [get_nets -hierarchical -quiet -filter {TYPE != GROUND && TYPE != POWER}]]
-    foreach t {GROUND POWER} {
-        set ns [get_nets -hierarchical -quiet -filter "TYPE == $t"]
-        if {[llength $ns]} { lappend names [get_property NAME [lindex $ns 0]] }
-    }
-    # A collection again (commands taking -of_objects reject plain names).
-    return [get_nets -quiet $names]
-}
-
 # get_property over a list of objects, falling back to one query per object
 # when values containing spaces (or empty values) break the returned list.
 proc _df_props {prop objs} {
+    if {[llength $objs] == 0} { return [list] }
     set vals [get_property $prop $objs]
     if {[llength $vals] != [llength $objs]} {
         set vals [list]
         foreach o $objs { lappend vals [get_property $prop $o] }
     }
     return $vals
+}
+
+# Used site pips of the given sites, as a list of {site bel from_pin to_pin}.
+# IS_USED costs ~0.3 ms per site pip and a slice has 140-300 of them, so in
+# slices only the site pips named by the site's SITE_PIPS property are
+# queried (one call per slice).  SITE_PIPS is only filled in for manually
+# routed sites, so the slices are made manually routed and back.  The site
+# pips SITE_PIPS gets wrong or leaves out, or which the manual routing
+# round trip changes (inverters, output muxes: 7-series *OUTMUX:O6,
+# UltraScale+ OUTMUX?:D6, and 7-series xUSED:0), are queried for all
+# slices beforehand (_df_sp_pre).  The
+# design's site routing is changed: call last.  NL_SP_CHECK compares this
+# with the exact query.  (Collections are only handled by Vivado commands:
+# iterating over them in Tcl converts every object to text, which is slow.)
+set _df_sp_pre {*OUTMUX*:* *INV:* *USED:*}
+proc _df_used_site_pips {sites} {
+    global _df_sp_pre
+    set res [list]
+    set so [get_sites -quiet $sites]
+    set slices [filter -quiet $so {SITE_TYPE =~ SLICE*}]
+    set others [filter -quiet $so {SITE_TYPE !~ SLICE*}]
+    set groups [list]
+    if {[llength $others]} {
+        lappend groups [get_site_pips -quiet -of_objects $others -filter {IS_USED}]
+    }
+    set ok 1
+    if {[llength $slices]} {
+        set pre [get_site_pips -quiet -of_objects $slices $_df_sp_pre]
+        if {[llength $pre]} { lappend groups [filter -quiet $pre {IS_USED}] }
+        foreach t [lsort -unique [_df_props SITE_TYPE $slices]] {
+            if {[catch {set_property MANUAL_ROUTING $t [filter $slices "SITE_TYPE == $t"]}]} {
+                set ok 0
+            }
+        }
+        if {$ok} {
+            set names [_df_props NAME $slices]
+            set types [_df_props SITE_TYPE $slices]
+            set named [_df_props SITE_PIPS $slices]
+        }
+        catch {reset_property MANUAL_ROUTING $slices}
+        if {!$ok} {
+            set f [join [lmap p $_df_sp_pre { set p "NAME !~ \"$p\"" }] " && "]
+            lappend groups [get_site_pips -quiet -of_objects $slices -filter "IS_USED && $f"]
+        }
+    }
+    foreach g $groups {
+        foreach n [_df_props NAME $g] f [_df_props FROM_PIN $g] to [_df_props TO_PIN $g] {
+            set n [split $n /]
+            lappend res [list [lindex $n 0] [lindex [split [lindex $n 1] :] 0] $f $to]
+        }
+    }
+    if {!$ok || [llength $slices] == 0} { return $res }
+    # One query per slice for the site pips SITE_PIPS names.  The output pin
+    # of each routing BEL is remembered; the input pin is in the name.
+    global _df_to_pin
+    foreach s $names t $types v $named {
+        set pats [list]
+        foreach x $v {
+            set done 0
+            foreach p $_df_sp_pre {
+                if {[string match $p $x]} { set done 1 }
+            }
+            if {!$done} { lappend pats $s/$x }
+        }
+        if {[llength $pats] == 0} continue
+        # (-filter would test every site pip of the site, not just these.)
+        set g [get_site_pips -quiet -of_objects [get_sites $s] $pats]
+        if {[llength $g] == 0} continue
+        set g [filter -quiet $g {IS_USED}]
+        if {[llength $g] == 0} continue
+        set gn [_df_props NAME $g]
+        set need 0
+        foreach n $gn {
+            set bel [lindex [split [lindex [split $n /] 1] :] 0]
+            if {![info exists _df_to_pin($t/$bel)]} { set need 1 }
+        }
+        if {$need} {
+            foreach n $gn to [_df_props TO_PIN $g] {
+                set bel [lindex [split [lindex [split $n /] 1] :] 0]
+                set _df_to_pin($t/$bel) $to
+            }
+        }
+        foreach n $gn {
+            lassign [split [lindex [split $n /] 1] :] bel pin
+            lappend res [list $s $bel $pin $_df_to_pin($t/$bel)]
+        }
+    }
+    return $res
+}
+
+# Elements only in a and only in b.
+proc _df_list_diff {a b} {
+    set da [dict create]
+    set db [dict create]
+    foreach x $a { dict set da $x 1 }
+    foreach x $b { dict set db $x 1 }
+    set oa [list]
+    set ob [list]
+    dict for {x -} $da { if {![dict exists $db $x]} { lappend oa $x } }
+    dict for {x -} $db { if {![dict exists $da $x]} { lappend ob $x } }
+    return [list $oa $ob]
 }
 
 proc struct_diff {a b} {
@@ -202,29 +304,6 @@ proc dump_features {out} {
         foreach s $sites st [_df_props SITE_TYPE $sites] {
             puts $fp "site $s $st -"
         }
-        set sps [get_site_pips -quiet -of_objects $sites -filter {IS_USED}]
-        if {[llength $sps]} {
-            foreach sp $sps f [_df_props FROM_PIN $sps] to [_df_props TO_PIN $sps] {
-                set n [split $sp /]
-                set bel [lindex [split [lindex $n 1] :] 0]
-                puts $fp "sp [lindex $n 0] $bel $f $to"
-            }
-        }
-        # A carry input taken from the chain (CIN) is not a site pip: report
-        # it as one (7-series PRECYINIT CIN, UltraScale CARRY8 CIN).
-        foreach c [get_cells -quiet -hierarchical -filter {REF_NAME == CARRY4 || REF_NAME == CARRY8}] {
-            set ci [get_pins -quiet $c/CI]
-            if {$ci eq ""} continue
-            set drv [get_pins -quiet -leaf -of_objects [get_nets -quiet -of_objects $ci] -filter {DIRECTION == OUT}]
-            if {[llength $drv] != 1 || [get_property REF_NAME [get_cells -of_objects $drv]] ni {CARRY4 CARRY8}} continue
-            set site [get_property SITE [get_cells $c]]
-            if {$site eq ""} continue
-            if {[get_property REF_NAME [get_cells $c]] eq "CARRY4"} {
-                puts $fp "sp $site PRECYINIT CIN OUT"
-            } else {
-                puts $fp "sp $site CARRY8 CIN CI"
-            }
-        }
         set used [get_sites -quiet -filter {IS_USED}]
         set bels [get_bels -quiet -of_objects $used -filter {IS_USED}]
         # Routing-only sites: all their BELs (unconfigured ones are skipped).
@@ -242,6 +321,49 @@ proc dump_features {out} {
                     set n [split $b /]
                     puts $fp "cfg [lindex $n 0] [lindex $n end] $name [string map {" " "_"} $v]"
                 }
+            }
+        }
+        puts $fp "# t_cfg [expr {[clock milliseconds] - $t0}]"
+        # Used site pips last: the fast query changes the site routing of
+        # the design (see _df_used_site_pips).
+        if {[info exists ::env(NL_SP_EXACT)] || [info exists ::env(NL_SP_CHECK)]} {
+            set sps [get_site_pips -quiet -of_objects $sites -filter {IS_USED}]
+            set used_sps [list]
+            foreach n [_df_props NAME $sps] f [_df_props FROM_PIN $sps] to [_df_props TO_PIN $sps] {
+                set n [split $n /]
+                lappend used_sps [list [lindex $n 0] [lindex [split [lindex $n 1] :] 0] $f $to]
+            }
+            if {[info exists ::env(NL_SP_CHECK)]} {
+                # Self check of the fast query (after the exact one: the
+                # fast one changes the design); the exact result is dumped.
+                puts $fp "# t_sp_exact [expr {[clock milliseconds] - $t0}]"
+                lassign [_df_list_diff $used_sps [_df_used_site_pips $sites]] miss extra
+                set cat [dict create]
+                foreach x $miss { dict incr cat "missing:[lindex $x 1]:[lindex $x 2]" }
+                foreach x $extra { dict incr cat "extra:[lindex $x 1]:[lindex $x 2]" }
+                puts $fp "# sp_check missing [llength $miss] extra [llength $extra] $cat [lrange $miss 0 5] [lrange $extra 0 5]"
+            }
+        } else {
+            set used_sps [_df_used_site_pips $sites]
+        }
+        foreach x $used_sps {
+            puts $fp "sp [join $x { }]"
+        }
+        # A carry input taken from the chain (CIN) is not a site pip: report
+        # it as one (7-series PRECYINIT CIN, UltraScale CARRY8 CIN).
+        # (Vectorised: the CI pins on nets driven by exactly one carry
+        # output pin.)
+        set carries [get_cells -quiet -hierarchical -filter {REF_NAME == CARRY4 || REF_NAME == CARRY8}]
+        set conets [get_nets -quiet -of_objects [get_pins -quiet -of_objects $carries -filter {DIRECTION == OUT}]]
+        set conets [filter -quiet $conets {DRIVER_COUNT == 1}]
+        set cis [get_pins -quiet -leaf -of_objects $conets -filter {REF_PIN_NAME == CI && DIRECTION == IN}]
+        set ccells [filter -quiet [get_cells -quiet -of_objects $cis] {REF_NAME == CARRY4 || REF_NAME == CARRY8}]
+        foreach ref [_df_props REF_NAME $ccells] site [_df_props SITE $ccells] {
+            if {$site eq ""} continue
+            if {$ref eq "CARRY4"} {
+                puts $fp "sp $site PRECYINIT CIN OUT"
+            } else {
+                puts $fp "sp $site CARRY8 CIN CI"
             }
         }
     }
