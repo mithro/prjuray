@@ -132,22 +132,71 @@ def vivado_env(threads):
     return env
 
 
+# Process groups of the running Vivado processes (each runs in its own
+# session so a timeout can kill it with all its children).  They are killed
+# when this process exits or is terminated, so no Vivado outlives it.
+_GROUPS = set()
+_GROUPS_LOCK = threading.Lock()
+
+
+def _spawn(*args, **kw):
+    p = subprocess.Popen(*args, start_new_session=True, **kw)
+    with _GROUPS_LOCK:
+        _GROUPS.add(p.pid)
+    return p
+
+
+def _reaped(pid):
+    with _GROUPS_LOCK:
+        _GROUPS.discard(pid)
+
+
+def kill_all_groups():
+    with _GROUPS_LOCK:
+        groups = list(_GROUPS)
+    for g in groups:
+        try:
+            os.killpg(g, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def _on_signal(signum, frame):
+    kill_all_groups()
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+def install_cleanup():
+    """Kill the Vivado process groups on exit, SIGTERM, SIGINT, SIGHUP."""
+    import atexit
+    atexit.register(kill_all_groups)
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, _on_signal)
+
+
 def run_fresh(die, wdir, timeout, threads):
     """One Vivado process for the design.  Returns (status, cpu seconds)."""
     vcmd = (f'source {VIVADO_SETTINGS} && NL_BUDGET={budget_of(die)} exec '
             f'vivado -mode batch -nojournal -log vivado.log -source '
             f'design.tcl > run.log 2>&1')
-    p = subprocess.Popen(['bash', '-c', vcmd], cwd=wdir,
-                         env=vivado_env(threads), start_new_session=True)
+    p = _spawn(['bash', '-c', vcmd], cwd=wdir, env=vivado_env(threads))
     t0 = time.time()
     while True:
         pid, status, ru = os.wait4(p.pid, os.WNOHANG)
         if pid:
+            # Leftover children of the group (if any) go too.
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            _reaped(p.pid)
             return 'done', ru.ru_utime + ru.ru_stime
         if time.time() - t0 > timeout:
             cpu = tree_cpu(p.pid)
             os.killpg(p.pid, signal.SIGKILL)
             os.wait4(p.pid, 0)
+            _reaped(p.pid)
             return 'timeout', cpu
         time.sleep(1)
 
@@ -166,11 +215,10 @@ class Worker:
         vcmd = (f'source {VIVADO_SETTINGS} && exec vivado -mode batch '
                 f'-nojournal -log {self.log} -source '
                 f'{os.path.join(TCL, "nl_server.tcl")}')
-        self.p = subprocess.Popen(['bash', '-c', vcmd], cwd=self.home,
-                                  env=env, stdin=subprocess.PIPE,
-                                  stdout=subprocess.PIPE,
-                                  stderr=subprocess.STDOUT, text=True,
-                                  bufsize=1, start_new_session=True)
+        self.p = _spawn(['bash', '-c', vcmd], cwd=self.home,
+                        env=env, stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, text=True, bufsize=1)
         self.out = None
         self.cond = threading.Condition()
         self.done = None
@@ -236,13 +284,15 @@ class Worker:
         except OSError:
             pass
         self.p.wait()
+        _reaped(self.p.pid)
 
     def close(self):
         try:
             self.p.stdin.close()
             self.p.wait(120)
         except (OSError, subprocess.TimeoutExpired):
-            self.kill()
+            pass
+        self.kill()
         shutil.rmtree(self.home, ignore_errors=True)
         try:
             os.unlink(self.log)
@@ -342,6 +392,7 @@ def main():
                     default=os.path.join(dieslib.BUILD, 'designs'))
     ap.add_argument('gen_args', nargs='*')
     args = ap.parse_args()
+    install_cleanup()
     alldies = dieslib.load()
     dlist = [alldies[n] for n in args.die.split(',')]
     first, last = map(int, args.seeds.split(':'))
