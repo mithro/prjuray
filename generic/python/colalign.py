@@ -39,6 +39,7 @@ reads <exp>/<arch>/<die>/evidence.json (tilegrid.py --evidence) and writes
 self-consistency report on stdout.
 """
 import argparse
+import bisect
 import collections
 import json
 import math
@@ -189,6 +190,14 @@ class DieRows:
         return v / (v.max() + 1.0)
 
 
+RARE = 10  # pairs seen fewer times also use generalised kinds
+
+
+def gen(kind):
+    """A tile type name without its leading qualifier."""
+    return kind.split('_', 1)[1] if '_' in kind else kind
+
+
 class Model:
     def __init__(self):
         self.emit = collections.defaultdict(collections.Counter)
@@ -258,6 +267,13 @@ class Model:
     def transition(self, a, b):
         """(log P(same frame column), log P(new frame column))"""
         same, split = self.pair.get((a, b), (0, 0))
+        if same + split < RARE:
+            # Rare pair: add the pairs of the kinds' generalisations (the
+            # name without its leading qualifier, e.g. GTP_INT_INTERFACE_R
+            # -> INT_INTERFACE_R), when known.
+            for ga, gb in ((gen(a), b), (a, gen(b)), (gen(a), gen(b))):
+                s, t = self.pair.get((ga, gb), (0, 0))
+                same, split = same + s, split + t
         if same + split == 0:
             # Unseen pair: back off to what follows a and what precedes b
             # (e.g. a kind always alone in its frame column).
@@ -296,6 +312,8 @@ def align_row(model, kinds, nfs, act, skip, gxs, voids, extra=None,
     rowkind = dict(zip(gxs, kinds))
     replaced = sorted(g for g, k in rowkind.items()
                       if g in refkind and refkind[g] != k)
+    unrep = sorted(g for g, k in rowkind.items()
+                   if g in refkind and refkind[g] == k)
 
     def nvoid(a, b):
         """frame columns the void columns strictly between grid x a and b
@@ -314,7 +332,16 @@ def align_row(model, kinds, nfs, act, skip, gxs, voids, extra=None,
         for g in replaced:
             if a <= g <= b:
                 cols.add(refcol[g])
-        return max(len(cols) + int(other / ratio), int((hi - lo) / ratio))
+        n = max(len(cols) + int(other / ratio), int((hi - lo) / ratio))
+        if replaced and any(a <= g <= b for g in replaced):
+            # Inside a block replacing reference columns (e.g. GT quads in
+            # the fabric), the frame columns of the whole block, between
+            # the unreplaced columns around it, may go unused.
+            k = bisect.bisect_right(unrep, a) - 1
+            m = bisect.bisect_left(unrep, b)
+            if k >= 0 and m < len(unrep):
+                n = max(n, abs(refcol[unrep[m]] - refcol[unrep[k]]) - 1)
+        return n
 
     cs = np.concatenate([[0.0], np.cumsum(skip)])  # cs[i] = sum skip[:i]
     if n == 0 or M == 0:
