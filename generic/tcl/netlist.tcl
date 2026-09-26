@@ -679,6 +679,12 @@ proc nl_iob {name site mode ref stds props} {
         nl_log "ioberr $name padused"
         return 0
     }
+    # The DCI reference resistor pin: DCI standards of its bank need it free.
+    # Same for the VREF pins of standards with an input reference.
+    if {[regexp {VRP|VREF} [get_property -quiet PIN_FUNC $pin]]} {
+        nl_log "ioberr $name vref"
+        return 0
+    }
     set pair [get_property -quiet DIFF_PAIR_PIN $pin]
     if {[string match diff* $mode] && $pair ne "" && [llength [get_ports -quiet -of_objects [get_package_pins -quiet $pair]]]} {
         set mode [dict get {diffin in diffout out difftri tri} $mode]
@@ -723,6 +729,11 @@ proc nl_iob {name site mode ref stds props} {
     set sv [lindex $cands [expr {int(rand() * [llength $cands])}]]
     set std [lindex [split $sv :] 0]
     set vcco [lindex [split $sv :] 1]
+    if {[dict exists $nl_bank_vcco $bank] && [dict get $nl_bank_vcco $bank] ne $vcco} {
+        # (A standard remembered for the bank with another VCCO.)
+        nl_log "ioberr $name novcco"
+        return 0
+    }
     if {[catch {create_cell -reference $ref $name} e]} {
         nl_log "cellerr $name $ref [string range $e 0 150]"
         return 0
@@ -760,6 +771,11 @@ proc nl_iob {name site mode ref stds props} {
         }
     }
     set btype [get_property -quiet BANK_TYPE $bank]
+    # The default drive strength (12) does not exist for LVCMOS12/10 in
+    # High Performance banks.
+    if {$mode ni {in diffin} && [regexp {^LVCMOS1[02]$} $std] && [string match *HIGH_PERFORMANCE* $btype] && [lsearch -exact $props DRIVE] < 0} {
+        lappend props DRIVE [lindex {2 4 6 8} [expr {int(rand() * 4)}]]
+    }
     foreach {k v} $props {
         # Input termination only exists for the SSTL/HSTL/HSUL family and
         # drive strengths only for LVCMOS/LVTTL (with a per standard / bank
@@ -772,7 +788,7 @@ proc nl_iob {name site mode ref stds props} {
             if {![regexp {^(LVCMOS|LVTTL)} $std]} continue
             set ok {4 8 12 16}
             if {[string match *HIGH_PERFORMANCE* $btype]} {
-                set ok [expr {$std eq "LVCMOS12" ? {2 4 6 8} : {2 4 6 8 12}}]
+                set ok [expr {$std in {LVCMOS12 LVCMOS10} ? {2 4 6 8} : {2 4 6 8 12}}]
             } elseif {$std eq "LVCMOS12"} {
                 set ok {4 8 12}
             } elseif {$std in {LVTTL LVCMOS18}} {

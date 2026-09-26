@@ -1295,19 +1295,26 @@ def recipe_io(d, site, stype):
             continue
         if vals and rng.random() < 0.35:
             props += [k, rng.choice(vals)]
+    ref2 = None
+    if mode in ('in', 'diffin'):
+        # (Bitslices need their BITSLICE_CONTROL: see recipe_native.)
+        opts = (['IDDRE1', 'ISERDESE3', 'IDELAYE3'] if us else
+                ['IDDR', 'IDDR_2CLK', 'ISERDESE2', 'IDELAYE2'])
+        opts = [o for o in opts if o in d.prims]
+        if rng.random() < 0.5 and opts:
+            ref2 = rng.choice(opts)
+        if ref2 and ref2.startswith('IDELAY') and 'IOBDELAY' in props:
+            # An IOB delay setting on a buffer feeding an IDELAY makes
+            # Vivado insert a ZHOLD_DELAY between them (unroutable).
+            i = props.index('IOBDELAY')
+            del props[i:i + 2]
     name = d.name('io')
     d.lines.append(f'nl_iob {name} {site} {mode} {ref} {{{" ".join(stds)}}} '
                    f'{{{" ".join(props)}}}')
     for p in IO_CTRL_PINS.get(ref, ()):
         d.add_sink(f'{name}/{p}', site, hard=True)
     if mode in ('in', 'diffin'):
-        r = rng.random()
-        # (Bitslices need their BITSLICE_CONTROL: see recipe_native.)
-        opts = (['IDDRE1', 'ISERDESE3', 'IDELAYE3'] if us else
-                ['IDDR', 'IDDR_2CLK', 'ISERDESE2', 'IDELAYE2'])
-        opts = [o for o in opts if o in d.prims]
-        if r < 0.5 and opts:
-            ref2 = rng.choice(opts)
+        if ref2:
             n2 = d.cell(ref2, None, None, d.random_params(ref2))
             din = {'RX_BITSLICE': 'DATAIN', 'RXTX_BITSLICE': 'DATAIN'}.get(
                 ref2, 'IDATAIN' if ref2.startswith('IDELAY') else 'D')
@@ -1726,7 +1733,8 @@ def generate(die, prims, seed, out, density, hard=True, pips=None,
             any(re.search(r' (IDELAYE|ODELAYE)\w* ', l) for l in d.lines)
         if delays and 'IDELAYCTRL' in prims and 'IDELAYCTRL' not in used:
             n = d.cell('IDELAYCTRL')
-            d.add_sink(f'{n}/REFCLK', die.by_type['SLICEL'][0], 'clock')
+            # REFCLK: from a global buffer (not a pad: unroutable).
+            d.add_sink(f'{n}/REFCLK', die.by_type['SLICEL'][0], 'gclock')
             d.add_sink(f'{n}/RST', die.by_type['SLICEL'][0])
         with open(os.path.join(os.path.dirname(os.path.abspath(out)),
                                'design.meta'), 'w') as f:
