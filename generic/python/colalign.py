@@ -100,8 +100,15 @@ class DieRows:
             self.gyrows[t['gy']].append((t['gx'], name))
         for lst in self.gyrows.values():
             lst.sort()
-        self.gxlo = min(t['gx'] for t in self.grid.tiles.values())
-        self.gxhi = max(t['gx'] for t in self.grid.tiles.values())
+        # Void columns: grid columns with tiles (feed through, breaks, PS
+        # placeholders, ...) but none that can own bits.
+        present = collections.defaultdict(set)
+        for t in self.grid.tiles.values():
+            if t['type'] != 'NULL':
+                present[self.grid.crrow[t['gy']]].add(t['gx'])
+        self.voids = {}
+        for cr, gxs in present.items():
+            self.voids[cr] = sorted(gxs)
         self.rows = {}
         for (cr, gx), c in counts.items():
             # Tile types with sites first (a hard block column also holds
@@ -111,6 +118,9 @@ class DieRows:
             self.rows.setdefault(cr, []).append((gx, kind))
         for cr in self.rows:
             self.rows[cr].sort()
+        for cr in list(self.voids):
+            own = {gx for gx, _ in self.rows.get(cr, ())}
+            self.voids[cr] = sorted(set(self.voids[cr]) - own)
         self.crmap = dict(self.ev['crmap'])
         self.structural_rows()
 
@@ -125,6 +135,30 @@ class DieRows:
         free = [k for k in keys if k not in self.crmap.values()]
         if missing and len(missing) == 1 and len(free) == 1:
             self.crmap[missing[0]] = free[0]
+
+    def row_keys(self):
+        return sorted(k for k in self.cols if k[0] == 0)
+
+    def order_consistent(self, order):
+        """None if the die's learnt frame rows do not fit the frame row
+        ordering (clock region rows ascending), else the number fitting."""
+        crs = sorted(self.rows)
+        keys = sorted(self.row_keys(), key=order)
+        if len(keys) != len(crs):
+            return None
+        want = dict(zip(crs, keys))
+        n = 0
+        for cr, k in self.crmap.items():
+            if want.get(cr) != k:
+                return None
+            n += 1
+        return n
+
+    def apply_order(self, order):
+        crs = sorted(self.rows)
+        keys = sorted(self.row_keys(), key=order)
+        for cr, k in zip(crs, keys):
+            self.crmap.setdefault(cr, k)
 
     def majors(self, cr):
         key = self.crmap.get(cr)
@@ -146,6 +180,7 @@ class Model:
         self.left = collections.defaultdict(lambda: [0, 0])  # (a, *)
         self.right = collections.defaultdict(lambda: [0, 0])  # (*, b)
         self.p0 = {}
+        self.psplit = 0.5
 
     def fit(self, assignments, nf_all):
         """assignments: list of rows, each a list of (kind, frame column
@@ -168,6 +203,9 @@ class Model:
                 prev = (kind, j)
         tot = sum(nf_all.values())
         self.p0 = {nf: n / tot for nf, n in nf_all.items()}
+        # Prior of a new frame column between two grid columns.
+        s, t = (sum(v[k] for v in self.pair.values()) for k in (0, 1))
+        self.psplit = (t + 1) / (s + t + 2)
 
     def emission(self, kind, nf):
         c = self.emit.get(kind)
@@ -197,7 +235,7 @@ class Model:
             s2, t2 = self.right.get(b, (0, 0))
             same, split = s1 + s2, t1 + t2
         n = same + split
-        p = (split + BETA * 0.5) / (n + BETA)
+        p = (split + BETA * self.psplit) / (n + BETA)
         return math.log(1 - p), math.log(p)
 
     def to_json(self):
@@ -209,16 +247,22 @@ class Model:
             p0={str(k): round(v, 4) for k, v in sorted(self.p0.items())})
 
 
-def align_row(model, kinds, nfs, act, skip, gxs, lo, hi):
+def align_row(model, kinds, nfs, act, skip, gxs, voids):
     """kinds: grid column kinds (left to right) at grid x gxs, nfs: frame
     counts of the frame columns, act: per column activity vector (or None),
-    skip: cost of leaving each grid column unassigned, lo / hi: grid x
-    range of the die.  Frame columns left without a grid column cost S_MAJ
+    skip: cost of leaving each grid column unassigned, voids: grid x of the
+    void columns of the row.  Frame columns left without a grid column cost S_MAJ
     each, except as many as there are void grid columns at that place (a
     frame column of a column without configurable tiles, e.g. feed through
     columns replacing fabric).  Returns the frame column index (or None) of
     every grid column."""
     n, M = len(kinds), len(nfs)
+    vv = np.array(voids, dtype=float)
+
+    def nvoid(a, b):
+        """void columns strictly between grid x a and b"""
+        return int(np.searchsorted(vv, b) - np.searchsorted(vv, a, 'right'))
+
     cs = np.concatenate([[0.0], np.cumsum(skip)])  # cs[i] = sum skip[:i]
     if n == 0 or M == 0:
         return [None] * n, 0.0
@@ -236,14 +280,14 @@ def align_row(model, kinds, nfs, act, skip, gxs, lo, hi):
     valid = D >= 0
     for i in range(n):
         # start: columns 0..i-1 unassigned, frame columns 0..j-1 unused
-        a0 = gxs[i] - lo - i
+        a0 = nvoid(-1, gxs[i])
         best = -cs[i] - S_MAJ * np.maximum(0, jidx - a0)
         arg = np.full((M, 2), -1)
         for ip in range(max(0, i - 1 - MAXSKIP), i):
             skipped = cs[i] - cs[ip + 1]
             ls, lt = model.transition(kinds[ip], kinds[i])
             same = dp[ip] + ls - skipped
-            a = gxs[i] - gxs[ip] - 1 - (i - ip - 1)
+            a = nvoid(gxs[ip], gxs[i])
             val = np.where(valid, dp[ip][None, :] -
                            S_MAJ * np.maximum(0, D - a), NEG)
             jp = np.argmax(val, axis=1)
@@ -257,7 +301,7 @@ def align_row(model, kinds, nfs, act, skip, gxs, lo, hi):
         dp[i] = best + E[i]
         back[i] = arg
     # end
-    aend = hi - np.array(gxs) - (n - 1 - np.arange(n))
+    aend = np.array([nvoid(g, 10**9) for g in gxs])
     tail = dp - (cs[n] - cs[1:])[:, None] - S_MAJ * np.maximum(
         0, (M - 1 - jidx)[None, :] - aend[:, None])
     i, j = np.unravel_index(int(np.argmax(tail)), tail.shape)
@@ -323,9 +367,10 @@ def attach_silent(rows_all, assigned, model=None, maxdist=16):
 
 def minority_tiles(dr, cr, full):
     """Hard block tiles (with sites) of another type than their column's
-    kind, e.g. a PCIE block over part of a CLB column: they take the frame
-    column of their nearest neighbours in their own grid row (both sides
-    agreeing, or the strictly nearer one) when it differs from their
+    kind, e.g. a PCIE block over part of a CLB column, where the other grid
+    columns sharing their column's frame column are absent: they take the
+    frame column of their nearest neighbours in their own grid row (both
+    sides agreeing, or the strictly nearer one) when it differs from their
     column's.  Returns {tile: frame column index}."""
     kinds = dict(dr.rows[cr])
     out = {}
@@ -336,6 +381,14 @@ def minority_tiles(dr, cr, full):
         if kinds.get(gx) in (None, t['type']) or gx not in full:
             continue
         row = [(g, n) for g, n in dr.gyrows.get(t['gy'], ()) if g in full]
+        # Only when the other grid columns of its column's frame column are
+        # missing in this grid row (the block replaces them), e.g. not for
+        # clock row tiles of a column that is alone in its frame column.
+        partners = [g for g, j in full.items()
+                    if j == full[gx] and g != gx]
+        here = {g for g, _ in row}
+        if not partners or any(g in here for g in partners):
+            continue
         left = [g for g, n in row if g < gx]
         right = [g for g, n in row if g > gx]
         L = left[-1] if left else None
@@ -386,7 +439,9 @@ def main():
                     help='experiment directory (<exp>/<arch>/<die>/)')
     ap.add_argument('--dies', help='comma separated (default: all with an '
                     'evidence file)')
-    ap.add_argument('--iters', type=int, default=6)
+    ap.add_argument('--iters', type=int, default=8)
+    ap.add_argument('--w-act', type=float, default=W_ACT,
+                    help='weight of the design activity bonus')
     ap.add_argument('--verbose', action='store_true',
                     help='list frame count mismatches and activity '
                     'disagreements')
@@ -395,6 +450,7 @@ def main():
     ap.add_argument('--init-dies', help='dies whose activity assignment '
                     'initialises the model (default: all)')
     args = ap.parse_args()
+    globals()['W_ACT'] = args.w_act
     alldies = dieslib.load()
     base = os.path.join(args.exp, args.arch)
     names = args.dies.split(',') if args.dies else sorted(
@@ -405,6 +461,29 @@ def main():
     for d in names:
         rows[d] = DieRows(alldies[d], os.path.join(base, d, 'evidence.json'))
         print('loaded', d, flush=True)
+    # Frame rows of clock region rows without activity: the order of the
+    # frame rows along the clock region rows is learnt from the dies with
+    # learnt frame rows among a few candidate orderings.
+    orders = {
+        'half, row': lambda k: (k[1], k[2]),
+        'reversed half, row': lambda k: (-k[1], -k[2]),
+        'outwards from the centre': lambda k: (-k[1], -k[2] if k[1] else k[2]),
+        'inwards to the centre': lambda k: (k[1], k[2] if k[1] else -k[2]),
+    }
+    votes = collections.Counter()
+    for dr in rows.values():
+        for name, o in orders.items():
+            n = dr.order_consistent(o)
+            if n:
+                votes[name] += n
+    if votes:
+        best = votes.most_common(1)[0][0]
+        print(f'frame row order: {best} ({dict(votes)})', flush=True)
+        for d, dr in rows.items():
+            if len(dr.crmap) < len(dr.rows) and \
+                    dr.order_consistent(orders[best]) is not None:
+                dr.apply_order(orders[best])
+                print(f'  {d}: frame rows from the order', flush=True)
     # Kinds with activity somewhere take part in the alignment.
     active = set()
     for d, dr in rows.items():
@@ -430,7 +509,9 @@ def main():
     for d, dr in rows.items():
         if d not in init:
             continue
-        colmap, _ = TG.assign_activity(dr.grid, dr.cols, dr.ev)
+        # Only assignments the activity supports directly (no propagation
+        # between rows or gap filling).
+        colmap, _ = TG.assign_activity(dr.grid, dr.cols, dr.ev, fill=False)
         for cr in dr.rows:
             m = dr.majors(cr)
             if not m:
@@ -462,8 +543,8 @@ def main():
                 act = [dr.activity(cr, gx, len(m)) for gx, _ in s]
                 skip = [S_COL if k in active else S_SILENT for k in kinds]
                 out, _ = align_row(model, kinds, [c[2] for c in m], act,
-                                   skip, [gx for gx, _ in s], dr.gxlo,
-                                   dr.gxhi)
+                                   skip, [gx for gx, _ in s],
+                                   dr.voids.get(cr, []))
                 asg = {gx: j for (gx, _), j in zip(s, out) if j is not None}
                 if asg != cur.get((d, cr)):
                     changed += 1

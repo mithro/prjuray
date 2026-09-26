@@ -317,7 +317,7 @@ def load_evidence(path, cols):
                 ndesigns=d['ndesigns'])
 
 
-def assign_activity(grid, cols, ev, verbose=False):
+def assign_activity(grid, cols, ev, verbose=False, fill=True):
     """Frame column of each grid column from design activity alone: per
     clock region row a monotonic assignment maximising the activity scores,
     then propagation between rows and gap filling."""
@@ -351,8 +351,9 @@ def assign_activity(grid, cols, ev, verbose=False):
                 colmap[(cr, gx)] = clist[j][0]
             # previous columns must use majors <= j
             j = int(np.argmax(pm[:j + 1] == pm[j])) if pm[j] > 0 else j
-    propagate_columns(grid, crmap, colmap, block0, verbose)
-    fill_gaps(grid, crmap, colmap, block0, verbose)
+    if fill:
+        propagate_columns(grid, crmap, colmap, block0, verbose)
+        fill_gaps(grid, crmap, colmap, block0, verbose)
     colmap1 = {k: v.most_common(1)[0][0] for k, v in ev['bram1'].items()}
     if verbose:
         print('frame rows', crmap)

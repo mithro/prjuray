@@ -30,6 +30,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 URAY_DIR = os.path.dirname(os.path.dirname(HERE))
 
 FAMILIES = ('artix7', 'kintex7', 'spartan7', 'zynq7', 'virtex7')
+# Other architectures (tile grid comparison only): prjuray-db families.
+ARCH_FAMILIES = {
+    'Series7': FAMILIES,
+    'UltraScale': ('kintexu', ),
+    'UltraScalePlus': ('zynqusp', 'kintexuplus'),
+}
+ARCH = 'Series7'
 BLOCKS = {'CLB_IO_CLK': 0, 'BLOCK_RAM': 1}
 PX_SUFFIX = {0: '', 1: '.block_ram'}
 WORD = 32
@@ -37,7 +44,10 @@ SAMPLE = 12
 
 
 def far_fields(far):
-    """7-series frame address -> (block, half, row, col, minor)."""
+    """Frame address -> (block, half, row, col, minor)."""
+    if ARCH != 'Series7':
+        import bitstream
+        return bitstream.far_fields(ARCH, far)
     return ((far >> 23) & 7, (far >> 22) & 1, (far >> 17) & 0x1f,
             (far >> 7) & 0x3ff, far & 0x7f)
 
@@ -129,7 +139,7 @@ def compare_tilegrid(px, ours):
             pf = far_fields(pbase)
             of = far_fields(obase)
             bad = []
-            if (pbase & ~0x7f) != (obase & ~0x7f):
+            if pf[:4] != of[:4]:
                 if pf[1:3] != of[1:3]:
                     bad.append('row')
                 if pf[3] != of[3]:
@@ -568,17 +578,24 @@ def main():
         'URAY_BUILD', os.path.join(URAY_DIR, 'build')))
     ap.add_argument('--db', help='default: <build>/db/Series7')
     ap.add_argument('--devices', help='comma separated prjxray devices')
+    ap.add_argument('--arch', default='Series7',
+                    help='Series7 (prjxray-db) or UltraScale(Plus) '
+                    '(prjuray-db, implies --tilegrid-only)')
     ap.add_argument('--tilegrid-only', action='store_true',
                     help='compare the tile grids only (no bits)')
     args = ap.parse_args()
     os.environ['URAY_BUILD'] = args.build
     sys.path.insert(0, HERE)
     import dies as dieslib
-    dbdir = args.db or os.path.join(args.build, 'db', 'Series7')
+    global ARCH
+    ARCH = args.arch
+    if ARCH != 'Series7':
+        args.tilegrid_only = True
+    dbdir = args.db or os.path.join(args.build, 'db', ARCH)
 
     alldies = dieslib.load()
     devices = []
-    for fam in FAMILIES:
+    for fam in ARCH_FAMILIES[ARCH]:
         for path in sorted(glob.glob(os.path.join(
                 args.prjxray_db, fam, '*', 'tilegrid.json'))):
             dev = os.path.basename(os.path.dirname(path))
@@ -586,7 +603,8 @@ def main():
                 continue
             die = None
             for d in alldies.values():
-                if dev in d.devices:
+                # prjuray-db names devices by part
+                if dev in d.devices or dev in d.parts:
                     die = d.name
             devices.append((fam, dev, die, path))
 
