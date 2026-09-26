@@ -34,6 +34,7 @@ proc nl_init {part} {
 # Create a cell with parameters.  Parameters Vivado rejects are logged and
 # left at their defaults.
 proc nl_cell {name ref {props {}} {loc {}} {bel {}}} {
+    nl_flush_nets
     if {[catch {create_cell -reference $ref $name} e]} {
         nl_log "cellerr $name $ref $e"
         return 0
@@ -111,17 +112,54 @@ proc nl_net {name pins} {
         }
         return
     }
-    if {[catch {create_net $name} e]} {
-        nl_log "neterr $name $e"
-        return
+    # Nets are created and connected in batches (one create_net and one
+    # connect_net call per batch is much faster than one per net).
+    global nl_pending
+    lappend nl_pending $name [concat $drv $loads]
+    if {[llength $nl_pending] >= 4000} { nl_flush_nets }
+}
+
+# Create and connect the nets queued by nl_net.  A failing batch is redone
+# net by net so that errors are logged per net as before.
+set nl_pending [list]
+proc nl_flush_nets {} {
+    global nl_pending
+    if {[llength $nl_pending] == 0} return
+    set batch $nl_pending
+    set nl_pending [list]
+    set names [list]
+    foreach {n -} $batch { lappend names $n }
+    if {[catch {create_net $names}]} {
+        set ok [list]
+        foreach {n objs} $batch {
+            if {[llength [get_nets -quiet $n]]} {
+                nl_log "neterr $n exists"
+            } elseif {[catch {create_net $n} e]} {
+                nl_log "neterr $n $e"
+            } else {
+                lappend ok $n $objs
+            }
+        }
+        set batch $ok
     }
-    if {[catch {connect_net -net $name -objects [concat $drv $loads]} e]} {
-        nl_log "connerr $name [string range $e 0 200]"
+    if {[catch {connect_net -net_object_list $batch}]} {
+        foreach {n objs} $batch {
+            set have [get_pins -quiet -of_objects [get_nets -quiet $n]]
+            set todo [list]
+            foreach o $objs {
+                if {[lsearch -exact $have $o] < 0} { lappend todo $o }
+            }
+            if {[llength $todo] == 0} continue
+            if {[catch {connect_net -net $n -objects [get_pins -quiet $todo]} e]} {
+                nl_log "connerr $n [string range $e 0 200]"
+            }
+        }
     }
 }
 
 # Connect pins to an existing net (e.g. the constant nets).
 proc nl_conn {net pins} {
+    nl_flush_nets
     set objs [get_pins -quiet $pins]
     if {[llength $objs] == 0} return
     if {[catch {connect_net -net $net -objects $objs} e]} {
@@ -131,6 +169,7 @@ proc nl_conn {net pins} {
 
 # Create a top level port with an I/O buffer attached to <pin>.
 proc nl_port {name dir pin} {
+    nl_flush_nets
     if {[catch {create_port -direction $dir $name} e]} {
         nl_log "porterr $name $e"
         return
@@ -422,6 +461,7 @@ proc nl_const_offenders {txt} {
 
 set nl_orphans [list]
 proc nl_finish {{relaxclk 0}} {
+    nl_flush_nets
     set t0 [clock seconds]
     nl_log "t_built [clock milliseconds]"
     global nl_orphans
@@ -552,6 +592,7 @@ proc nl_finish {{relaxclk 0}} {
 
 # Constrain cells to a region.
 proc nl_pblock {name range cells} {
+    nl_flush_nets
     if {[catch {
         set pb [create_pblock $name]
         resize_pblock $pb -add $range
@@ -569,6 +610,7 @@ proc nl_pblock {name range cells} {
 #   props: random buffer/port properties to try
 set nl_bank_vcco [dict create]
 proc nl_iob {name site mode ref stds props} {
+    nl_flush_nets
     global nl_bank_vcco
     set s [get_sites -quiet $site]
     if {$s eq ""} { nl_log "ioberr $name nosite"; return 0 }
@@ -676,6 +718,7 @@ proc nl_iob {name site mode ref stds props} {
 # generator with nl_want_pip and applied by nl_finish before routing.
 set nl_wanted_pips [list]
 proc nl_want_pip {net pip} {
+    nl_flush_nets
     global nl_wanted_pips
     lappend nl_wanted_pips $net $pip
 }
