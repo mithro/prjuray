@@ -19,7 +19,9 @@ def run(cmd, log):
     return r.returncode
 
 
-def tilegrid(args):
+def evidence(args):
+    """Design activity evidence of a die (and its activity only tile grid,
+    for comparison)."""
     die, arch, tags = args
     out = os.path.join(dieslib.BUILD, 'db', arch, die)
     os.makedirs(out, exist_ok=True)
@@ -28,7 +30,22 @@ def tilegrid(args):
     return die, run([
         sys.executable,
         os.path.join(HERE, 'tilegrid.py'), '--die', die, '--designs', roots,
-        '--out',
+        '--evidence',
+        os.path.join(out, 'evidence.json'), '--out',
+        os.path.join(out, 'tilegrid_activity.json')
+    ], os.path.join(out, 'evidence.log'))
+
+
+def tilegrid(args):
+    """Tile grid from the evidence and the structural frame column
+    alignment."""
+    die, arch = args
+    out = os.path.join(dieslib.BUILD, 'db', arch, die)
+    return die, run([
+        sys.executable,
+        os.path.join(HERE, 'tilegrid.py'), '--die', die, '--evidence',
+        os.path.join(out, 'evidence.json'), '--colmap',
+        os.path.join(out, 'colmap.json'), '--out',
         os.path.join(out, 'tilegrid.json')
     ], os.path.join(out, 'tilegrid.log'))
 
@@ -49,7 +66,18 @@ def main():
     logdir = os.path.join(dieslib.BUILD, 'logs')
     if not args.skip_tilegrid:
         with ProcessPoolExecutor(min(len(dlist), 8)) as ex:
-            for die, rc in ex.map(tilegrid, [(d, arch, tags) for d in dlist]):
+            for die, rc in ex.map(evidence, [(d, arch, tags) for d in dlist]):
+                print('evidence', die, 'rc', rc, flush=True)
+        # Frame column alignment over every die of the architecture with
+        # evidence (the kind tables are shared).
+        rc = run([
+            sys.executable,
+            os.path.join(HERE, 'colalign.py'), '--arch', arch, '--exp',
+            os.path.join(dieslib.BUILD, 'db'), '--verbose'
+        ], os.path.join(logdir, f'colalign_{arch}.log'))
+        print('colalign rc', rc, flush=True)
+        with ProcessPoolExecutor(min(len(dlist), 8)) as ex:
+            for die, rc in ex.map(tilegrid, [(d, arch) for d in dlist]):
                 print('tilegrid', die, 'rc', rc, flush=True)
     rc = run([
         sys.executable,
