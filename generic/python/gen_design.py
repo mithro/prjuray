@@ -817,6 +817,12 @@ def recipe_hard(d, site, ref, pconn=0.6):
                 kind = 'clock' if (DIRECT_CLOCKS.search(pin) or (
                     CLOCK_BUFFERS.match(ref) and pin in ('I', 'I0', 'I1'))) \
                     else 'data'
+                if kind == 'data' and ref.startswith('DSP48') and \
+                        rng.random() < 0.3:
+                    # DSP inputs have their own VCC/GND tie-offs (the
+                    # DSP_VCC / DSP_GND site pips).
+                    d.tie(full, int(rng.random() < 0.7))
+                    continue
                 d.add_sink(full, site, kind, hard=True)
         elif direction == 'OUT':
             if rng.random() < pconn:
