@@ -245,6 +245,22 @@ proc dump_features {out} {
             }
         }
     }
+    # Bank wide settings (e.g. the 7-series STEPDOWN of low voltage banks)
+    # also change unused pads: report the I/O standards used in each bank on
+    # every pad site of the bank.
+    set bankstd [dict create]
+    foreach port [get_ports -quiet] {
+        set pin [get_package_pins -quiet -of_objects $port]
+        set std [get_property IOSTANDARD $port]
+        if {$pin eq "" || $std eq ""} continue
+        dict set bankstd [get_property BANK $pin] $std 1
+    }
+    dict for {bank stds} $bankstd {
+        set bsites [get_sites -quiet -of_objects [get_package_pins -quiet -filter "BANK == $bank"]]
+        foreach s $bsites {
+            foreach std [dict keys $stds] { puts $fp "bank $s IOSTD $std" }
+        }
+    }
     puts $fp "# t_done [expr {[clock milliseconds] - $t0}]"
     close $fp
 }

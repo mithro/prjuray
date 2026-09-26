@@ -13,6 +13,7 @@ Feature naming (relative to the tile, prefixed by the tile type in the DB):
   <SITEKEY>.<BEL>.<CFG>[i]         bit i of a vector BEL configuration is 1
   <SITEKEY>.<BEL>.<CFG>[i]=0       bit i is 0 (vectors of <= 64 bits)
   <SITEKEY>.<BEL>.INIT[i]          LUT truth table bit (from EQN)
+  <SITEKEY>.BANK.IOSTD=<std>       an I/O standard used in the pad's bank
 
 SITEKEY is <site prefix>_X<dx>Y<dy>, relative to the lowest coordinates of
 same-prefix sites in the tile.
@@ -152,6 +153,11 @@ def tile_features(path, sitekeys):
             elif kind == 'sp':
                 tile, key = site_map[p[1]]
                 feats[tile].add(f'{key}.{p[2]}.SP.{p[3]}.{p[4]}')
+            elif kind == 'bank':
+                # I/O standards used in the pad's bank (pad may be unused).
+                if len(p) >= 4 and p[1] in sitekeys.key:
+                    tile, key = sitekeys.key[p[1]]
+                    feats[tile].add(f'{key}.BANK.{p[2]}={p[3]}')
             elif kind == 'cfg':
                 tile, key = site_map[p[1]]
                 value = ' '.join(p[4:])
