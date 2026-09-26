@@ -100,6 +100,8 @@ class DieRows:
             self.gyrows[t['gy']].append((t['gx'], name))
         for lst in self.gyrows.values():
             lst.sort()
+        self.gxlo = min(t['gx'] for t in self.grid.tiles.values())
+        self.gxhi = max(t['gx'] for t in self.grid.tiles.values())
         self.rows = {}
         for (cr, gx), c in counts.items():
             # Tile types with sites first (a hard block column also holds
@@ -207,11 +209,15 @@ class Model:
             p0={str(k): round(v, 4) for k, v in sorted(self.p0.items())})
 
 
-def align_row(model, kinds, nfs, act, skip):
-    """kinds: grid column kinds (left to right), nfs: frame counts of the
-    frame columns, act: per column activity vector (or None), skip: cost of
-    leaving each grid column unassigned.  Returns the frame column index (or
-    None) of every grid column."""
+def align_row(model, kinds, nfs, act, skip, gxs, lo, hi):
+    """kinds: grid column kinds (left to right) at grid x gxs, nfs: frame
+    counts of the frame columns, act: per column activity vector (or None),
+    skip: cost of leaving each grid column unassigned, lo / hi: grid x
+    range of the die.  Frame columns left without a grid column cost S_MAJ
+    each, except as many as there are void grid columns at that place (a
+    frame column of a column without configurable tiles, e.g. feed through
+    columns replacing fabric).  Returns the frame column index (or None) of
+    every grid column."""
     n, M = len(kinds), len(nfs)
     cs = np.concatenate([[0.0], np.cumsum(skip)])  # cs[i] = sum skip[:i]
     if n == 0 or M == 0:
@@ -225,37 +231,35 @@ def align_row(model, kinds, nfs, act, skip):
     dp = np.full((n, M), NEG)
     back = {}
     jidx = np.arange(M)
+    # D[j, j'] = frame columns skipped going from j' to j
+    D = jidx[:, None] - jidx[None, :] - 1
+    valid = D >= 0
     for i in range(n):
         # start: columns 0..i-1 unassigned, frame columns 0..j-1 unused
-        best = -cs[i] - S_MAJ * jidx
+        a0 = gxs[i] - lo - i
+        best = -cs[i] - S_MAJ * np.maximum(0, jidx - a0)
         arg = np.full((M, 2), -1)
         for ip in range(max(0, i - 1 - MAXSKIP), i):
             skipped = cs[i] - cs[ip + 1]
             ls, lt = model.transition(kinds[ip], kinds[i])
             same = dp[ip] + ls - skipped
-            # split: max over j' < j of dp[ip][j'] - S_MAJ * (j - j' - 1)
-            shifted = dp[ip] + S_MAJ * jidx
-            run = np.maximum.accumulate(shifted)
-            runarg = np.zeros(M, dtype=int)
-            cur = 0
-            for j in range(M):
-                if shifted[j] >= shifted[cur]:
-                    cur = j
-                runarg[j] = cur
-            split = np.full(M, NEG)
-            split[1:] = run[:-1] - S_MAJ * (jidx[1:] - 1) + lt - skipped
-            for j in range(M):
-                if same[j] > best[j]:
-                    best[j] = same[j]
-                    arg[j] = (ip, j)
-                if split[j] > best[j]:
-                    best[j] = split[j]
-                    arg[j] = (ip, runarg[j - 1])
+            a = gxs[i] - gxs[ip] - 1 - (i - ip - 1)
+            val = np.where(valid, dp[ip][None, :] -
+                           S_MAJ * np.maximum(0, D - a), NEG)
+            jp = np.argmax(val, axis=1)
+            split = val[jidx, jp] + lt - skipped
+            take = same > best
+            best = np.where(take, same, best)
+            arg[take] = np.stack([np.full(M, ip), jidx], axis=1)[take]
+            take = split > best
+            best = np.where(take, split, best)
+            arg[take] = np.stack([np.full(M, ip), jp], axis=1)[take]
         dp[i] = best + E[i]
         back[i] = arg
     # end
-    tail = dp - (cs[n] - cs[1:])[:, None] - \
-        S_MAJ * (M - 1 - jidx)[None, :]
+    aend = hi - np.array(gxs) - (n - 1 - np.arange(n))
+    tail = dp - (cs[n] - cs[1:])[:, None] - S_MAJ * np.maximum(
+        0, (M - 1 - jidx)[None, :] - aend[:, None])
     i, j = np.unravel_index(int(np.argmax(tail)), tail.shape)
     total = float(tail[i, j])
     out = [None] * n
@@ -455,7 +459,8 @@ def main():
                 act = [dr.activity(cr, gx, len(m)) for gx, _ in s]
                 skip = [S_COL if k in active else S_SILENT for k in kinds]
                 out, _ = align_row(model, kinds, [c[2] for c in m], act,
-                                   skip)
+                                   skip, [gx for gx, _ in s], dr.gxlo,
+                                   dr.gxhi)
                 asg = {gx: j for (gx, _), j in zip(s, out) if j is not None}
                 if asg != cur.get((d, cr)):
                     changed += 1
