@@ -262,7 +262,9 @@ def write_db(outdir, ttype, k, res):
     suffix = ttype.lower() + (f'.{k}' if k else '')
     with open(os.path.join(outdir, f'segbits_{suffix}.db'), 'w') as f:
         for feat in sorted(res['feat_bits']):
-            bits = sorted(res['feat_bits'][feat], key=lambda b: b.lstrip('!'))
+            # A bit can be assigned twice (single cover, then pair cover).
+            bits = sorted(set(res['feat_bits'][feat]),
+                          key=lambda b: b.lstrip('!'))
             f.write(f'{ttype}.{feat} {" ".join(bits)}\n')
     with open(os.path.join(outdir, f'defaults_{suffix}.db'), 'w') as f:
         for b in sorted(res['defaults']):
