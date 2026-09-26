@@ -39,6 +39,7 @@ reads <exp>/<arch>/<die>/evidence.json (tilegrid.py --evidence) and writes
 self-consistency report on stdout.
 """
 import argparse
+import bisect
 import collections
 import json
 import math
@@ -60,6 +61,8 @@ S_MAJ = 2.0  # frame column without any grid column
 S_COL = 3.0  # grid column of an active kind without a frame column
 S_SILENT = 1.0  # same for a silent kind
 MIN_ACT = 2.0  # activity score (~ matching tiles) making a kind active
+SUPPORTED = False  # learn only from activity supported assignments
+SUP_ACT = 3.0  # activity score supporting an assignment
 INIT_EA = False  # leave kinds whose activity neighbours explain out of the
 # initial assignment
 ALPHA = 1.0  # emission smoothing
@@ -189,6 +192,14 @@ class DieRows:
         return v / (v.max() + 1.0)
 
 
+RARE = 10  # pairs seen fewer times also use generalised kinds
+
+
+def gen(kind):
+    """A tile type name without its leading qualifier."""
+    return kind.split('_', 1)[1] if '_' in kind else kind
+
+
 class Model:
     def __init__(self):
         self.emit = collections.defaultdict(collections.Counter)
@@ -258,6 +269,13 @@ class Model:
     def transition(self, a, b):
         """(log P(same frame column), log P(new frame column))"""
         same, split = self.pair.get((a, b), (0, 0))
+        if same + split < RARE:
+            # Rare pair: add the pairs of the kinds' generalisations (the
+            # name without its leading qualifier, e.g. GTP_INT_INTERFACE_R
+            # -> INT_INTERFACE_R), when known.
+            for ga, gb in ((gen(a), b), (a, gen(b)), (gen(a), gen(b))):
+                s, t = self.pair.get((ga, gb), (0, 0))
+                same, split = same + s, split + t
         if same + split == 0:
             # Unseen pair: back off to what follows a and what precedes b
             # (e.g. a kind always alone in its frame column).
@@ -296,6 +314,8 @@ def align_row(model, kinds, nfs, act, skip, gxs, voids, extra=None,
     rowkind = dict(zip(gxs, kinds))
     replaced = sorted(g for g, k in rowkind.items()
                       if g in refkind and refkind[g] != k)
+    unrep = sorted(g for g, k in rowkind.items()
+                   if g in refkind and refkind[g] == k)
 
     def nvoid(a, b):
         """frame columns the void columns strictly between grid x a and b
@@ -314,7 +334,16 @@ def align_row(model, kinds, nfs, act, skip, gxs, voids, extra=None,
         for g in replaced:
             if a <= g <= b:
                 cols.add(refcol[g])
-        return max(len(cols) + int(other / ratio), int((hi - lo) / ratio))
+        n = max(len(cols) + int(other / ratio), int((hi - lo) / ratio))
+        if replaced and any(a <= g <= b for g in replaced):
+            # Inside a block replacing reference columns (e.g. GT quads in
+            # the fabric), the frame columns of the whole block, between
+            # the unreplaced columns around it, may go unused.
+            k = bisect.bisect_right(unrep, a) - 1
+            m = bisect.bisect_left(unrep, b)
+            if k >= 0 and m < len(unrep):
+                n = max(n, abs(refcol[unrep[m]] - refcol[unrep[k]]) - 1)
+        return n
 
     cs = np.concatenate([[0.0], np.cumsum(skip)])  # cs[i] = sum skip[:i]
     if n == 0 or M == 0:
@@ -579,6 +608,9 @@ def main():
     ap.add_argument('--verbose', action='store_true',
                     help='list frame count mismatches and activity '
                     'disagreements')
+    ap.add_argument('--supported', action='store_true',
+                    help='learn the tables only from assignments the '
+                    'activity supports (not merely does not contradict)')
     ap.add_argument('--init-explained', action='store_true',
                     help='leave kinds whose activity is explained by their '
                     'neighbours out of the initial assignment')
@@ -589,6 +621,7 @@ def main():
     args = ap.parse_args()
     globals()['W_ACT'] = args.w_act
     globals()['INIT_EA'] = args.init_explained
+    globals()['SUPPORTED'] = args.supported
     alldies = dieslib.load()
     base = os.path.join(args.exp, args.arch)
     names = args.dies.split(',') if args.dies else sorted(
@@ -696,6 +729,10 @@ def main():
                 v = sc.get(gx)
                 if j is not None and v is not None and \
                         v.max() >= MIN_ACT and v[j] < 0.5 * v.max():
+                    nf = None
+                if SUPPORTED and j is not None and \
+                        (v is None or v[j] < SUP_ACT):
+                    # only assignments the activity supports
                     nf = None
                 row.append((k, j, nf))
             data.append(row)

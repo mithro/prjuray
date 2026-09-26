@@ -104,9 +104,12 @@ def check_ids(col, db, ids, fasm=None):
                 documented.add(gid)
             else:
                 undoc.append((gid, tt, b))
+    bad = set()
     for gid, tt, b in undoc:
         if gid not in documented:
             unknown[tt][b] += 1
+            bad.add(gid)
+    check_ids.undocumented_bits = len(bad)
     return col.unowned(ids), unknown
 
 
@@ -164,7 +167,7 @@ def main():
                     help='write decoded features of the (first) input here')
     args = ap.parse_args()
     die = dieslib.load()[args.die]
-    dbdir = os.path.join(dieslib.BUILD, 'db', die.arch)
+    dbdir = os.path.join(dieslib.DB, die.arch)
     tg = json.load(open(os.path.join(dbdir, die.name, 'tilegrid.json')))
     col = mkdb.Collector(die, tg)
     db = Database(dbdir)
@@ -195,7 +198,9 @@ def main():
             with open(args.fasm, 'w') as f:
                 f.write('\n'.join(sorted(set(fasm))) + '\n')
         n = sum(sum(c.values()) for c in unknown.values())
-        print(f'{name}: set {len(ids)} unowned {unowned} undocumented {n}')
+        # n counts a bit once per owning tile; distinct bits too
+        print(f'{name}: set {len(ids)} unowned {unowned} undocumented {n} '
+              f'bits {check_ids.undocumented_bits}')
         total_unowned += unowned
         for tt, c in unknown.items():
             total[tt].update(c)

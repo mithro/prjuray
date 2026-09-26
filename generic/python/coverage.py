@@ -32,7 +32,7 @@ def main():
     ap.add_argument('--targets', default=None)
     ap.add_argument('--min-seen', type=int, default=3)
     args = ap.parse_args()
-    dbdir = os.path.join(dieslib.BUILD, 'db', args.arch)
+    dbdir = os.path.join(dieslib.DB, args.arch)
     db = db_features(dbdir)
     counts = {}
     for path in glob.glob(os.path.join(dbdir, 'counts_*.txt')):

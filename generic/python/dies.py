@@ -9,6 +9,8 @@ URAY_DIR = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))))
 BUILD = os.environ.get('URAY_BUILD', os.path.join(URAY_DIR, 'build'))
 META = os.path.join(BUILD, 'meta')
+# Database root (<DB>/<arch>/...), e.g. an experiment directory.
+DB = os.environ.get('URAY_DB', os.path.join(BUILD, 'db'))
 
 ARCH_OF_FAMILY = {
     'artix7': 'Series7',

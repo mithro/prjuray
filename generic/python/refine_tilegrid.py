@@ -40,7 +40,7 @@ def main():
     ap.add_argument('--min-bits', type=int, default=30)
     args = ap.parse_args()
     die = dieslib.load()[args.die]
-    dbdir = os.path.join(dieslib.BUILD, 'db', die.arch)
+    dbdir = os.path.join(dieslib.DB, die.arch)
     path = os.path.join(dbdir, die.name, 'tilegrid.json')
     tg = json.load(open(path))
     db = CK.Database(dbdir)

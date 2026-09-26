@@ -23,7 +23,7 @@ def evidence(args):
     """Design activity evidence of a die (and its activity only tile grid,
     for comparison)."""
     die, arch, tags = args
-    out = os.path.join(dieslib.BUILD, 'db', arch, die)
+    out = os.path.join(dieslib.DB, arch, die)
     os.makedirs(out, exist_ok=True)
     roots = ','.join(
         os.path.join(dieslib.BUILD, 'designs', die, t) for t in tags)
@@ -40,14 +40,58 @@ def tilegrid(args):
     """Tile grid from the evidence and the structural frame column
     alignment."""
     die, arch = args
-    out = os.path.join(dieslib.BUILD, 'db', arch, die)
+    out = os.path.join(dieslib.DB, arch, die)
+    win = os.path.join(dieslib.DB, arch, 'windows.json')
     return die, run([
         sys.executable,
         os.path.join(HERE, 'tilegrid.py'), '--die', die, '--evidence',
         os.path.join(out, 'evidence.json'), '--colmap',
         os.path.join(out, 'colmap.json'), '--out',
         os.path.join(out, 'tilegrid.json')
+    ] + (['--windows', win] if os.path.exists(win) else []),
+        os.path.join(out, 'tilegrid.log'))
+
+
+def probe(args):
+    """Tile type windows of a die: a tile grid giving the doubtful tile
+    types wide windows, a bit database of these types built with it (in
+    <BUILD>/probe/<die>), and the rows their features use."""
+    die, arch, tags = args
+    root = os.path.join(dieslib.BUILD, 'probe', die)
+    out = os.path.join(root, arch, die)
+    os.makedirs(out, exist_ok=True)
+    src = os.path.join(dieslib.DB, arch, die)
+    rc = run([
+        sys.executable,
+        os.path.join(HERE, 'tilegrid.py'), '--die', die, '--evidence',
+        os.path.join(src, 'evidence.json'), '--colmap',
+        os.path.join(src, 'colmap.json'), '--probe', 'auto', '--out',
+        os.path.join(out, 'tilegrid.json')
     ], os.path.join(out, 'tilegrid.log'))
+    if rc:
+        return die, rc
+    types = []
+    for line in open(os.path.join(out, 'tilegrid.log')):
+        if line.startswith('probe '):
+            types = line.split()[1:]
+    if not types:
+        return die, 0
+    env = dict(os.environ, URAY_DB=root, PYTHONHASHSEED='0')
+    with open(os.path.join(out, 'mkdb.log'), 'w') as f:
+        rc = subprocess.run([
+            sys.executable,
+            os.path.join(HERE, 'mkdb.py'), '--arch', arch, '--dies', die,
+            '--tag', ','.join(tags), '--types', ','.join(types), '--jobs',
+            '16'
+        ], stdout=f, stderr=subprocess.STDOUT, env=env).returncode
+    if rc:
+        return die, rc
+    return die, run([
+        sys.executable,
+        os.path.join(HERE, 'windows.py'), '--die', die, '--probe-db',
+        os.path.join(root, arch), '--probe-types', ','.join(types),
+        '--out', os.path.join(out, 'windows.json')
+    ], os.path.join(out, 'windows.log'))
 
 
 def main():
@@ -56,6 +100,10 @@ def main():
     ap.add_argument('--tags', required=True)
     ap.add_argument('--check-tags', default=None)
     ap.add_argument('--skip-tilegrid', action='store_true')
+    ap.add_argument('--probe-windows', action='store_true',
+                    help='learn the tile type windows of hard blocks (a '
+                    'probe bit database per die) into <db>/<arch>/'
+                    'windows.json before building the tile grids')
     ap.add_argument('--jobs', type=int, default=24)
     args = ap.parse_args()
     alldies = dieslib.load()
@@ -73,9 +121,25 @@ def main():
         rc = run([
             sys.executable,
             os.path.join(HERE, 'colalign.py'), '--arch', arch, '--exp',
-            os.path.join(dieslib.BUILD, 'db'), '--verbose'
-        ], os.path.join(logdir, f'colalign_{arch}.log'))
+            dieslib.DB, '--verbose'
+        ] + (['--supported'] if arch != 'Series7' else []),
+            os.path.join(logdir, f'colalign_{arch}.log'))
         print('colalign rc', rc, flush=True)
+        if args.probe_windows:
+            with ProcessPoolExecutor(min(len(dlist), 4)) as ex:
+                for die, rc in ex.map(probe, [(d, arch, tags)
+                                              for d in dlist]):
+                    print('probe', die, 'rc', rc, flush=True)
+            files = [os.path.join(dieslib.BUILD, 'probe', d, arch, d,
+                                  'windows.json') for d in dlist]
+            files = [f for f in files if os.path.exists(f)]
+            rc = run([
+                sys.executable,
+                os.path.join(HERE, 'windows.py'), '--die', dlist[0],
+                '--merge'] + files + [
+                '--out', os.path.join(dieslib.DB, arch, 'windows.json')
+            ], os.path.join(logdir, f'windows_{arch}.log'))
+            print('windows rc', rc, flush=True)
         with ProcessPoolExecutor(min(len(dlist), 8)) as ex:
             for die, rc in ex.map(tilegrid, [(d, arch) for d in dlist]):
                 print('tilegrid', die, 'rc', rc, flush=True)

@@ -26,7 +26,7 @@ def main():
     ap.add_argument('--dirs', required=True, nargs='+')
     args = ap.parse_args()
     die = dieslib.load()[args.die]
-    dbdir = os.path.join(dieslib.BUILD, 'db', die.arch)
+    dbdir = os.path.join(dieslib.DB, die.arch)
     tg = json.load(open(os.path.join(dbdir, die.name, 'tilegrid.json')))
     col = BD.Collector(die, tg)
     runs = []

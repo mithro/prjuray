@@ -50,8 +50,13 @@ class Grid:
         self.rows_per_cr = g['rows']
         self.bpr = g['bpr']
         self.centre = g['centre']
+        self.frame_bits = bitstream.ARCHES[die.arch]['words'] * 32
         self.tiles = {}
         self.at = {}
+        # tile type -> (first bit, end bit) relative to the tile's grid row
+        # (row_bit), overriding the structural window (see windows.py)
+        self.type_windows = {}
+        self.probe = False
         for line in open(die.tiles_tsv):
             p = line.split()
             if p[0] != 'tile':
@@ -101,8 +106,38 @@ class Grid:
         self.centre_rows = centre_rows
         self.int_rows = int_rows
 
+    def row_bit(self, gy):
+        """First bit of grid row gy within its clock region row's frames:
+        INT rows by their index, the centre (HCLK / RCLK) row at the centre
+        bits; None for other rows (e.g. breaks between clock regions)."""
+        half = self.rows_per_cr // 2
+        if gy in self.rowidx:
+            r = self.rowidx[gy]
+            return r * self.bpr + (self.centre if r >= half else 0)
+        if gy in self.centre_rows:
+            return half * self.bpr
+        return None
+
     def tile_window(self, name):
-        """(clock region row, first bit, number of bits) or None."""
+        """(clock region row, first bit, number of bits) or None: the
+        structural window, widened to the learnt window of the tile type
+        (type_windows, clipped to the frame unless probing)."""
+        w = self.structural_window(name)
+        t = self.tiles[name]
+        tw = self.type_windows.get(t['type'])
+        base = self.row_bit(t['gy'])
+        if tw is None or base is None:
+            return w
+        lo, hi = base + tw[0], base + tw[1]
+        if w is not None:
+            lo, hi = min(lo, w[1]), max(hi, w[1] + w[2])
+        if not self.probe:
+            lo, hi = max(lo, 0), min(hi, self.frame_bits)
+        return self.crrow[t['gy']], lo, hi - lo
+
+    def structural_window(self, name):
+        """The tile's INT row and the empty grid rows above it; the centre
+        bits for HCLK / RCLK tiles in the centre row."""
         t = self.tiles[name]
         if t['type'] == 'NULL':
             return None
@@ -130,6 +165,29 @@ class Grid:
         return cr, off, end - off
 
 
+def probe_types(grid):
+    """Tile types (with sites) whose structural window is doubtful: taller
+    than one INT row, in the centre (HCLK / RCLK) row, or without a window
+    although the tile has a grid row with bits; only hard blocks (at most
+    PROBE_PER_ROW tiles per clock region row on average), whose windows are
+    cheap to learn and which the structural rule does not describe."""
+    out = collections.Counter()
+    for name, t in grid.tiles.items():
+        if t['type'] == 'NULL' or t['sites'] == '-':
+            continue
+        w = grid.structural_window(name)
+        if w is None:
+            if grid.row_bit(t['gy']) is not None:
+                out[t['type']] += 1
+        elif w[2] > grid.bpr or CENTRE_TYPES.match(t['type']):
+            out[t['type']] += 1
+    nrows = len(set(grid.crrow.values()))
+    return sorted(t for t, n in out.items() if n <= PROBE_PER_ROW * nrows)
+
+
+PROBE_PER_ROW = 3
+
+
 def frame_columns(dframes):
     """{(block, half, row): [(col, first frame index, nframes), ...]}"""
     cols = collections.OrderedDict()
@@ -142,6 +200,37 @@ def frame_columns(dframes):
         else:
             lst.append([col, i, 1])
     return cols
+
+
+def activity(die, dframes, design_root, maxd=192):
+    """Design activity: (act, use, number of designs).
+    act[frame index, bit offset, word] = mask of the designs in which that
+    bit differs from the baseline; use[tile] = mask of the designs using the
+    tile.  Up to maxd designs, newest tags first (later tags use larger
+    parts of the die and better generators)."""
+    sk = featlib.SiteKeys(die.tiles_tsv)
+    roots = design_root.split(',') if isinstance(design_root, str) \
+        else list(design_root)
+    dirs = []
+    for r in reversed(roots):
+        dirs += DD.design_dirs(r)
+    dirs = dirs[:maxd]
+    D = len(dirs)
+    NW = max(1, (D + 63) // 64)
+    act = np.zeros((len(dframes.frames), dframes.wpf * 32, NW),
+                   dtype=np.uint64)
+    flat = act.reshape(-1, NW)
+    use = collections.defaultdict(int)
+    for i, d in enumerate(dirs):
+        b = DD.load_bits(dframes, d)
+        diff = np.setxor1d(b, dframes.base, assume_unique=True)
+        flat[diff, i // 64] |= np.uint64(1 << (i % 64))
+        for t, fs in DD.load_features(d, sk).items():
+            # Design wide pseudo features (unused pad pulls) do not mean the
+            # tile is used.
+            if any('.UNUSEDPIN=' not in f for f in fs):
+                use[t] |= 1 << i
+    return act, use, D
 
 
 def collect(die, design_root, verbose=False):
@@ -157,35 +246,8 @@ def collect(die, design_root, verbose=False):
     """
     grid = Grid(die)
     dframes = DD.DieFrames(die)
-    wpf = dframes.wpf
-    sk = featlib.SiteKeys(die.tiles_tsv)
-    # Up to MAXD designs (one bit each in the activity masks), newest tags
-    # first (later tags use larger parts of the die and better generators).
-    roots = design_root.split(',') if isinstance(design_root, str) \
-        else list(design_root)
-    dirs = []
-    for r in reversed(roots):
-        dirs += DD.design_dirs(r)
-    MAXD = 192
-    dirs = dirs[:MAXD]
-    D = len(dirs)
-    NW = (D + 63) // 64
-    nbits_frame = wpf * 32
-    # Activity: act[frame index, bit offset, word] = mask of designs in which
-    # that bit differs from the baseline.
-    act = np.zeros((len(dframes.frames), nbits_frame, max(1, NW)),
-                   dtype=np.uint64)
-    flat = act.reshape(-1, max(1, NW))
-    use = collections.defaultdict(int)
-    for i, d in enumerate(dirs):
-        b = DD.load_bits(dframes, d)
-        diff = np.setxor1d(b, dframes.base, assume_unique=True)
-        flat[diff, i // 64] |= np.uint64(1 << (i % 64))
-        for t, fs in DD.load_features(d, sk).items():
-            # Design wide pseudo features (unused pad pulls) do not mean the
-            # tile is used.
-            if any('.UNUSEDPIN=' not in f for f in fs):
-                use[t] |= 1 << i
+    act, use, D = activity(die, dframes, design_root)
+    NW = act.shape[2]
 
     def to_int(words):
         v = 0
@@ -554,10 +616,28 @@ def main():
                     '--designs is given, read otherwise')
     ap.add_argument('--colmap', help='frame column assignment from '
                     'colalign.py (default: activity only)')
+    ap.add_argument('--windows', help='tile type windows (windows.py '
+                    '--merge output)')
+    ap.add_argument('--probe', help='comma separated tile types (or "auto": '
+                    'tall and windowless ones) given a window of +-'
+                    '--probe-span bits around their grid row, to learn their '
+                    'windows from a bit database built with it')
+    ap.add_argument('--probe-span', type=int, default=None)
     ap.add_argument('--out', required=True)
     args = ap.parse_args()
     die = dieslib.load()[args.die]
     grid = Grid(die)
+    if args.windows:
+        with open(args.windows) as f:
+            grid.type_windows = {t: tuple(w) for t, w in json.load(f).items()}
+    if args.probe:
+        span = args.probe_span or grid.rows_per_cr * grid.bpr + grid.centre
+        types = probe_types(grid) if args.probe == 'auto' else \
+            args.probe.split(',')
+        grid.probe = True
+        for t in types:
+            grid.type_windows[t] = (-span, span)
+        print('probe', ' '.join(sorted(types)))
     dframes = DD.DieFrames(die)
     cols = frame_columns(dframes)
     if args.designs:
