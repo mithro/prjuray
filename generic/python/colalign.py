@@ -387,6 +387,9 @@ def main():
     ap.add_argument('--dies', help='comma separated (default: all with an '
                     'evidence file)')
     ap.add_argument('--iters', type=int, default=6)
+    ap.add_argument('--verbose', action='store_true',
+                    help='list frame count mismatches and activity '
+                    'disagreements')
     ap.add_argument('--show', help='comma separated dies whose alignment '
                     'is printed')
     ap.add_argument('--init-dies', help='dies whose activity assignment '
@@ -476,6 +479,10 @@ def main():
                for (d, cr) in cur], nf_all)
     with open(os.path.join(base, 'model.json'), 'w') as f:
         json.dump(model.to_json(), f, indent=1)
+    print('frame count table (kind: frame count x grid columns):')
+    for k, c in sorted(model.emit.items()):
+        print(f'  {k}: ' + ', '.join(f'{nf} x{n}' for nf, n in
+                                     sorted(c.items(), key=lambda x: -x[1])))
     # Output + self-consistency.
     for d, dr in rows.items():
         colmap = []
@@ -500,11 +507,20 @@ def main():
                 k = kinds[gx]
                 c = model.emit.get(k, {})
                 n = sum(c.values())
-                if n >= 3 and c.get(m[j][2], 0) < 0.05 * n:
-                    rep['frame count mismatches'] += 1
+                # A frame count seen (over all dies) at most twice for a
+                # common kind is suspicious.
+                if n >= 20 and c.get(m[j][2], 0) <= 2:
+                    rep['rare frame counts'] += 1
+                    if args.verbose:
+                        print(f'  {d} row {cr} x {gx} {k}: frame count '
+                              f'{m[j][2]}, usually {dict(c)}')
                 v = dr.ev['scores'].get(cr, {}).get(gx)
                 if v is not None and v.max() >= 3 and v[j] < 0.5 * v.max():
                     rep['activity disagreements'] += 1
+                    if args.verbose:
+                        print(f'  {d} row {cr} x {gx} {k}: frame column '
+                              f'index {j}, activity {int(np.argmax(v))} '
+                              f'({v.max():.1f})')
             for gx, k in seqs(dr, cr):
                 if gx not in full:
                     rep['active columns unassigned' if k in active else
