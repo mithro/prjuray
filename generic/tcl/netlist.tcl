@@ -374,12 +374,16 @@ proc nl_remove {names} {
         foreach c [get_cells -quiet "${n}_OPT_INSERTED*"] { lappend cells $c }
     }
     nl_log "removing [llength $cells] cells: [lrange $names 0 20]"
-    # Remove IO ports attached to removed IO buffers as well.
-    foreach c $cells {
-        foreach p [get_ports -quiet -of_objects [get_nets -quiet -of_objects [get_pins -of_objects $c]]] {
-            catch {remove_port $p}
-        }
+    # Drop placement constraints first: a removed cell or port left in
+    # Vivado's placement constraint store crashes the next route_design
+    # (PSSiteStore::getCheckSum).
+    set ports [get_ports -quiet -of_objects [get_nets -quiet -of_objects [get_pins -quiet -of_objects $cells]]]
+    foreach prop {LOC BEL IS_LOC_FIXED IS_BEL_FIXED} { catch {reset_property $prop $cells} }
+    if {[llength $ports]} {
+        foreach prop {PACKAGE_PIN LOC} { catch {reset_property $prop $ports} }
     }
+    # Remove IO ports attached to removed IO buffers as well.
+    foreach p $ports { catch {remove_port $p} }
     set onets [get_nets -quiet -of_objects [get_pins -quiet -of_objects $cells -filter {DIRECTION == OUT}]]
     # The design is always placed again after a removal: unplace everything
     # so no stale placement refers to removed cells.
