@@ -704,7 +704,9 @@ proc nl_iob {name site mode ref stds props} {
     }
     global nl_bank_std
     if {![info exists nl_bank_std]} { set nl_bank_std [dict create] }
-    set diffkey [expr {[string match diff* $mode] ? "d" : "s"}]
+    # (Differential inputs and outputs remember their standard separately:
+    # some differential standards are receiver only.)
+    set diffkey [expr {[string match diff* $mode] ? ($mode eq "diffin" ? "di" : "do") : "s"}]
     if {$mode eq "inout"} {
         # Bidirectional ports need a bidirectional standard.
         set bi [list]
