@@ -1,0 +1,644 @@
+# Copyright 2020-2026 F4PGA Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Helpers used by generated fuzzing designs (see generic/python/gen_design.py).
+# The generated script builds a netlist directly in Vivado (no synthesis),
+# places/routes it and writes a bitstream plus a feature dump.
+
+source [file join [file dirname [info script]] dump_features.tcl]
+
+proc nl_log {msg} {
+    global nl_logfp
+    puts $nl_logfp $msg
+    flush $nl_logfp
+}
+
+proc nl_init {part} {
+    global nl_logfp
+    set nl_logfp [open nl.log w]
+    create_project -in_memory -part $part
+    link_design -part $part
+    set_param messaging.defaultLimit 100000
+    set_param general.maxThreads 2
+    create_cell -reference GND nl_gnd
+    create_cell -reference VCC nl_vcc
+    create_net nl_const0
+    create_net nl_const1
+    connect_net -net nl_const0 -objects [get_pins nl_gnd/G]
+    connect_net -net nl_const1 -objects [get_pins nl_vcc/P]
+}
+
+# Create a cell with parameters.  Parameters Vivado rejects are logged and
+# left at their defaults.
+proc nl_cell {name ref {props {}} {loc {}} {bel {}}} {
+    if {[catch {create_cell -reference $ref $name} e]} {
+        nl_log "cellerr $name $ref $e"
+        return 0
+    }
+    set c [get_cells $name]
+    global nl_props
+    set nl_props($name) [list]
+    foreach {k v} $props {
+        if {[catch {set_property $k $v $c} e]} {
+            nl_log "properr $name $k $v"
+        } else {
+            lappend nl_props($name) $k
+        }
+    }
+    if {$loc ne ""} {
+        if {$bel ne ""} {
+            if {[catch {place_cell $c $loc/$bel} e]} {
+                nl_log "placeerr $name $loc/$bel [string range $e 0 200]"
+            }
+        } else {
+            if {[catch {set_property LOC $loc $c} e]} {
+                nl_log "locerr $name $loc [string range $e 0 200]"
+            }
+        }
+    }
+    return 1
+}
+
+# The design's ground net (Vivado may rename or merge the constant nets).
+proc nl_gnd {} {
+    set n [get_nets -quiet nl_const0]
+    if {$n eq ""} {
+        set n [lindex [get_nets -quiet -hierarchical -filter {TYPE == GROUND}] 0]
+    }
+    if {$n eq ""} {
+        catch {create_cell -reference GND nl_gnd2}
+        create_net nl_const0
+        connect_net -net nl_const0 -objects [get_pins nl_gnd2/G]
+        set n [get_nets nl_const0]
+    }
+    return $n
+}
+
+# Create net <name> connecting the given pins (first one is the driver).
+# A missing driver (e.g. an I/O buffer that could not be created) ties the
+# loads to ground; I/O logic left without loads is removed.
+proc nl_net {name pins} {
+    set drv [get_pins -quiet [lindex $pins 0]]
+    set loads [get_pins -quiet [lrange $pins 1 end]]
+    if {$drv eq ""} {
+        set tie [list]
+        foreach l $loads {
+            set c [get_cells -of_objects $l]
+            if {[regexp {^(IDDR|ODDR|ISERDES|OSERDES|IDELAY|ODELAY|RX_BITSLICE|TX_BITSLICE|RXTX_BITSLICE)} [get_property REF_NAME $c]]} {
+                # I/O logic whose I/O buffer is missing cannot be placed;
+                # removed before implementation (not while building).
+                global nl_orphans
+                lappend nl_orphans [get_property NAME $c]
+            } else {
+                lappend tie $l
+            }
+        }
+        if {[llength $tie]} {
+            if {[catch {connect_net -net [nl_gnd] -objects $tie} e]} {
+                nl_log "connerr $name [string range $e 0 200]"
+            }
+        }
+        return
+    }
+    if {[llength $loads] == 0} {
+        set c [get_cells -of_objects $drv]
+        if {[regexp {^(IDDR|ODDR|ISERDES|OSERDES|IDELAY|ODELAY)} [get_property REF_NAME $c]]} {
+            global nl_orphans
+            lappend nl_orphans [get_property NAME $c]
+        }
+        return
+    }
+    if {[catch {create_net $name} e]} {
+        nl_log "neterr $name $e"
+        return
+    }
+    if {[catch {connect_net -net $name -objects [concat $drv $loads]} e]} {
+        nl_log "connerr $name [string range $e 0 200]"
+    }
+}
+
+# Connect pins to an existing net (e.g. the constant nets).
+proc nl_conn {net pins} {
+    set objs [get_pins -quiet $pins]
+    if {[llength $objs] == 0} return
+    if {[catch {connect_net -net $net -objects $objs} e]} {
+        nl_log "connerr $net [string range $e 0 200]"
+    }
+}
+
+# Create a top level port with an I/O buffer attached to <pin>.
+proc nl_port {name dir pin} {
+    if {[catch {create_port -direction $dir $name} e]} {
+        nl_log "porterr $name $e"
+        return
+    }
+    if {[catch {
+        create_net ${name}_n
+        connect_net -net ${name}_n -objects [list [get_ports $name] [get_pins $pin]]
+    } e]} {
+        nl_log "porterr $name [string range $e 0 200]"
+    }
+}
+
+# Returns generated cell names mentioned in ERROR messages written to
+# vivado.log since the last call.
+set nl_logpos 0
+proc nl_offenders {{extra ""}} {
+    global nl_logpos
+    set names [list]
+    set nets [list]
+    if {[catch {
+        set lf [open vivado.log r]
+        seek $lf $nl_logpos
+        set txt [read $lf]
+        set nl_logpos [tell $lf]
+        close $lf
+        append txt "\n" $extra
+        global nl_lasttxt
+        set nl_lasttxt $txt
+    } e]} {
+        nl_log "logread $e"
+        return [list {} {}]
+    }
+    # Message ids of errors: warnings with the same id often name the cells.
+    set ids [list]
+    foreach {- id} [regexp -all -inline {ERROR: \[([^\]]+)\]} $txt] {
+        lappend ids $id
+    }
+    set grab 0
+    foreach line [split $txt "\n"] {
+        if {[string match "ERROR:*" $line]} {
+            set grab 12
+        } elseif {[regexp {^(CRITICAL WARNING|WARNING): \[([^\]]+)\]} $line - - id] && [lsearch -exact $ids $id] >= 0} {
+            set grab 12
+        } elseif {[regexp {^(INFO|WARNING|CRITICAL WARNING|Phase|Resolution|Time)} $line]} {
+            set grab 0
+        }
+        if {[regexp {Net: (\S+) is not completely routed} $line - n]} {
+            lappend nets $n
+        }
+        if {[regexp {Router will skip net (\S+)} $line - n]} {
+            lappend nets $n
+        }
+        if {[regexp {problem bus\(es\) and/or net\(s\) are (.*)\.$} $line - lst]} {
+            foreach n [split [string map {, " "} $lst]] {
+                if {$n ne ""} { lappend nets $n }
+            }
+        }
+        if {$grab > 0} {
+            incr grab -1
+            # Generated cell names, possibly with a suffix (port "_p"/"_n",
+            # Vivado inserted "_OPT_INSERTED" cells, ...).
+            foreach {- n} [regexp -all -inline {\m((?:c|io)\d+)(?![0-9])} $line] {
+                lappend names $n
+            }
+            # Net names: blame the driving cell.
+            foreach {- n} [regexp -all -inline {\m(n\d+)\M} $line] {
+                set net [get_nets -quiet $n]
+                if {$net ne ""} {
+                    foreach c [get_cells -quiet -of_objects [get_pins -quiet -of_objects $net -filter {DIRECTION == OUT}]] {
+                        lappend names [get_property NAME $c]
+                    }
+                }
+            }
+            # Errors naming sites (e.g. bitgen): take the cells placed there.
+            foreach {- s} [regexp -all -inline {\m([A-Z][A-Z0-9_]*_X\d+Y\d+)\M} $line] {
+                set site [get_sites -quiet $s]
+                if {$site ne "" && ![string match SLICE_* $s]} {
+                    foreach c [get_cells -quiet -of_objects $site] {
+                        lappend names [get_property NAME $c]
+                    }
+                }
+            }
+        }
+    }
+    return [list [lsort -unique $names] [lsort -unique $nets]]
+}
+
+# True if the last log chunk read by nl_offenders mentions pblocks.
+set nl_lasttxt ""
+proc nl_pblock_trouble {} {
+    global nl_lasttxt
+    foreach line [split $nl_lasttxt "\n"] {
+        if {[regexp {^(ERROR|CRITICAL WARNING)} $line] && [regexp -nocase {pblock|area group|area constraint} $line]} {
+            return 1
+        }
+    }
+    # Placement failures inside a pblock are reported on the next lines.
+    return [regexp -nocase {in pblock} $nl_lasttxt]
+}
+
+# Fallback for errors naming a primitive kind rather than a cell (e.g.
+# "does not support the STARTUP component ..."): cells whose REF_NAME starts
+# with an upper case word of the error text.
+proc nl_ref_offenders {txt} {
+    set refs [lsort -unique [get_property REF_NAME [get_cells -quiet -hierarchical -filter {IS_PRIMITIVE}]]]
+    set names [list]
+    foreach line [split $txt "\n"] {
+        if {![string match "*ERROR*" $line]} continue
+        foreach w [regexp -all -inline {\m[A-Z][A-Z0-9_]{3,}\M} $line] {
+            if {$w in {ERROR DRC}} continue
+            foreach r $refs {
+                if {[string match "${w}*" $r] && ![regexp {^(LUT|FD|LD|CARRY|MUXF|SRL|GND|VCC)} $r]} {
+                    foreach c [get_cells -quiet -hierarchical -filter "REF_NAME == $r"] {
+                        lappend names [get_property NAME $c]
+                    }
+                }
+            }
+        }
+    }
+    return [lsort -unique $names]
+}
+
+# Over-utilisation (DRC UTLZ-1) names no cells: remove half of the cells of
+# the over-used resource kinds.
+proc nl_utlz_offenders {txt} {
+    set kinds {
+        {RAMB|FIFO} {^(RAMB|FIFO)}
+        {DSP} {^DSP}
+        {ILOGIC} {^(IDDR|ISERDES)}
+        {OLOGIC} {^(ODDR|OSERDES)}
+        {IDELAY} {^IDELAY}
+        {ODELAY} {^ODELAY}
+        {BUFG} {^BUFG}
+        {BUFH} {^BUFH}
+        {BUFR} {^BUFR}
+        {BUFIO} {^BUFIO}
+        {MMCM} {^MMCM}
+        {PLL} {^PLL}
+        {GT} {^GT}
+        {URAM} {^URAM}
+        {BITSLICE} {BITSLICE}
+    }
+    set names [list]
+    foreach line [split $txt "\n"] {
+        if {![regexp {UTLZ-1\] Resource utilization: (.*) over-utilized} $line - what]} continue
+        foreach {key re} $kinds {
+            if {![regexp $key $what]} continue
+            set i 0
+            foreach c [get_cells -quiet -hierarchical -filter {IS_PRIMITIVE}] {
+                if {[regexp $re [get_property REF_NAME $c]] && [incr i] % 2 == 0} {
+                    lappend names [get_property NAME $c]
+                }
+            }
+        }
+    }
+    return [lsort -unique $names]
+}
+
+proc nl_remove {names} {
+    set cells [get_cells -quiet $names]
+    if {[llength $cells] == 0} { return 0 }
+    nl_log "removing [llength $cells] cells: [lrange $names 0 20]"
+    # Remove IO ports attached to removed IO buffers as well.
+    foreach c $cells {
+        foreach p [get_ports -quiet -of_objects [get_nets -quiet -of_objects [get_pins -of_objects $c]]] {
+            catch {remove_port $p}
+        }
+    }
+    set onets [get_nets -quiet -of_objects [get_pins -quiet -of_objects $cells -filter {DIRECTION == OUT}]]
+    catch {unplace_cell $cells}
+    if {[catch {remove_cell $cells} e]} { nl_log "removeerr $e" }
+    # Nets left without a driver: detach their loads.
+    set dangling [list]
+    foreach n $onets {
+        if {[llength [get_pins -quiet -of_objects $n -filter {DIRECTION == OUT}]] == 0} {
+            lappend dangling [get_property NAME $n]
+        }
+    }
+    if {[llength $dangling]} { nl_unroutable $dangling }
+    return [llength $cells]
+}
+
+proc nl_unroutable {bad} {
+    nl_log "disconnecting [llength $bad] unroutable nets"
+    foreach n $bad {
+        set net [get_nets -quiet $n]
+        if {$net eq ""} continue
+        # Never tear down the global constant nets.
+        if {[get_property TYPE $net] in {GROUND POWER} || $n in {nl_const0 nl_const1}} continue
+        set loads [get_pins -quiet -of_objects $net -filter {DIRECTION == IN}]
+        catch {disconnect_net -net $net -objects $loads}
+        # Fabric cells need their pins connected: tie them to ground.
+        set fab [list]
+        foreach p $loads {
+            if {[regexp {^(LUT|FD|LD|CARRY|MUXF|SRL)} [get_property REF_NAME [get_cells -of_objects $p]]]} {
+                lappend fab $p
+            }
+        }
+        if {[llength $fab]} {
+            if {[catch {connect_net -net [nl_gnd] -objects $fab} e]} {
+                nl_log "tieerr [string range $e 0 150]"
+            }
+        }
+    }
+}
+
+# Tie every unconnected input pin of fabric cells to ground (removed cells
+# leave their loads dangling; LUT equations need all their inputs).
+proc nl_fix_dangling {} {
+    # Nets that lost their driver: detach their loads (fabric loads get tied
+    # to ground below / by nl_unroutable).
+    set orphaned [get_nets -quiet -hierarchical -filter {DRIVER_COUNT == 0 && TYPE == SIGNAL && FLAT_PIN_COUNT > 0}]
+    if {[llength $orphaned]} {
+        nl_log "driverless nets [llength $orphaned]"
+        nl_unroutable [get_property NAME $orphaned]
+    }
+    set cells [get_cells -quiet -hierarchical -filter {IS_PRIMITIVE && (REF_NAME =~ LUT* || REF_NAME =~ FD* || REF_NAME =~ LD* || REF_NAME =~ CARRY* || REF_NAME =~ MUXF* || REF_NAME =~ SRL*)}]
+    if {[llength $cells] == 0} return
+    set pins [get_pins -quiet -of_objects $cells -filter {DIRECTION == IN}]
+    set dangling [list]
+    foreach p $pins {
+        if {[llength [get_nets -quiet -of_objects $p]] == 0} { lappend dangling $p }
+    }
+    if {[llength $dangling]} {
+        nl_log "tying [llength $dangling] dangling pins"
+        if {[catch {connect_net -net [nl_gnd] -objects $dangling} e]} {
+            nl_log "tieerr [string range $e 0 150]"
+        }
+    }
+}
+
+set nl_orphans [list]
+proc nl_finish {{relaxclk 0}} {
+    set t0 [clock seconds]
+    global nl_orphans
+    if {[llength $nl_orphans]} {
+        nl_log "orphans [llength $nl_orphans]"
+        nl_remove [lsort -unique $nl_orphans]
+    }
+    if {$relaxclk} {
+        catch {set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets -quiet -hierarchical]}
+    }
+    foreach d [get_drc_checks] {
+        catch {set_property SEVERITY Warning $d}
+    }
+    nl_offenders
+    # Implement; after any failure remove the cells the errors name (or
+    # disconnect unroutable nets) and try again.
+    set stage place
+    for {set attempt 0} {$attempt < 40} {incr attempt} {
+        set budget 2700
+        if {[info exists ::env(NL_BUDGET)]} { set budget $::env(NL_BUDGET) }
+        if {[clock seconds] - $t0 > $budget} {
+            nl_log "giving up: time budget exceeded"
+            return
+        }
+        if {$stage eq "place"} {
+            nl_fix_dangling
+            if {[catch {place_design} e]} {
+                nl_log "place_design failed: [string range $e 0 200]"
+                lassign [nl_offenders "ERROR: $e"] names nets
+                global nl_lasttxt
+                if {[llength $names] == 0} { set names [nl_utlz_offenders $nl_lasttxt] }
+                if {[llength [get_pblocks -quiet]] && [nl_pblock_trouble]} {
+                    nl_log "dropping pblocks (pblock errors)"
+                    catch {place_design -unplace}
+                    catch {delete_pblocks [get_pblocks]}
+                    continue
+                }
+                if {[nl_remove $names] == 0} {
+                    if {[llength [get_pblocks -quiet]]} {
+                        nl_log "dropping pblocks"
+                        catch {place_design -unplace}
+                        catch {delete_pblocks [get_pblocks]}
+                        continue
+                    }
+                    return
+                }
+                continue
+            }
+            nl_log "placed [expr [clock seconds] - $t0]"
+            global nl_wanted_pips
+            if {[llength $nl_wanted_pips]} { nl_force_pips; set nl_wanted_pips [list] }
+            set stage route
+        }
+        if {$stage eq "route"} {
+            if {[catch {route_design} e]} {
+                nl_log "route_design failed: [string range $e 0 200]"
+                lassign [nl_offenders "ERROR: $e"] names nets
+                catch {route_design -unroute}
+                if {[llength $nets]} {
+                    # Placement is unchanged: route again directly.
+                    nl_unroutable $nets
+                    continue
+                } elseif {[nl_remove $names] == 0} {
+                    nl_log "route: nothing to repair"
+                    set stage write
+                    continue
+                }
+                set stage place
+                continue
+            }
+            nl_log "routed [expr [clock seconds] - $t0]"
+            set stage write
+        }
+        if {$stage eq "write"} {
+            set_property BITSTREAM.GENERAL.PERFRAMECRC YES [current_design]
+            if {[catch {write_bitstream -force design.bit} e]} {
+                nl_log "write_bitstream failed: [string range $e 0 200]"
+                lassign [nl_offenders "ERROR: $e"] names nets
+                # First try resetting the random parameters of the blamed
+                # cells (keeps the site in use), then remove them.
+                global nl_props nl_was_reset
+                set reset 0
+                foreach n $names {
+                    if {[info exists nl_props($n)] && [llength $nl_props($n)] && ![info exists nl_was_reset($n)]} {
+                        set nl_was_reset($n) 1
+                        foreach k $nl_props($n) { catch {reset_property $k [get_cells $n]} }
+                        incr reset
+                    }
+                }
+                if {$reset} {
+                    nl_log "reset parameters of $reset cells"
+                    continue
+                }
+                if {[llength $names] == 0} {
+                    global nl_lasttxt
+                    set names [nl_ref_offenders $nl_lasttxt]
+                    nl_log "blaming by primitive kind: [llength $names] cells"
+                }
+                if {[llength $nets]} {
+                    catch {route_design -unroute}
+                    nl_unroutable $nets
+                    set stage place
+                    continue
+                }
+                if {[nl_remove $names] == 0} { return }
+                catch {route_design -unroute}
+                set stage place
+                continue
+            }
+            nl_log "written [expr [clock seconds] - $t0]"
+            if {[info exists ::env(NL_DCP)]} { write_checkpoint -force design.dcp }
+            dump_features design.features
+            nl_log "dumped [expr [clock seconds] - $t0]"
+            set refs [dict create]
+            foreach c [get_cells -quiet -hierarchical -filter {IS_PRIMITIVE}] {
+                dict incr refs [get_property REF_NAME $c]
+            }
+            nl_log "final $refs"
+            nl_log "done [expr [clock seconds] - $t0]"
+            return
+        }
+    }
+}
+
+# Constrain cells to a region.
+proc nl_pblock {name range cells} {
+    if {[catch {
+        set pb [create_pblock $name]
+        resize_pblock $pb -add $range
+        add_cells_to_pblock $pb [get_cells $cells]
+        set_property IS_SOFT FALSE $pb
+    } e]} {
+        nl_log "pblockerr $name [string range $e 0 200]"
+    }
+}
+
+# I/O buffer on a pad site with a random, bank consistent I/O standard.
+#   mode: in out tri inout diffin diffout difftri
+#   stds: list of STANDARD:VCCO pairs (single ended and differential mixed,
+#         differential ones must start with DIFF_ or be in diffstds)
+#   props: random buffer/port properties to try
+set nl_bank_vcco [dict create]
+proc nl_iob {name site mode ref stds props} {
+    global nl_bank_vcco
+    set s [get_sites -quiet $site]
+    if {$s eq ""} { nl_log "ioberr $name nosite"; return 0 }
+    set pin [get_package_pins -quiet -of_objects $s]
+    if {$pin eq ""} { nl_log "ioberr $name unbonded"; return 0 }
+    # Pad already used (e.g. the N side of a differential pair).
+    if {[llength [get_ports -quiet -of_objects $pin]]} {
+        nl_log "ioberr $name padused"
+        return 0
+    }
+    set pair [get_property -quiet DIFF_PAIR_PIN $pin]
+    if {[string match diff* $mode] && $pair ne "" && [llength [get_ports -quiet -of_objects [get_package_pins -quiet $pair]]]} {
+        set mode [dict get {diffin in diffout out difftri tri} $mode]
+        set ref [dict get {in IBUF out OBUF tri OBUFT} $mode]
+    }
+    set bank [get_iobanks -quiet -of_objects $s]
+    if {[string match diff* $mode] && ![regexp {_L\d+P} [get_property PIN_FUNC $pin]]} {
+        # Not the P side of a pair: use the single ended equivalent.
+        set mode [dict get {diffin in diffout out difftri tri} $mode]
+        set ref [dict get {in IBUF out OBUF tri OBUFT} $mode]
+        set ses [list]
+        foreach sv $stds {
+            if {![regexp {^(DIFF_|LVDS|TMDS|MINI_LVDS|BLVDS|RSDS|PPDS|SUB_LVDS|SLVS|LVPECL|MIPI)} $sv]} { lappend ses $sv }
+        }
+        if {[llength $ses] == 0} { set ses {LVCMOS18:1.8 LVCMOS33:3.3 LVCMOS12:1.2} }
+        set stds $ses
+    }
+    global nl_bank_std
+    if {![info exists nl_bank_std]} { set nl_bank_std [dict create] }
+    set diffkey [expr {[string match diff* $mode] ? "d" : "s"}]
+    if {$mode eq "inout"} {
+        # Bidirectional ports need a bidirectional standard.
+        set bi [list]
+        foreach sv $stds {
+            if {[regexp {^(LVCMOS|LVTTL|LVDCI)} $sv]} { lappend bi $sv }
+        }
+        set stds $bi
+    }
+    if {[dict exists $nl_bank_std $bank,$diffkey] && $mode ne "inout"} {
+        # One standard per bank (VREF / DCI requirements must agree).
+        set cands [list [dict get $nl_bank_std $bank,$diffkey]]
+    } elseif {[dict exists $nl_bank_vcco $bank]} {
+        set v [dict get $nl_bank_vcco $bank]
+        set cands [list]
+        foreach sv $stds {
+            if {[lindex [split $sv :] 1] eq $v} { lappend cands $sv }
+        }
+    } else {
+        set cands $stds
+    }
+    if {[llength $cands] == 0} { nl_log "ioberr $name novcco"; return 0 }
+    set sv [lindex $cands [expr {int(rand() * [llength $cands])}]]
+    set std [lindex [split $sv :] 0]
+    set vcco [lindex [split $sv :] 1]
+    if {[catch {create_cell -reference $ref $name} e]} {
+        nl_log "cellerr $name $ref [string range $e 0 150]"
+        return 0
+    }
+    set diff [string match diff* $mode]
+    set ports [list ${name}_p]
+    if {$diff} { lappend ports ${name}_n }
+    foreach p $ports {
+        set dir [expr {$mode in {in diffin} ? "IN" : ($mode eq "inout" ? "INOUT" : "OUT")}]
+        create_port -direction $dir $p
+    }
+    # Pad pins of the buffer: I (inputs), O (outputs), IO (bidir), IB/OB (n).
+    set padpins [list]
+    foreach bp [get_pins -of_objects [get_cells $name]] {
+        set rp [get_property REF_PIN_NAME $bp]
+        if {$mode in {in diffin} && $rp in {I IB}} { lappend padpins $rp $bp }
+        if {$mode in {out tri diffout difftri} && $rp in {O OB}} { lappend padpins $rp $bp }
+        if {$mode eq "inout" && $rp in {IO}} { lappend padpins $rp $bp }
+    }
+    foreach {rp bp} $padpins {
+        set p [expr {$rp in {IB OB} ? "${name}_n" : "${name}_p"}]
+        if {$diff == 0 && $rp in {IB OB}} continue
+        create_net ${p}_pad
+        connect_net -net ${p}_pad -objects [list [get_ports $p] $bp]
+    }
+    if {[catch {set_property PACKAGE_PIN $pin [get_ports ${name}_p]} e]} {
+        nl_log "ioberr $name pin [string range $e 0 150]"
+        foreach p $ports { catch {remove_port [get_ports $p]} }
+        catch {remove_cell [get_cells $name]}
+        return 0
+    }
+    foreach p $ports {
+        if {[catch {set_property IOSTANDARD $std [get_ports $p]} e]} {
+            nl_log "properr $name IOSTANDARD $std"
+        }
+    }
+    foreach {k v} $props {
+        if {[catch {set_property $k $v [get_ports ${name}_p]} e]} {
+            if {[catch {set_property $k $v [get_cells $name]} e]} {
+                nl_log "properr $name $k $v"
+            }
+        }
+    }
+    dict set nl_bank_vcco $bank $vcco
+    if {$mode ne "inout"} { dict set nl_bank_std $bank,$diffkey $sv }
+    return 1
+}
+
+# Directed PIP coverage: after placement, route net <net> (one driver, one
+# load) through the given PIP by fixing its route.  Registered by the
+# generator with nl_want_pip and applied by nl_finish before routing.
+set nl_wanted_pips [list]
+proc nl_want_pip {net pip} {
+    global nl_wanted_pips
+    lappend nl_wanted_pips $net $pip
+}
+
+proc nl_force_pips {} {
+    global nl_wanted_pips
+    set ok 0
+    set bad 0
+    foreach {n p} $nl_wanted_pips {
+        set net [get_nets -quiet $n]
+        set pip [get_pips -quiet $p]
+        if {$net eq "" || $pip eq ""} { incr bad; continue }
+        if {[catch {
+            set drv [get_site_pins -of_objects [get_pins -of_objects $net -filter {DIRECTION == OUT}]]
+            set ld [lindex [get_site_pins -of_objects [get_pins -of_objects $net -filter {DIRECTION == IN}]] 0]
+            set from [get_nodes -of_objects $drv]
+            set to [get_nodes -of_objects $ld]
+            set n0 [get_nodes -uphill -of_objects $pip]
+            set n1 [get_nodes -downhill -of_objects $pip]
+            set path [find_routing_path -quiet -from $from -to $to -include_nodes [list $n0 $n1] -sort_include_nodes -max_nodes 120]
+            if {[llength $path]} {
+                set_property FIXED_ROUTE $path $net
+                incr ok
+            } else {
+                incr bad
+            }
+        } e]} {
+            incr bad
+        }
+    }
+    nl_log "forced pips ok $ok failed $bad"
+}
