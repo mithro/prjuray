@@ -53,6 +53,7 @@ ECAP = 8.0  # |emission| cap
 W_ACT = 3.0  # activity bonus weight
 W_VERT = 3.0  # bonus for the frame column of the same grid column in the
 # best aligned clock region row
+W_VERT_ANY = 0.0  # same, where the grid column has another kind there
 S_MAJ = 2.0  # frame column without any grid column
 S_COL = 3.0  # grid column of an active kind without a frame column
 S_SILENT = 1.0  # same for a silent kind
@@ -182,7 +183,7 @@ class DieRows:
 
     def activity(self, cr, gx, M):
         v = self.ev['scores'].get(cr, {}).get(gx)
-        if v is None:
+        if v is None or v.max() < MIN_ACT:
             return None
         return v / (v.max() + 1.0)
 
@@ -208,7 +209,11 @@ class Model:
         for row in assignments:
             prev = None
             for kind, j, nf in row:
-                if j is None or kind in noemit:
+                if j is None:
+                    continue
+                if kind in noemit:
+                    # no pair across it either
+                    prev = None
                     continue
                 self.emit[kind][nf] += 1
                 if prev is not None:
@@ -281,11 +286,17 @@ def align_row(model, kinds, nfs, act, skip, gxs, voids, extra=None,
     Returns the frame column index (or None) of every grid column."""
     n, M = len(kinds), len(nfs)
     vv = np.array(voids, dtype=float)
-    refcol = refcol or {}
+
+    refcol, refkind = refcol or ({}, {})
+    rowkind = dict(zip(gxs, kinds))
+    replaced = sorted(g for g, k in rowkind.items()
+                      if g in refkind and refkind[g] != k)
 
     def nvoid(a, b):
         """frame columns the void columns strictly between grid x a and b
-        can stand for"""
+        can stand for: their frame columns in the reference row (with those
+        of the columns from a to b replaced by another kind), at least
+        void columns / grid columns per frame column"""
         lo = int(np.searchsorted(vv, a, 'right'))
         hi = int(np.searchsorted(vv, b))
         cols = set()
@@ -295,7 +306,10 @@ def align_row(model, kinds, nfs, act, skip, gxs, voids, extra=None,
                 cols.add(refcol[g])
             else:
                 other += 1
-        return len(cols) + int(other / ratio)
+        for g in replaced:
+            if a <= g <= b:
+                cols.add(refcol[g])
+        return max(len(cols) + int(other / ratio), int((hi - lo) / ratio))
 
     cs = np.concatenate([[0.0], np.cumsum(skip)])  # cs[i] = sum skip[:i]
     if n == 0 or M == 0:
@@ -367,7 +381,7 @@ def explain_away(dr, cr, s, M):
     out = [dr.activity(cr, gx, M) for gx, _ in s]
     for i, (gx, _) in enumerate(s):
         v = raw[i]
-        if v is None or not v.max():
+        if v is None or out[i] is None:
             continue
         j = int(np.argmax(v))
         for k in (i - 1, i + 1):
@@ -397,10 +411,11 @@ def align_die(model, dr, d, active):
         if ref:
             extra = np.zeros((len(s), len(m)))
             for i, (gx, k) in enumerate(s):
-                if (gx, k) in ref:
-                    for j, c in enumerate(m):
-                        if (c[0], c[2]) == ref[(gx, k)]:
-                            extra[i, j] = W_VERT
+                for j, c in enumerate(m):
+                    if (c[0], c[2]) == ref.get((gx, k)):
+                        extra[i, j] = W_VERT
+                    elif c[0] == refcol[0].get(gx):
+                        extra[i, j] = W_VERT_ANY
         out, _ = align_row(model, kinds, [c[2] for c in m], act, skip,
                            [gx for gx, _ in s], dr.voids.get(cr, []), extra,
                            dr.ratio, refcol)
@@ -419,15 +434,18 @@ def align_die(model, dr, d, active):
         best = unused(order[0])
         ref = {}
         refcol = {}
-        for cr in order:
+        refkind = {}
+        for cr in [c for c in order if unused(c) == best]:
             m = dr.majors(cr)
             kinds = dict(dr.rows[cr])
             for gx, j in res[cr].items():
                 ref.setdefault((gx, kinds[gx]), (m[j][0], m[j][2]))
-                refcol.setdefault(gx, m[j][0])
+                if gx not in refcol:
+                    refcol[gx] = m[j][0]
+                    refkind[gx] = kinds[gx]
         for cr in order:
             if unused(cr) > best:
-                res[cr] = run(cr, ref, refcol)
+                res[cr] = run(cr, ref, (refcol, refkind))
     return {(d, cr): asg for cr, asg in res.items()}
 
 
