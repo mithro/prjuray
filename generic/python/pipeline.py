@@ -150,7 +150,8 @@ def main():
         str(args.jobs)
     ], os.path.join(logdir, f'mkdb_{arch}.log'))
     print('build_db rc', rc, flush=True)
-    for d in dlist:
+    # Checks of all dies in parallel (each checks its designs in parallel).
+    def check(d):
         roots = ','.join(
             os.path.join(dieslib.BUILD, 'designs', d, t)
             for t in (args.check_tags or args.tags).split(','))
@@ -158,8 +159,14 @@ def main():
         run([
             sys.executable,
             os.path.join(HERE, 'check.py'), '--die', d, '--designs', roots,
-            '--max', '20'
+            '--max', '20', '--jobs',
+            str(max(1, min(20, args.jobs // len(dlist))))
         ], log)
+        return log
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(len(dlist)) as ex:
+        logs = list(ex.map(check, dlist))
+    for d, log in zip(dlist, logs):
         tail = open(log).read().strip().split('\n')
         summary = [l for l in tail if not l.startswith('/')]
         print(f'== check {d}')

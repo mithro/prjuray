@@ -25,6 +25,8 @@ import argparse
 import collections
 import json
 import os
+import pickle
+import zlib
 
 import numpy as np
 
@@ -101,10 +103,12 @@ class Collector:
 def correlate(samples):
     """samples: list of (features set, bits list).  Returns dict."""
     S = len(samples)
-    fidx, bidx = {}, {}
+    # Features in sorted order: the greedy covers break ties by index, and
+    # the iteration order of sets of strings changes from run to run.
+    fidx = {f: i for i, f in enumerate(sorted(set().union(
+        *(fs for fs, _ in samples))))}
+    bidx = {}
     for fs, bs in samples:
-        for f in fs:
-            fidx.setdefault(f, len(fidx))
         for b in bs:
             bidx.setdefault(b, len(bidx))
     nF, nB = len(fidx), len(bidx)
@@ -292,8 +296,15 @@ def write_db(outdir, ttype, k, res):
 _COLLECTORS = {}
 
 
+def design_seed(d):
+    """Seed of the per design sample thinning: stable across runs and build
+    directory locations (hash() of a string changes every run)."""
+    rel = '/'.join(os.path.normpath(d).split(os.sep)[-3:])  # die/tag/sN
+    return zlib.crc32(rel.encode())
+
+
 def _collect_one(item):
-    """Worker: samples of one design (tile type, region, features, bits)."""
+    """Samples of one design [(tile type, region, features, bits)]."""
     import random
     arch, dn, d = item
     if dn not in _COLLECTORS:
@@ -301,8 +312,113 @@ def _collect_one(item):
         outdir = os.path.join(dieslib.DB, arch)
         tg = json.load(open(os.path.join(outdir, dn, 'tilegrid.json')))
         _COLLECTORS[dn] = Collector(die, tg)
-    rng = random.Random(hash(d) & 0xffffffff)
+    rng = random.Random(design_seed(d))
     return list(_COLLECTORS[dn].samples(d, rng=rng))
+
+
+# Per design sample cache.  One file per design: pickled chunks, one per
+# (tile type, region), then the pickled index {key: (offset, length, used,
+# empty)} plus stamp, then an 8 byte trailer with the index offset.  A
+# chunk is ([(sorted feature tuple, bit list)] of used tiles, same for
+# empty tiles).  The stamp (inputs' mtimes and sizes) invalidates it.
+# (pickle: the cache is private to the build tree and written only here.)
+CACHE_VERSION = 2  # 2: zlib compressed chunks
+
+
+def _cache_stamp(arch, dn, d):
+    st = [CACHE_VERSION]
+    for p in (os.path.join(d, 'bits.npz'),
+              os.path.join(d, 'design.features.gz'),
+              os.path.join(dieslib.DB, arch, dn, 'tilegrid.json')):
+        s = os.stat(p)
+        st += [s.st_mtime_ns, s.st_size]
+    return st
+
+
+def _read_index(path):
+    with open(path, 'rb') as f:
+        f.seek(-8, 2)
+        off = int.from_bytes(f.read(8), 'little')
+        f.seek(off)
+        return pickle.loads(f.read()[:-8])
+
+
+def _read_chunk(path, off, n):
+    with open(path, 'rb') as f:
+        f.seek(off)
+        return pickle.loads(zlib.decompress(f.read(n)))
+
+
+def _cache_one(item):
+    """Worker: makes sure the sample cache of one design is current.
+    Returns [(key, used count, empty count)] in sample order."""
+    arch, dn, d, path = item
+    stamp = _cache_stamp(arch, dn, d)
+    if os.path.exists(path):
+        try:
+            idx = _read_index(path)
+            if idx['stamp'] == stamp:
+                return [(k, v[2], v[3]) for k, v in idx['keys']]
+        except (OSError, ValueError, EOFError, pickle.UnpicklingError,
+                KeyError):
+            pass
+    chunks = {}
+    for tt, k, fs, bits in _collect_one((arch, dn, d)):
+        c = chunks.setdefault((tt, k), ([], []))
+        c[0 if fs else 1].append((tuple(sorted(fs)), bits))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f'{path}.{os.getpid()}.tmp'
+    keys = []
+    with open(tmp, 'wb') as f:
+        for key, c in chunks.items():
+            data = zlib.compress(pickle.dumps(c, protocol=pickle.HIGHEST_PROTOCOL), 1)
+            keys.append((key, (f.tell(), len(data), len(c[0]), len(c[1]))))
+            f.write(data)
+        off = f.tell()
+        f.write(pickle.dumps({'stamp': stamp, 'keys': keys},
+                             protocol=pickle.HIGHEST_PROTOCOL))
+        f.write(off.to_bytes(8, 'little'))
+    os.replace(tmp, path)
+    return [(k, v[2], v[3]) for k, v in keys]
+
+
+def _type_task(task):
+    """Worker: gathers the selected samples of one (tile type, region) from
+    the design caches, correlates them and writes the database files."""
+    outdir, (tt, k), designs, sel_used, sel_empty = task
+    pos_u = {g: i for i, g in enumerate(sel_used)}
+    pos_e = {g: i for i, g in enumerate(sel_empty)}
+    used = [None] * len(sel_used)
+    empty = [None] * len(sel_empty)
+    gu = ge = 0
+    for path, nu, ne in designs:
+        if not any(g in pos_u for g in range(gu, gu + nu)) and \
+                not any(g in pos_e for g in range(ge, ge + ne)):
+            gu += nu
+            ge += ne
+            continue
+        off, n = dict(_read_index(path)['keys'])[(tt, k)][:2]
+        cu, ce = _read_chunk(path, off, n)
+        for x in cu:
+            i = pos_u.get(gu)
+            if i is not None:
+                used[i] = x
+            gu += 1
+        for x in ce:
+            i = pos_e.get(ge)
+            if i is not None:
+                empty[i] = x
+            ge += 1
+    res = correlate(used + empty)
+    write_db(outdir, tt, k, res)
+    nexp = len(res['unexplained'])
+    summary = dict(samples=res['samples'], empty=res['empty'],
+                   features=len(res['feat_bits']),
+                   defaults=len(res['defaults']), unexplained=nexp)
+    line = (f'{tt}.{k}: samples {res["samples"]} empty {res["empty"]} '
+            f'feat {res["nfeat"]} with-bits {len(res["feat_bits"])} '
+            f'defaults {len(res["defaults"])} unexplained {nexp}')
+    return (tt, k), summary, line
 
 
 def main():
@@ -313,13 +429,17 @@ def main():
     ap.add_argument('--types', default=None, help='restrict to tile types')
     ap.add_argument('--jobs', type=int, default=32)
     ap.add_argument('--max-samples', type=int, default=50000)
+    ap.add_argument('--cache', default=None,
+                    help='per design sample cache (default: '
+                    '<db>/<arch>/cache)')
     args = ap.parse_args()
     import random
+    import time
+    from concurrent.futures import ProcessPoolExecutor
     rng = random.Random(0)
     outdir = os.path.join(dieslib.DB, args.arch)
+    cache = args.cache or os.path.join(outdir, 'cache')
     os.makedirs(outdir, exist_ok=True)
-    per_type = collections.defaultdict(list)
-    alldies = dieslib.load()
     only = set(args.types.split(',')) if args.types else None
     work = []
     for dn in args.dies.split(','):
@@ -327,42 +447,42 @@ def main():
                 os.path.join(dieslib.BUILD, 'designs', dn, t)
                 for t in args.tag.split(',')
         ], v2only=True):
-            work.append((args.arch, dn, d))
-    from concurrent.futures import ProcessPoolExecutor as _PPE
-    with _PPE(args.jobs) as ex:
-        for res in ex.map(_collect_one, work, chunksize=2):
-            for tt, k, fs, bits in res:
-                if only and tt not in only:
+            rel = '/'.join(os.path.normpath(d).split(os.sep)[-3:])
+            work.append((args.arch, dn, d,
+                         os.path.join(cache, rel + '.smp')))
+    # Phase 1: one small task per design (cached across runs).
+    t0 = time.time()
+    per_key = {}  # key -> [(cache path, used, empty)], first seen order
+    with ProcessPoolExecutor(args.jobs) as ex:
+        for item, keys in zip(work, ex.map(_cache_one, work, chunksize=2)):
+            for key, nu, ne in keys:
+                if only and key[0] not in only:
                     continue
-                per_type[(tt, k)].append((fs, bits))
-    # Bound the work per tile type: keep a random subset of the samples.
-    for key, samples in per_type.items():
-        used = [x for x in samples if x[0]]
-        empty = [x for x in samples if not x[0]]
-        if len(used) > args.max_samples:
-            used = rng.sample(used, args.max_samples)
-        if len(empty) > args.max_samples // 5:
-            empty = rng.sample(empty, args.max_samples // 5)
-        per_type[key] = used + empty
+                per_key.setdefault(key, []).append((item[3], nu, ne))
+    print(f'# samples of {len(work)} designs in {time.time() - t0:.0f} s',
+          flush=True)
+    # Bound the work per tile type: keep a random subset of the samples
+    # (the same subset as sampling the concatenated sample lists).
+    tasks = []
+    for key, designs in per_key.items():
+        nu = sum(x[1] for x in designs)
+        ne = sum(x[2] for x in designs)
+        su = rng.sample(range(nu), args.max_samples) \
+            if nu > args.max_samples else list(range(nu))
+        se = rng.sample(range(ne), args.max_samples // 5) \
+            if ne > args.max_samples // 5 else list(range(ne))
+        tasks.append((outdir, key, designs, su, se))
+    # Phase 2: one task per (tile type, region), largest first.
+    tasks.sort(key=lambda t: -(len(t[3]) + len(t[4])))
+    results = {}
+    with ProcessPoolExecutor(min(len(tasks), args.jobs) or 1) as ex:
+        for key, summary, line in ex.map(_type_task, tasks):
+            results[key] = (summary, line)
     summary = {}
-    from concurrent.futures import ProcessPoolExecutor
-    keys = sorted(per_type, key=lambda k: -len(per_type[k]))
-    with ProcessPoolExecutor(min(len(keys), args.jobs) or 1) as ex:
-        results = dict(zip(keys, ex.map(correlate,
-                                        [per_type[k] for k in keys])))
     for (tt, k) in sorted(results):
-        res = results[(tt, k)]
-        write_db(outdir, tt, k, res)
-        nexp = len(res['unexplained'])
-        summary[f'{tt}.{k}'] = dict(samples=res['samples'],
-                                    empty=res['empty'],
-                                    features=len(res['feat_bits']),
-                                    defaults=len(res['defaults']),
-                                    unexplained=nexp)
-        print(f'{tt}.{k}: samples {res["samples"]} empty {res["empty"]} '
-              f'feat {res["nfeat"]} with-bits {len(res["feat_bits"])} '
-              f'defaults {len(res["defaults"])} unexplained {nexp}',
-              flush=True)
+        s, line = results[(tt, k)]
+        summary[f'{tt}.{k}'] = s
+        print(line, flush=True)
     json.dump(summary, open(os.path.join(outdir, 'summary.json'), 'w'),
               indent=1)
 

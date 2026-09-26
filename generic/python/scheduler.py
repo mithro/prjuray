@@ -226,6 +226,7 @@ def main():
     r.add_argument('--force', action='store_true',
                    help='also items of live runners of this host')
     args = ap.parse_args()
+    rd.install_cleanup()
     {'submit': submit, 'work': work, 'status': status,
      'requeue': requeue}[args.cmd](args)
 
