@@ -157,14 +157,18 @@ def from_probe(dbdir, grid, span, types, mincount=3, minshare=0.02):
 
 
 def merge(paths):
-    """Hull of the windows of several files."""
-    out = {}
+    """Per tile type, the median first and end bit over the dies' windows
+    (robust against a die with few samples of the type)."""
+    per = collections.defaultdict(list)
     for p in paths:
         with open(p) as f:
-            for tt, (lo, hi) in json.load(f).items():
-                if tt in out:
-                    lo, hi = min(lo, out[tt][0]), max(hi, out[tt][1])
-                out[tt] = (lo, hi)
+            for tt, w in json.load(f).items():
+                per[tt].append(w)
+    out = {}
+    for tt, ws in per.items():
+        los = sorted(w[0] for w in ws)
+        his = sorted(w[1] for w in ws)
+        out[tt] = (los[len(los) // 2], his[(len(his) - 1) // 2])
     return out
 
 
