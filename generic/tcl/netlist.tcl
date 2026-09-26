@@ -401,6 +401,22 @@ proc nl_fix_dangling {} {
     }
 }
 
+# "Instance GND of type GND is not Placeable": constant cells inserted by
+# Vivado (e.g. for the CI pin of a carry chain whose neighbour was removed)
+# that cannot be placed.  Blame the cells they drive.
+proc nl_const_offenders {txt} {
+    set cells [list]
+    foreach {- c} [regexp -all -inline {Instance\s+(\S+) of type (?:GND|VCC) is not Placeable} $txt] {
+        foreach n [get_nets -quiet -of_objects [get_pins -quiet -of_objects [get_cells -quiet $c]]] {
+            foreach l [get_cells -quiet -of_objects [get_pins -quiet -of_objects $n -filter {DIRECTION == IN}]] {
+                lappend cells [get_property NAME $l]
+            }
+        }
+    }
+    if {[llength $cells]} { nl_log "blaming loads of unplaceable constants: [llength $cells] cells" }
+    return [lsort -unique $cells]
+}
+
 set nl_orphans [list]
 proc nl_finish {{relaxclk 0}} {
     set t0 [clock seconds]
@@ -432,6 +448,7 @@ proc nl_finish {{relaxclk 0}} {
                 nl_log "place_design failed: [string range $e 0 200]"
                 lassign [nl_offenders "ERROR: $e"] names nets
                 global nl_lasttxt
+                if {[llength $names] == 0} { set names [nl_const_offenders $nl_lasttxt] }
                 if {[llength $names] == 0} { set names [nl_utlz_offenders $nl_lasttxt] }
                 if {[llength [get_pblocks -quiet]] && [nl_pblock_trouble]} {
                     nl_log "dropping pblocks (pblock errors)"
