@@ -71,25 +71,40 @@ with sites, else the most common tile type with PIPs, among the tiles with a
 bit window); the ordered kinds of a clock region row are aligned with the
 ordered frame columns by dynamic programming (a monotonic HMM) scoring
 
-* log P(frame count | kind) (Witten-Bell smoothed, so interconnect kinds
-  seen with many frame counts stay flexible),
+* log P(frame count | kind) (Witten-Bell smoothed; kinds seen with several
+  frame counts, e.g. interconnect sharing its neighbour's frame column, have
+  no preference against unseen ones),
 * log P(new frame column | previous kind, kind) (unseen pairs back off to the
-  kinds' left / right statistics),
-* the design activity score (a bonus, i.e. a tie breaker),
+  kinds' left / right statistics, then to the architecture's overall rate),
+* the design activity score as a bonus (a tie breaker; activity a column
+  shares with a more active adjacent column is explained away: tiles used
+  together with their neighbour, e.g. interface tiles, show its changes),
 * a cost for grid columns left out and for frame columns without grid
-  columns (free up to the number of void grid columns at that place, e.g.
-  feed through columns or the PS).
+  columns (free up to the frame columns the void grid columns there stand
+  for, e.g. feed through columns or the PS),
+* vertical consistency: clock region rows with more unused frame columns
+  than the die's best rows are realigned with a bonus for the frame column
+  the same grid column (of the same kind) has in the best rows, whose frame
+  columns also give the void allowance.
 
 The tables are learnt by hard EM over all dies of an architecture starting
-from the activity only assignment, and printed at the end (Series7:
-CLB 36, BRAM / DSP 28, IO 42, CMT / CLK / CFG 30, GT 32 frames; INT and
-interface kinds take the count of their neighbour).  Kinds without activity
-on any die take part with no frame count preference; those left out join
-their nearest neighbour's frame column.  Hard block tiles over part of
-another kind's column (e.g. PCIE) take the frame column of their neighbours
-in their grid row.  The report lists per die unused frame columns, rare
-(kind, frame count) pairs and columns placed against strong activity, the
-self-consistency check for architectures without a reference database.
+from the activity supported assignment; frame counts and transitions are
+only learnt from assignments the activity does not contradict, and not for
+*silent* kinds (activity below `MIN_ACT` on every die), which take part in
+the alignment without a frame count preference, so that an alignment does
+not reinforce its own mistakes.  The learnt table is printed (Series7: CLB
+36, BRAM / DSP 28, IO 42, CMT / CLK / CFG 30, GT 32 frames; INT and
+interface kinds take the count of their neighbour; UltraScale+: INT 76, CLE
+16, BRAM 6, DSP 8, ...).  Silent columns left out join their nearest
+neighbour's frame column.  Hard block tiles over part of another kind's
+column (e.g. PCIE) take the frame column of their neighbours in their grid
+row when the other columns of their column's frame column are absent there.
+Clock region rows without activity get their frame row from the frame row
+order learnt on the other dies (e.g. dies with few designs).  The report
+lists per die unused frame columns, rare (kind, frame count) pairs and
+columns placed against strong activity (`--verbose`: each of them;
+`--show <die>`: the alignment), the self-consistency check for
+architectures without a reference database.
 
 ```
 python3 generic/python/tilegrid.py --die <die> --designs <roots> \

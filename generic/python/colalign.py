@@ -24,11 +24,13 @@ state is the frame column index), scored with:
 * penalties for frame columns and grid columns left unassigned.
 
 The model is learnt by hard EM over all dies of an architecture: it starts
-from the activity only assignment, and alternates between estimating the
-kind tables from all assignments and re-aligning every die.  Only kinds with
-design activity on some die take part in the alignment; other non void
-columns ("silent" kinds) are attached to the frame column of their
-neighbours when both sides agree.
+from the activity supported assignment, and alternates between estimating
+the kind tables from the assignments the activity does not contradict and
+re-aligning every die.  Kinds without real activity on any die ("silent")
+take part without a frame count preference and are not learnt from; those
+left out join their nearest neighbour's frame column.  Clock region rows
+with more unused frame columns than a die's best rows are realigned for
+vertical consistency with them (see generic/README.md).
 
   colalign.py --arch Series7 --exp build/tilegrid_exp [--dies a,b,...]
 
@@ -57,7 +59,6 @@ W_VERT_ANY = 0.0  # same, where the grid column has another kind there
 S_MAJ = 2.0  # frame column without any grid column
 S_COL = 3.0  # grid column of an active kind without a frame column
 S_SILENT = 1.0  # same for a silent kind
-S_OWN = 0.0  # a silent column ending a frame column (disabled)
 MIN_ACT = 2.0  # activity score (~ matching tiles) making a kind active
 INIT_EA = False  # leave kinds whose activity neighbours explain out of the
 # initial assignment
@@ -340,10 +341,6 @@ def align_row(model, kinds, nfs, act, skip, gxs, voids, extra=None,
         for ip in range(max(0, i - 1 - MAXSKIP), i):
             skipped = cs[i] - cs[ip + 1]
             ls, lt = model.transition(kinds[ip], kinds[i])
-            if skip[ip] == S_SILENT:
-                # A silent column ending a frame column: less likely than
-                # sharing the next one (it would own no evidence).
-                lt -= S_OWN
             same = dp[ip] + ls - skipped
             a = nvoid(gxs[ip], gxs[i])
             val = np.where(valid, dp[ip][None, :] -
