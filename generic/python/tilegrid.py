@@ -448,12 +448,15 @@ def virtual_bram_shift(clist, colmap, cr, gxs, extra):
     return None
 
 
-def build(grid, dframes, cols, crmap, colmap, colmap1, verbose=False):
+def build(grid, dframes, cols, crmap, colmap, colmap1, verbose=False,
+          tilemap=None):
     """Returns the tilegrid dict: tile -> {type, gx, gy, bits: [...]}.
     crmap: clock region row -> (block, half, row); colmap: (clock region
     row, grid x) -> block 0 frame column; colmap1: (clock region row, grid
     x) -> block 1 (BRAM content) frame column learnt from activity (used when
-    the BRAM columns cannot be mapped by rank)."""
+    the BRAM columns cannot be mapped by rank); tilemap: tile -> block 0
+    frame column overriding its grid column's."""
+    tilemap = tilemap or {}
     colinfo = {}
     for key, clist in cols.items():
         for col, first, nfr in clist:
@@ -465,7 +468,7 @@ def build(grid, dframes, cols, crmap, colmap, colmap1, verbose=False):
         if w is not None:
             cr, lo, n = w
             key = crmap.get(cr)
-            col = colmap.get((cr, t['gx']))
+            col = tilemap.get(name, colmap.get((cr, t['gx'])))
             if key is not None and col is not None:
                 first, nfr = colinfo[(key, col)]
                 entry['bits'].append(
@@ -570,12 +573,14 @@ def main():
             cm = json.load(f)
         crmap = {int(cr): tuple(k) for cr, k in cm['crmap'].items()}
         colmap = {(cr, gx): col for cr, gx, col in cm['colmap']}
+        tilemap = cm.get('tiles', {})
         colmap1 = {k: v.most_common(1)[0][0]
                    for k, v in ev['bram1'].items()}
     else:
         crmap = ev['crmap']
         colmap, colmap1 = assign_activity(grid, cols, ev, True)
-    tg = build(grid, dframes, cols, crmap, colmap, colmap1, True)
+        tilemap = {}
+    tg = build(grid, dframes, cols, crmap, colmap, colmap1, True, tilemap)
     with open(args.out, 'w') as f:
         json.dump(tg, f, indent=0, sort_keys=True)
     nb = sum(1 for t in tg.values() if t['bits'])

@@ -11,8 +11,8 @@ and it is characteristic of the tile columns it covers (e.g. 7-series CLB 36,
 BRAM/DSP 28, IO 42, CMT/CFG/CLK 30; UltraScale+ INT 76, CLE 16).
 
 Every grid column of a clock region row gets a *kind* (its most common tile
-type that has PIPs or sites; columns without such tiles are void and own no
-frames).  The assignment of the ordered grid column kinds to the ordered
+type with sites, else with PIPs, among the tiles with a bit window; columns
+without such tiles are void and own no frames).  The assignment of the ordered grid column kinds to the ordered
 frame column list is a monotonic alignment (a hidden Markov model whose
 state is the frame column index), scored with:
 
@@ -52,10 +52,11 @@ import tilegrid as TG
 ECAP = 8.0  # |emission| cap
 W_ACT = 3.0  # activity bonus weight
 S_MAJ = 2.0  # frame column without any grid column
-S_COL = 3.0  # evidenced grid column without a frame column
+S_COL = 3.0  # grid column of an active kind without a frame column
+S_SILENT = 1.0  # same for a silent kind
 ALPHA = 1.0  # emission smoothing
 BETA = 1.0  # transition smoothing
-MAXSKIP = 3  # consecutive unassigned grid columns
+MAXSKIP = 8  # consecutive unassigned grid columns
 
 
 def type_info(die):
@@ -86,10 +87,19 @@ class DieRows:
             return np_ > 0 or ns > 0
 
         counts = collections.defaultdict(collections.Counter)
-        for t in self.grid.tiles.values():
-            if t['type'] == 'NULL' or not cfg(t['type']):
+        # grid row -> [(gx, tile)] of the tiles that can own bits
+        self.gyrows = collections.defaultdict(list)
+        self.sited = {k for k, v in tinfo.items() if v[1] > 0}
+        for name, t in self.grid.tiles.items():
+            # Tiles without PIPs or sites, or without a bit window (e.g.
+            # break rows between clock regions) own no configuration bits.
+            if t['type'] == 'NULL' or not cfg(t['type']) or \
+                    self.grid.tile_window(name) is None:
                 continue
             counts[(self.grid.crrow[t['gy']], t['gx'])][t['type']] += 1
+            self.gyrows[t['gy']].append((t['gx'], name))
+        for lst in self.gyrows.values():
+            lst.sort()
         self.rows = {}
         for (cr, gx), c in counts.items():
             # Tile types with sites first (a hard block column also holds
@@ -131,6 +141,8 @@ class Model:
     def __init__(self):
         self.emit = collections.defaultdict(collections.Counter)
         self.pair = collections.defaultdict(lambda: [0, 0])  # [same, split]
+        self.left = collections.defaultdict(lambda: [0, 0])  # (a, *)
+        self.right = collections.defaultdict(lambda: [0, 0])  # (*, b)
         self.p0 = {}
 
     def fit(self, assignments, nf_all):
@@ -138,6 +150,8 @@ class Model:
         index or None, frame count or None)."""
         self.emit.clear()
         self.pair.clear()
+        self.left.clear()
+        self.right.clear()
         for row in assignments:
             prev = None
             for kind, j, nf in row:
@@ -145,7 +159,10 @@ class Model:
                     continue
                 self.emit[kind][nf] += 1
                 if prev is not None:
-                    self.pair[(prev[0], kind)][int(prev[1] != j)] += 1
+                    x = int(prev[1] != j)
+                    self.pair[(prev[0], kind)][x] += 1
+                    self.left[prev[0]][x] += 1
+                    self.right[kind][x] += 1
                 prev = (kind, j)
         tot = sum(nf_all.values())
         self.p0 = {nf: n / tot for nf, n in nf_all.items()}
@@ -171,6 +188,12 @@ class Model:
     def transition(self, a, b):
         """(log P(same frame column), log P(new frame column))"""
         same, split = self.pair.get((a, b), (0, 0))
+        if same + split == 0:
+            # Unseen pair: back off to what follows a and what precedes b
+            # (e.g. a kind always alone in its frame column).
+            s1, t1 = self.left.get(a, (0, 0))
+            s2, t2 = self.right.get(b, (0, 0))
+            same, split = s1 + s2, t1 + t2
         n = same + split
         p = (split + BETA * 0.5) / (n + BETA)
         return math.log(1 - p), math.log(p)
@@ -184,11 +207,13 @@ class Model:
             p0={str(k): round(v, 4) for k, v in sorted(self.p0.items())})
 
 
-def align_row(model, kinds, nfs, act):
+def align_row(model, kinds, nfs, act, skip):
     """kinds: grid column kinds (left to right), nfs: frame counts of the
-    frame columns, act: per column activity vector (or None).  Returns the
-    frame column index (or None) of every grid column."""
+    frame columns, act: per column activity vector (or None), skip: cost of
+    leaving each grid column unassigned.  Returns the frame column index (or
+    None) of every grid column."""
     n, M = len(kinds), len(nfs)
+    cs = np.concatenate([[0.0], np.cumsum(skip)])  # cs[i] = sum skip[:i]
     if n == 0 or M == 0:
         return [None] * n, 0.0
     NEG = -1e18
@@ -202,12 +227,12 @@ def align_row(model, kinds, nfs, act):
     jidx = np.arange(M)
     for i in range(n):
         # start: columns 0..i-1 unassigned, frame columns 0..j-1 unused
-        best = -S_COL * i - S_MAJ * jidx
+        best = -cs[i] - S_MAJ * jidx
         arg = np.full((M, 2), -1)
         for ip in range(max(0, i - 1 - MAXSKIP), i):
-            skipped = i - ip - 1
+            skipped = cs[i] - cs[ip + 1]
             ls, lt = model.transition(kinds[ip], kinds[i])
-            same = dp[ip] + ls - S_COL * skipped
+            same = dp[ip] + ls - skipped
             # split: max over j' < j of dp[ip][j'] - S_MAJ * (j - j' - 1)
             shifted = dp[ip] + S_MAJ * jidx
             run = np.maximum.accumulate(shifted)
@@ -218,8 +243,7 @@ def align_row(model, kinds, nfs, act):
                     cur = j
                 runarg[j] = cur
             split = np.full(M, NEG)
-            split[1:] = run[:-1] - S_MAJ * (jidx[1:] - 1) + lt - \
-                S_COL * skipped
+            split[1:] = run[:-1] - S_MAJ * (jidx[1:] - 1) + lt - skipped
             for j in range(M):
                 if same[j] > best[j]:
                     best[j] = same[j]
@@ -230,7 +254,7 @@ def align_row(model, kinds, nfs, act):
         dp[i] = best + E[i]
         back[i] = arg
     # end
-    tail = dp - S_COL * (n - 1 - np.arange(n))[:, None] - \
+    tail = dp - (cs[n] - cs[1:])[:, None] - \
         S_MAJ * (M - 1 - jidx)[None, :]
     i, j = np.unravel_index(int(np.argmax(tail)), tail.shape)
     total = float(tail[i, j])
@@ -244,7 +268,7 @@ def align_row(model, kinds, nfs, act):
     return out, total
 
 
-def attach_silent(rows_all, assigned, maxdist=16):
+def attach_silent(rows_all, assigned, model=None, maxdist=16):
     """Silent non void columns (kinds without activity on any die) join the
     frame column of the nearest assigned grid column: of both neighbours
     when they agree, else of the strictly nearer one (at a row end: only a
@@ -252,6 +276,7 @@ def attach_silent(rows_all, assigned, maxdist=16):
     silent columns follow their neighbour."""
     out = dict(assigned)
     gxs = [gx for gx, _ in rows_all]
+    kinds = dict(rows_all)
     for d in range(1, maxdist + 1):
         while True:
             known = sorted(out.items())
@@ -273,6 +298,15 @@ def attach_silent(rows_all, assigned, maxdist=16):
                         add[gx] = L[1]
                     elif dr < dl and dr <= d:
                         add[gx] = R[1]
+                    elif dl == dr and dl <= d and model is not None:
+                        # Equally near: the side more likely to share.
+                        k = kinds[gx]
+                        pl = model.transition(kinds[L[0]], k)[0]
+                        pr = model.transition(k, kinds[R[0]])[0]
+                        if pl > pr + 0.1:
+                            add[gx] = L[1]
+                        elif pr > pl + 0.1:
+                            add[gx] = R[1]
                 elif L and dl == 1:
                     add[gx] = L[1]
                 elif R and dr == 1:
@@ -283,13 +317,45 @@ def attach_silent(rows_all, assigned, maxdist=16):
     return out
 
 
+def minority_tiles(dr, cr, full):
+    """Hard block tiles (with sites) of another type than their column's
+    kind, e.g. a PCIE block over part of a CLB column: they take the frame
+    column of their nearest neighbours in their own grid row (both sides
+    agreeing, or the strictly nearer one) when it differs from their
+    column's.  Returns {tile: frame column index}."""
+    kinds = dict(dr.rows[cr])
+    out = {}
+    for name, t in dr.grid.tiles.items():
+        if dr.grid.crrow.get(t['gy']) != cr or t['type'] not in dr.sited:
+            continue
+        gx = t['gx']
+        if kinds.get(gx) in (None, t['type']) or gx not in full:
+            continue
+        row = [(g, n) for g, n in dr.gyrows.get(t['gy'], ()) if g in full]
+        left = [g for g, n in row if g < gx]
+        right = [g for g, n in row if g > gx]
+        L = left[-1] if left else None
+        R = right[0] if right else None
+        if L is not None and R is not None and full[L] == full[R]:
+            j = full[L]
+        elif L is not None and (R is None or gx - L < R - gx):
+            j = full[L]
+        elif R is not None and (L is None or R - gx < gx - L):
+            j = full[R]
+        else:
+            continue
+        if j != full[gx]:
+            out[name] = j
+    return out
+
+
 def show(dr, cur, d, model, active):
     for cr in sorted(dr.rows):
         m = dr.majors(cr)
         print(f'== {d} clock region row {cr} frame row {dr.crmap.get(cr)}')
         if not m:
             continue
-        asg = cur[(d, cr)]
+        asg = attach_silent(dr.rows[cr], cur[(d, cr)], model)
         used = set()
         for gx, k in dr.rows[cr]:
             j = asg.get(gx)
@@ -349,8 +415,7 @@ def main():
                 nf_all.update(nf for _, _, nf in m)
 
     def seqs(dr, cr):
-        lst = [(gx, k) for gx, k in dr.rows[cr] if k in active]
-        return lst
+        return dr.rows[cr]
 
     # Initial assignment: activity only.
     cur = {}
@@ -388,7 +453,9 @@ def main():
                 s = seqs(dr, cr)
                 kinds = [k for _, k in s]
                 act = [dr.activity(cr, gx, len(m)) for gx, _ in s]
-                out, _ = align_row(model, kinds, [c[2] for c in m], act)
+                skip = [S_COL if k in active else S_SILENT for k in kinds]
+                out, _ = align_row(model, kinds, [c[2] for c in m], act,
+                                   skip)
                 asg = {gx: j for (gx, _), j in zip(s, out) if j is not None}
                 if asg != cur.get((d, cr)):
                     changed += 1
@@ -407,6 +474,7 @@ def main():
     # Output + self-consistency.
     for d, dr in rows.items():
         colmap = []
+        tilemap = {}
         rep = collections.Counter()
         for cr in sorted(dr.rows):
             m = dr.majors(cr)
@@ -414,9 +482,11 @@ def main():
                 rep['rows without frame row'] += 1
                 continue
             asg = cur[(d, cr)]
-            full = attach_silent(dr.rows[cr], asg)
+            full = attach_silent(dr.rows[cr], asg, model)
             for gx, j in sorted(full.items()):
                 colmap.append([cr, gx, m[j][0]])
+            for name, j in minority_tiles(dr, cr, full).items():
+                tilemap[name] = m[j][0]
             used = set(asg.values())
             rep['frame columns'] += len(m)
             rep['frame columns unused'] += len(m) - len(used)
@@ -431,14 +501,15 @@ def main():
                 if v is not None and v.max() >= 3 and v[j] < 0.5 * v.max():
                     rep['activity disagreements'] += 1
             for gx, k in seqs(dr, cr):
-                if gx not in asg:
-                    rep['active columns unassigned'] += 1
+                if gx not in full:
+                    rep['active columns unassigned' if k in active else
+                        'silent columns unassigned'] += 1
         if args.show and d in args.show.split(','):
             show(dr, cur, d, model, active)
         with open(os.path.join(base, d, 'colmap.json'), 'w') as f:
             json.dump(dict(crmap={str(cr): list(k)
                                   for cr, k in dr.crmap.items()},
-                           colmap=colmap), f)
+                           colmap=colmap, tiles=tilemap), f)
         print(d, ', '.join(f'{k} {v}' for k, v in sorted(rep.items())),
               flush=True)
 
