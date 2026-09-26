@@ -30,6 +30,7 @@ class Die:
         self.sites = {}  # site -> (site_type, tile, tile_type, gx, gy)
         self.by_type = collections.defaultdict(list)
         self.tile_pos = {}
+        self.tile_cr = {}
         self.part = None
         self.arch = None
         for line in open(tiles_tsv):
@@ -44,6 +45,7 @@ class Die:
                 continue
             tile, ttype, gx, gy = p[1], p[2], int(p[3]), int(p[4])
             self.tile_pos[tile] = (ttype, gx, gy)
+            self.tile_cr[tile] = p[5]
             for s in p[6].split(','):
                 name, stype = s.split(':')
                 self.sites[name] = (stype, tile, ttype, gx, gy)
@@ -115,8 +117,10 @@ class Design:
         self.ties = []  # (pin, 0 | 1) fixed constant inputs
         self._tile_sites = None
         self.gt_quads = set()
+        self.gt_bufs = []  # (BUFG_GT, driver) of the current GT quad
         self.config_done = False
         self.native_used = set()
+        self.sites_used = set()  # hard sites taken by recipes
 
     def die_arch(self):
         return {'kintexu': 'UltraScale', 'kintexuplus': 'UltraScalePlus',
@@ -605,6 +609,7 @@ DEDICATED = {
     'XADC': {'VP', 'VN'} | {f'VAUX{s}[{i}]' for s in 'PN' for i in range(16)},
     'SYSMONE1': {'VP', 'VN'} |
                 {f'VAUX{s}[{i}]' for s in 'PN' for i in range(16)},
+    'HPIO_VREF': {'VREF'},
     'SYSMONE4': {'VP', 'VN'} |
                 {f'VAUX{s}[{i}]' for s in 'PN' for i in range(16)},
 }
@@ -640,6 +645,11 @@ def _fmt(x):
 # Pins (by regexp) that only connect to package pads or other hard blocks.
 DEDICATED_RE = {
     'PS8': re.compile(r'_PAD_'),
+}
+# Clock outputs of hard blocks that must drive a given clock buffer.
+CLOCK_OUT_BUFFERS = {
+    'PS8': (re.compile(r'^(PLCLK\[\d\]|DP(AUDIO|VIDEO)REFCLK|FMIO\w*TOPLBUFG|'
+                       r'OSCRTCCLK)$'), 'BUFG_PS'),
 }
 
 
@@ -773,6 +783,9 @@ def recipe_clockgen(d, site, ref):
     pin would be constrained to its clock region; too many buffers exceed
     the buffers / clock tracks of the clock region)."""
     rng = d.rng
+    if site in d.sites_used:
+        return
+    d.sites_used.add(site)
     params = d.prims[ref].params
     pll = ref.startswith('PLL')
     props = d.random_params(ref)
@@ -826,6 +839,12 @@ def recipe_hard(d, site, ref, pconn=0.6):
         return
     props = d.random_params(ref)
     n = d.cell(ref, site, None, props)
+    npins = len(pins_of(d.prims, ref))
+    if npins > 500:
+        # Huge blocks (PS, PCIe, CMAC, VCU): thousands of random nets make
+        # placement / routing take longer than the time budget.
+        pconn = max(0.1, min(pconn, 300.0 / npins))
+    clkbuf = CLOCK_OUT_BUFFERS.get(ref)
     shared = set()
     if props.get('CLOCK_DOMAINS') == 'COMMON' or props.get('EN_SYN') == 'TRUE':
         pins = {p for _, p in pins_of(d.prims, ref)}
@@ -852,7 +871,13 @@ def recipe_hard(d, site, ref, pconn=0.6):
                     continue
                 d.add_sink(full, site, kind, hard=True)
         elif direction == 'OUT':
-            if rng.random() < pconn:
+            if clkbuf and clkbuf[0].search(pin):
+                # Clock outputs that only reach a dedicated buffer.
+                if clkbuf[1] in d.prims and rng.random() < 0.5:
+                    b = d.cell(clkbuf[1])
+                    d.connect(full, [f'{b}/I'])
+                    d.clocks.append(f'{b}/O')
+            elif rng.random() < pconn:
                 d.add_source(full, site)
 
 
@@ -900,8 +925,9 @@ _GT_SKIP = re.compile(r'^(GT(NORTH|SOUTH|EAST|WEST|G)REFCLK|.*RSVD)')
 
 
 def gt_clock_buffer(d, site, driver):
-    """Clock buffer on a GT clock output: BUFG_GT (sometimes with a
-    BUFG_GT_SYNC) on UltraScale, BUFG/BUFH on 7-series."""
+    """Clock buffer on a GT clock output: BUFG_GT on UltraScale (CE / CLR
+    shared by all BUFG_GTs of the quad, see gt_quad_buffers), BUFG on
+    7-series."""
     rng = d.rng
     if 'BUFG_GT' not in d.prims:
         return global_buffer(d, site, driver)
@@ -909,19 +935,29 @@ def gt_clock_buffer(d, site, driver):
     d.connect(driver, [f'{b}/I'])
     for p in ('CEMASK', 'CLRMASK', 'DIV[0]', 'DIV[1]', 'DIV[2]'):
         d.tie(f'{b}/{p}', int(rng.random() < 0.3))
-    if 'BUFG_GT_SYNC' in d.prims and rng.random() < 0.5:
-        sy = d.cell('BUFG_GT_SYNC')
-        d.connect(driver, [f'{sy}/CLK'])
-        d.add_sink(f'{sy}/CE', site, 'fabric')
-        d.add_sink(f'{sy}/CLR', site, 'fabric')
-        d.connect(f'{sy}/CESYNC', [f'{b}/CE'])
-        d.connect(f'{sy}/CLRSYNC', [f'{b}/CLR'])
-    else:
-        # CE / CLR: the constant tie-offs cannot reach them.
-        d.add_sink(f'{b}/CE', site, 'fabric')
-        d.add_sink(f'{b}/CLR', site, 'fabric')
+    d.gt_bufs.append((b, driver))
     d.clocks.append(f'{b}/O')
     return b
+
+
+def gt_quad_buffers(d, site):
+    """CE / CLR of the BUFG_GTs of a quad: all BUFG_GTs of one GT must
+    share them (Vivado Opt 31-214/215), through a BUFG_GT_SYNC or directly
+    from the fabric (constants cannot reach them)."""
+    bufs, d.gt_bufs = d.gt_bufs, []
+    if not bufs:
+        return
+    if 'BUFG_GT_SYNC' in d.prims and len({v for _, v in bufs}) == 1 and \
+            d.rng.random() < 0.7:
+        sy = d.cell('BUFG_GT_SYNC')
+        d.connect(bufs[0][1], [f'{sy}/CLK'])
+        d.add_sink(f'{sy}/CE', site, 'fabric')
+        d.add_sink(f'{sy}/CLR', site, 'fabric')
+        d.connect(f'{sy}/CESYNC', [f'{b}/CE' for b, _ in bufs])
+        d.connect(f'{sy}/CLRSYNC', [f'{b}/CLR' for b, _ in bufs])
+    else:
+        d.add_sink([f'{b}/CE' for b, _ in bufs], site, 'fabric')
+        d.add_sink([f'{b}/CLR' for b, _ in bufs], site, 'fabric')
 
 
 def gt_block_pins(d, site, n, ref, refclks, common, chsite=None):
@@ -935,9 +971,12 @@ def gt_block_pins(d, site, n, ref, refclks, common, chsite=None):
         m = _GT_PAD.match(p)
         if m:
             if chsite:
+                # 7-series: Vivado inserts I/O buffers on GT pad ports (that
+                # then fail placement): only check the pads are bonded.
                 d.padpin(f'{n}_{p.lower()}', full, chsite,
                          f'^MGT[A-Z]*{m.group(1)}{m.group(2)}\\d',
-                         'IN' if dr == 'IN' else 'OUT')
+                         ('IN' if dr == 'IN' else 'OUT') if is_us(d.die)
+                         else 'CHECK')
             continue
         if _GT_SKIP.match(p):
             continue
@@ -1026,6 +1065,7 @@ def recipe_gt(d, site, ref):
         if chref in d.prims:
             n = d.cell(chref, ch, None, d.random_params(chref))
             gt_block_pins(d, site, n, chref, refclks, cn, ch)
+    gt_quad_buffers(d, site)
 
 
 # Configuration primitives (one site each on 7-series, BELs of the single
@@ -1225,6 +1265,9 @@ def recipe_io(d, site, stype):
         modes += ['diffin', 'diffout', 'difftri']
     mode = rng.choice(modes)
     ref = rng.choice(IO_REFS[mode])
+    if ref.endswith('_DCIEN') and not stype.startswith(('IOB18', 'HPIOB')):
+        # DCI only exists in High Performance banks.
+        ref = IO_REFS[mode][0]
     if ref not in d.prims and ref not in IO_MACROS:
         return
     stds = diff if mode.startswith('diff') else se
@@ -1252,19 +1295,26 @@ def recipe_io(d, site, stype):
             continue
         if vals and rng.random() < 0.35:
             props += [k, rng.choice(vals)]
+    ref2 = None
+    if mode in ('in', 'diffin'):
+        # (Bitslices need their BITSLICE_CONTROL: see recipe_native.)
+        opts = (['IDDRE1', 'ISERDESE3', 'IDELAYE3'] if us else
+                ['IDDR', 'IDDR_2CLK', 'ISERDESE2', 'IDELAYE2'])
+        opts = [o for o in opts if o in d.prims]
+        if rng.random() < 0.5 and opts:
+            ref2 = rng.choice(opts)
+        if ref2 and ref2.startswith('IDELAY') and 'IOBDELAY' in props:
+            # An IOB delay setting on a buffer feeding an IDELAY makes
+            # Vivado insert a ZHOLD_DELAY between them (unroutable).
+            i = props.index('IOBDELAY')
+            del props[i:i + 2]
     name = d.name('io')
     d.lines.append(f'nl_iob {name} {site} {mode} {ref} {{{" ".join(stds)}}} '
                    f'{{{" ".join(props)}}}')
     for p in IO_CTRL_PINS.get(ref, ()):
         d.add_sink(f'{name}/{p}', site, hard=True)
     if mode in ('in', 'diffin'):
-        r = rng.random()
-        opts = (['IDDRE1', 'ISERDESE3', 'IDELAYE3', 'RX_BITSLICE',
-                 'RXTX_BITSLICE'] if us else
-                ['IDDR', 'IDDR_2CLK', 'ISERDESE2', 'IDELAYE2'])
-        opts = [o for o in opts if o in d.prims]
-        if r < 0.5 and opts:
-            ref2 = rng.choice(opts)
+        if ref2:
             n2 = d.cell(ref2, None, None, d.random_params(ref2))
             din = {'RX_BITSLICE': 'DATAIN', 'RXTX_BITSLICE': 'DATAIN'}.get(
                 ref2, 'IDATAIN' if ref2.startswith('IDELAY') else 'D')
@@ -1289,8 +1339,7 @@ def recipe_io(d, site, stype):
         d.add_sink(f'{name}/I', site, hard=True)
         d.add_sink(f'{name}/T', site, hard=True)
     else:
-        opts = (['ODDRE1', 'OSERDESE3', 'TX_BITSLICE', 'RXTX_BITSLICE']
-                if us else ['ODDR', 'OSERDESE2'])
+        opts = (['ODDRE1', 'OSERDESE3'] if us else ['ODDR', 'OSERDESE2'])
         opts = [o for o in opts if o in d.prims]
         if rng.random() < 0.5 and opts:
             ref2 = rng.choice(opts)
@@ -1335,16 +1384,43 @@ def _connect_bus(d, src, sref, spin, dst, dref, dpin):
 
 
 def _native_bytes(d):
-    """HP I/O pads grouped by byte: {(column, byte): {bit: (site, type)}}.
-    I/O sites are numbered 52 per bank (4 bytes of 13 pads), bits 0-5 are
-    the lower nibble, 6-12 the upper one."""
-    if getattr(d, '_nbytes', None) is None:
-        d._nbytes = collections.defaultdict(dict)
-        for st in ('HPIOB', 'HPIOB_M', 'HPIOB_S', 'HPIOB_SNGL'):
-            for s in d.die.by_type.get(st, []):
+    """HP I/O pads and their bitslices grouped by byte:
+    {(bitslice column, byte): {bit: (pad site, pad type, bitslice site)}}.
+
+    Each clock region row of an I/O column has one bank: 52 pads and 52
+    bitslices (4 bytes of 13, bits 0-5 lower nibble, 6-12 upper nibble),
+    matched in site order; pad columns pair with the nearest bitslice
+    column."""
+    if getattr(d, '_nbytes', None) is not None:
+        return d._nbytes
+    d._nbytes = {}
+    die = d.die
+
+    def cols(types):
+        out = collections.defaultdict(lambda: collections.defaultdict(list))
+        for st in types:
+            for s in die.by_type.get(st, []):
                 _, x, y = _SITE_IDX.match(s).groups()
-                x, y = int(x), int(y)
-                d._nbytes[(x, y // 13)][y % 13] = (s, st)
+                v = die.sites[s]
+                out[int(x)][die.tile_cr.get(v[1], '-')].append(
+                    (int(y), s, st, v[3]))
+        return out
+    pads = cols(('HPIOB', 'HPIOB_M', 'HPIOB_S', 'HPIOB_SNGL'))
+    bss = cols(('BITSLICE_RX_TX',))
+    if not bss:
+        return d._nbytes
+    bsgx = {x: next(iter(v.values()))[0][3] for x, v in bss.items()}
+    for px, crs in pads.items():
+        pgx = next(iter(crs.values()))[0][3]
+        bx = min(bsgx, key=lambda x: abs(bsgx[x] - pgx))
+        for cr, plist in crs.items():
+            blist = sorted(bss[bx].get(cr, []))
+            plist = sorted(plist)
+            if len(plist) != 52 or len(blist) != 52:
+                continue
+            for (_, ps, pst, _), (by, bs, _, _) in zip(plist, blist):
+                d._nbytes.setdefault((bx, by // 13), {})[by % 13] = \
+                    (ps, pst, bs)
     return d._nbytes
 
 
@@ -1355,15 +1431,17 @@ _NATIVE_SKIP = re.compile(r'^(RX_BIT_CTRL|TX_BIT_CTRL|BIT_CTRL|DATAIN$|O$|'
                           r'[PN]CLK_NIBBLE_OUT|RIU_RD_DATA|RIU_VALID|.*_EXT)')
 
 
-def _native_fabric_pins(d, n, ref, site):
+def _native_fabric_pins(d, n, ref, site, clk_pins):
     rng = d.rng
     for dr, p in pins_of(d.prims, ref):
         if _NATIVE_SKIP.match(p):
             continue
         full = f'{n}/{p}'
-        if dr == 'IN' and rng.random() < 0.7:
-            d.add_sink(full, site, 'clock' if re.search(r'CLK$', p)
-                       else 'data', hard=True)
+        if dr == 'IN' and re.search(r'CLK$', p):
+            if rng.random() < 0.8:
+                clk_pins.append(full)
+        elif dr == 'IN' and rng.random() < 0.7:
+            d.add_sink(full, site, 'data', hard=True)
         elif dr == 'OUT' and rng.random() < 0.6:
             d.add_source(full, site)
 
@@ -1381,14 +1459,29 @@ def recipe_native(d, site, ref):
     key = rng.choice(free)
     d.native_used.add(key)
     pads = nbytes[key]
-    us_std = IO_SITES
+    bx, byte = key
+
+    def loc(prefix, y):
+        s = f'{prefix}_X{bx}Y{y}'
+        return s if s in d.die.sites else None
+    # One fabric clock for all bitslice clocks of the byte (at most 6
+    # clocks per half bank).
+    clk_pins = []
     pll = None
     pllref = next((r for r in ('PLLE4_ADV', 'PLLE3_ADV') if r in d.prims),
                   None)
-    if pllref and rng.random() < 0.8:
+    # The PLL feeding PLL_CLK must be in the clock region of the byte.
+    anybs = next(iter(pads.values()))[2]
+    cr = d.die.tile_cr.get(d.die.sites[anybs][1])
+    pllsites = [s for st in ('PLLE3_ADV', 'PLL') for s in d.die.by_type.get(st, [])
+                if d.die.tile_cr.get(d.die.sites[s][1]) == cr and
+                s not in d.sites_used]
+    if pllref and pllsites and rng.random() < 0.8:
         props = d.random_params(pllref)
         props.update(clockgen_params(pllref, d.prims[pllref].params, rng))
-        pll = d.cell(pllref, None, None, props)
+        psite = rng.choice(pllsites)
+        d.sites_used.add(psite)
+        pll = d.cell(pllref, psite, None, props)
         d.connect(f'{pll}/CLKFBOUT', [f'{pll}/CLKFBIN'])
         d.add_sink(f'{pll}/CLKIN', site, 'gclock', hard=True)
         for p in ('RST', 'PWRDWN', 'CLKOUTPHYEN'):
@@ -1406,24 +1499,25 @@ def recipe_native(d, site, ref):
         for k in ('EN_OTHER_PCLK', 'EN_OTHER_NCLK'):
             cprops[k] = 'FALSE'
         cprops['REFCLK_SRC'] = 'PLLCLK' if pll else 'REFCLK'
-        ctl = d.cell('BITSLICE_CONTROL', None, None, cprops)
+        ctl = d.cell('BITSLICE_CONTROL', loc('BITSLICE_CONTROL',
+                                             2 * byte + nib), None, cprops)
         ctrls[nib] = ctl
         if pll:
             d.connect(f'{pll}/CLKOUTPHY', [f'{ctl}/PLL_CLK'])
-        _native_fabric_pins(d, ctl, 'BITSLICE_CONTROL', site)
+        _native_fabric_pins(d, ctl, 'BITSLICE_CONTROL', site, clk_pins)
         tri = None
         if rng.random() < 0.6:
-            tri = d.cell('TX_BITSLICE_TRI', None, None,
-                         d.random_params('TX_BITSLICE_TRI'))
+            tri = d.cell('TX_BITSLICE_TRI', loc('BITSLICE_TX', 2 * byte + nib),
+                         None, d.random_params('TX_BITSLICE_TRI'))
             _connect_bus(d, ctl, 'BITSLICE_CONTROL', 'TX_BIT_CTRL_OUT_TRI',
                          tri, 'TX_BITSLICE_TRI', 'BIT_CTRL_IN')
             _connect_bus(d, tri, 'TX_BITSLICE_TRI', 'BIT_CTRL_OUT',
                          ctl, 'BITSLICE_CONTROL', 'TX_BIT_CTRL_IN_TRI')
-            _native_fabric_pins(d, tri, 'TX_BITSLICE_TRI', site)
+            _native_fabric_pins(d, tri, 'TX_BITSLICE_TRI', site, clk_pins)
         tbyte = []
         for b in rng.sample(avail, rng.randint(1, len(avail))):
             i = b - bits[0]
-            psite, stype = pads[b]
+            psite, stype, bsite = pads[b]
             mode = rng.choice(['in', 'out', 'tri', 'inout'])
             sref = {'in': rng.choice(['RX_BITSLICE', 'RXTX_BITSLICE']),
                     'out': rng.choice(['TX_BITSLICE', 'RXTX_BITSLICE']),
@@ -1438,10 +1532,12 @@ def recipe_native(d, site, ref):
                     props[k] = 'DATA'
             if 'CASCADE' in props:
                 props['CASCADE'] = 'FALSE'
-            sl = d.cell(sref, None, None, props)
+            # Native mode bitslices must be LOCed (Vivado does not place
+            # them next to their pads).
+            sl = d.cell(sref, bsite, None, props)
             io = d.name('io')
             d.lines.append(f'nl_iob {io} {psite} {mode} {iref} '
-                           f'{{{" ".join(us_std[stype][0])}}} {{}}')
+                           f'{{{" ".join(IO_SITES[stype][0])}}} {{}}')
             if mode in ('in', 'inout'):
                 d.connect(f'{io}/O', [f'{sl}/DATAIN'])
             if mode != 'in':
@@ -1455,11 +1551,11 @@ def recipe_native(d, site, ref):
                              ctl, 'BITSLICE_CONTROL', f'{bus}_IN{i}')
             if tri and props.get('TBYTE_CTL') == 'TBYTE_IN':
                 tbyte.append(f'{sl}/TBYTE_IN')
-            _native_fabric_pins(d, sl, sref, site)
+            _native_fabric_pins(d, sl, sref, site, clk_pins)
         if tbyte:
             d.connect(f'{tri}/TRI_OUT', tbyte)
     if ctrls and rng.random() < 0.8:
-        riu = d.cell('RIU_OR')
+        riu = d.cell('RIU_OR', loc('RIU_OR', byte))
         for nib, side in ((0, 'LOW'), (1, 'UPP')):
             if nib in ctrls:
                 _connect_bus(d, ctrls[nib], 'BITSLICE_CONTROL', 'RIU_RD_DATA',
@@ -1474,9 +1570,12 @@ def recipe_native(d, site, ref):
             for b in _bus(d, 'BITSLICE_CONTROL', 'RIU_RD_DATA'):
                 if rng.random() < 0.5:
                     d.add_source(f'{c}/RIU_RD_DATA[{b}]', site)
+    if clk_pins:
+        d.add_sink(clk_pins, site, 'clock')
 
 
-for _r in ('BITSLICE_CONTROL', 'RIU_OR', 'TX_BITSLICE_TRI'):
+for _r in ('BITSLICE_CONTROL', 'RIU_OR', 'TX_BITSLICE_TRI', 'RX_BITSLICE',
+           'TX_BITSLICE', 'RXTX_BITSLICE'):
     HARD_RECIPES[_r] = recipe_native
 
 
@@ -1588,6 +1687,10 @@ def generate(die, prims, seed, out, density, hard=True, pips=None,
         for st in chosen:
             p = rng.choice([0.1, 0.3, 0.6, 1.0])
             cap = len(die.by_type[st])
+            if cap <= 4:
+                # Blocks with one or a few sites (PCIe, PS, SYSMON, CMAC,
+                # configuration, ...): mostly used once the type is chosen.
+                p = max(p, 0.7)
             if re.match(r'^(ILOGIC|OLOGIC|IDELAY|ODELAY|IOB|HPIOB|HRIO|HDIOB|'
                         r'BITSLICE|IN_FIFO|OUT_FIFO)', st):
                 cap = min(cap, io_cap // 3)
@@ -1630,7 +1733,8 @@ def generate(die, prims, seed, out, density, hard=True, pips=None,
             any(re.search(r' (IDELAYE|ODELAYE)\w* ', l) for l in d.lines)
         if delays and 'IDELAYCTRL' in prims and 'IDELAYCTRL' not in used:
             n = d.cell('IDELAYCTRL')
-            d.add_sink(f'{n}/REFCLK', die.by_type['SLICEL'][0], 'clock')
+            # REFCLK: from a global buffer (not a pad: unroutable).
+            d.add_sink(f'{n}/REFCLK', die.by_type['SLICEL'][0], 'gclock')
             d.add_sink(f'{n}/RST', die.by_type['SLICEL'][0])
         with open(os.path.join(os.path.dirname(os.path.abspath(out)),
                                'design.meta'), 'w') as f:

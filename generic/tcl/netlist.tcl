@@ -105,7 +105,7 @@ proc nl_net {name pins} {
     }
     if {[llength $loads] == 0} {
         set c [get_cells -of_objects $drv]
-        if {[regexp {^(IDDR|ODDR|ISERDES|OSERDES|IDELAY|ODELAY)} [get_property REF_NAME $c]]} {
+        if {[regexp {^(IDDR|ODDR|ISERDES|OSERDES|IDELAY|ODELAY|TX_BITSLICE$|RXTX_BITSLICE)} [get_property REF_NAME $c]]} {
             global nl_orphans
             lappend nl_orphans [get_property NAME $c]
         }
@@ -158,6 +158,7 @@ proc nl_padpin {name pin site func dir} {
         catch {remove_cell [get_cells -of_objects $p]}
         return
     }
+    if {$dir eq "CHECK"} return
     if {[catch {
         create_port -direction $dir $name
         create_net ${name}_pad
@@ -528,7 +529,7 @@ proc nl_finish {{relaxclk 0}} {
         # through general interconnect they end in unresolvable overlaps.
         set gen [get_cells -quiet -hierarchical -filter {REF_NAME =~ MMCM* || REF_NAME =~ PLL* || REF_NAME =~ GT* || REF_NAME =~ IBUFDS_GT*}]
         if {[llength $gen]} {
-            catch {reset_property CLOCK_DEDICATED_ROUTE [get_nets -quiet -of_objects [get_pins -quiet -of_objects $gen -filter {DIRECTION == OUT}]]}
+            catch {set_property CLOCK_DEDICATED_ROUTE TRUE [get_nets -quiet -of_objects [get_pins -quiet -of_objects $gen -filter {DIRECTION == OUT}]]}
         }
     }
     foreach d [get_drc_checks] {
@@ -678,6 +679,12 @@ proc nl_iob {name site mode ref stds props} {
         nl_log "ioberr $name padused"
         return 0
     }
+    # The DCI reference resistor pin: DCI standards of its bank need it free.
+    # Same for the VREF pins of standards with an input reference.
+    if {[regexp {VRP|VREF} [get_property -quiet PIN_FUNC $pin]]} {
+        nl_log "ioberr $name vref"
+        return 0
+    }
     set pair [get_property -quiet DIFF_PAIR_PIN $pin]
     if {[string match diff* $mode] && $pair ne "" && [llength [get_ports -quiet -of_objects [get_package_pins -quiet $pair]]]} {
         set mode [dict get {diffin in diffout out difftri tri} $mode]
@@ -697,7 +704,9 @@ proc nl_iob {name site mode ref stds props} {
     }
     global nl_bank_std
     if {![info exists nl_bank_std]} { set nl_bank_std [dict create] }
-    set diffkey [expr {[string match diff* $mode] ? "d" : "s"}]
+    # (Differential inputs and outputs remember their standard separately:
+    # some differential standards are receiver only.)
+    set diffkey [expr {[string match diff* $mode] ? ($mode eq "diffin" ? "di" : "do") : "s"}]
     if {$mode eq "inout"} {
         # Bidirectional ports need a bidirectional standard.
         set bi [list]
@@ -722,6 +731,11 @@ proc nl_iob {name site mode ref stds props} {
     set sv [lindex $cands [expr {int(rand() * [llength $cands])}]]
     set std [lindex [split $sv :] 0]
     set vcco [lindex [split $sv :] 1]
+    if {[dict exists $nl_bank_vcco $bank] && [dict get $nl_bank_vcco $bank] ne $vcco} {
+        # (A standard remembered for the bank with another VCCO.)
+        nl_log "ioberr $name novcco"
+        return 0
+    }
     if {[catch {create_cell -reference $ref $name} e]} {
         nl_log "cellerr $name $ref [string range $e 0 150]"
         return 0
@@ -759,16 +773,24 @@ proc nl_iob {name site mode ref stds props} {
         }
     }
     set btype [get_property -quiet BANK_TYPE $bank]
+    # The default drive strength (12) does not exist for LVCMOS12/10 in
+    # High Performance banks.
+    if {$mode ni {in diffin} && [regexp {^LVCMOS1[02]$} $std] && [string match *HIGH_PERFORMANCE* $btype] && [lsearch -exact $props DRIVE] < 0} {
+        lappend props DRIVE [lindex {2 4 6 8} [expr {int(rand() * 4)}]]
+    }
     foreach {k v} $props {
         # Input termination only exists for the SSTL/HSTL/HSUL family and
         # drive strengths only for LVCMOS/LVTTL (with a per standard / bank
         # type set): other values fail placement, removing the buffer.
         if {$k eq "IN_TERM" && ![regexp {^(DIFF_)?(SSTL|HSTL|HSUL|MOBILE_DDR)} $std]} continue
+        # SLEW MEDIUM: only the SSTL/HSTL/HSUL/POD family (else an error at
+        # every DRC run).
+        if {$k eq "SLEW" && $v eq "MEDIUM" && ![regexp {^(DIFF_)?(SSTL|HSTL|HSUL|POD)} $std]} { set v FAST }
         if {$k eq "DRIVE"} {
             if {![regexp {^(LVCMOS|LVTTL)} $std]} continue
             set ok {4 8 12 16}
             if {[string match *HIGH_PERFORMANCE* $btype]} {
-                set ok [expr {$std eq "LVCMOS12" ? {2 4 6 8} : {2 4 6 8 12}}]
+                set ok [expr {$std in {LVCMOS12 LVCMOS10} ? {2 4 6 8} : {2 4 6 8 12}}]
             } elseif {$std eq "LVCMOS12"} {
                 set ok {4 8 12}
             } elseif {$std in {LVTTL LVCMOS18}} {

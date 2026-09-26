@@ -20,6 +20,31 @@ the bitstream.
 | Bit database | `python/mkdb.py` | `build/db/<arch>/segbits_<tiletype>.db`, `defaults_<tiletype>.db` |
 | Checking / decoding | `python/check.py` | undocumented bit report, FASM |
 
+### Random designs
+
+Each design has random logic clusters, 1-4 random hard site types and
+(mostly) random I/O.  Primitives get random parameters; `nl_finish` places,
+routes and writes the bitstream, removing the cells named in errors or
+disconnecting unroutable nets until it succeeds.  Hard blocks whose random
+parameters or connections rarely survive this have their own recipes
+(`HARD_RECIPES` in `gen_design.py`):
+
+* MMCM/PLL: legal counter settings (VCO/PFD ranges, duty/phase grid),
+  clock input from a global buffer, feedback internal or through a BUFG,
+  outputs on global buffers.
+* GT quads: reference clock buffers on the MGTREFCLK pads, common block
+  feeding the channels, serial pads on ports (`nl_padpin`), user clocks
+  from buffered TX/RXOUTCLK (BUFG_GT on UltraScale).
+* Configuration primitives: a random subset of all of them per design.
+* Native mode I/O: bytes of bitslices with their BITSLICE_CONTROL,
+  TX_BITSLICE_TRI, RIU_OR and PLL.
+
+`PARAM_FIXUPS` restricts random parameters of primitives with interdependent
+parameters (e.g. SERDES widths) to legal combinations.
+`gen_design.py --focus <regexp>` limits a design to the hard site types
+matching the pattern (no random I/O), for quick recipe experiments, e.g.
+`run_designs.py --die xcku025 --tag t --seeds 1:4 -- --density 0.01 --focus '^(MMCM|PLL)'`.
+
 ### Features
 
 `tcl/dump_features.tcl` dumps, for a routed design, every used PIP, every used
