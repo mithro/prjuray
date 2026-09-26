@@ -119,8 +119,18 @@ class Design:
         self.gt_quads = set()
         self.gt_bufs = []  # (BUFG_GT, driver) of the current GT quad
         self.config_done = False
+        self.nclkbuf = 0
         self.native_used = set()
         self.sites_used = set()  # hard sites taken by recipes
+
+    def take_clock_buffer(self):
+        # Account one more recipe clock buffer; False once there are as
+        # many as the clock tracks of a clock region can carry (else the
+        # global clock router fails, after a long time).
+        if self.nclkbuf >= (16 if is_us(self.die) else 10):
+            return False
+        self.nclkbuf += 1
+        return True
 
     def die_arch(self):
         return {'kintexu': 'UltraScale', 'kintexuplus': 'UltraScalePlus',
@@ -761,7 +771,10 @@ def clockgen_params(ref, params, rng):
 def global_buffer(d, site, driver, export=True):
     """A global clock buffer (placed by Vivado) on <driver>; with export its
     output becomes a clock of the design.  (Regional BUFH buffers conflict
-    with the slice pblocks.)"""
+    with the slice pblocks.)  None once the design has its maximum number
+    of clock buffers."""
+    if not d.take_clock_buffer():
+        return None
     ref = 'BUFGCE' if is_us(d.die) else 'BUFG'
     if ref not in d.prims:
         ref = 'BUFG'
@@ -800,8 +813,8 @@ def recipe_clockgen(d, site, ref):
              if v in ('ZHOLD', 'BUF_IN', 'AUTO')] or ['INTERNAL'])
     n = d.cell(ref, site, None, props)
     pins = {p: dr for dr, p in pins_of(d.prims, ref)}
-    if fbbuf:
-        b = global_buffer(d, site, f'{n}/CLKFBOUT', export=False)
+    b = fbbuf and global_buffer(d, site, f'{n}/CLKFBOUT', export=False)
+    if b:
         d.connect(f'{b}/O', [f'{n}/CLKFBIN'])
     else:
         d.connect(f'{n}/CLKFBOUT', [f'{n}/CLKFBIN'])
@@ -931,6 +944,8 @@ def gt_clock_buffer(d, site, driver):
     rng = d.rng
     if 'BUFG_GT' not in d.prims:
         return global_buffer(d, site, driver)
+    if not d.take_clock_buffer():
+        return None
     b = d.cell('BUFG_GT', None, None, d.random_params('BUFG_GT'))
     d.connect(driver, [f'{b}/I'])
     for p in ('CEMASK', 'CLRMASK', 'DIV[0]', 'DIV[1]', 'DIV[2]'):
