@@ -140,6 +140,31 @@ proc nl_port {name dir pin} {
     }
 }
 
+# Top level port on the bonded package pin of <site> whose PIN_FUNC matches
+# <func>, connected to cell pin <pin> (dedicated pads of GTs, reference
+# clock buffers, ...).  Without such a pin the cell is removed.
+proc nl_padpin {name pin site func dir} {
+    set p [get_pins -quiet $pin]
+    if {$p eq ""} return
+    set pp ""
+    foreach x [get_package_pins -quiet -of_objects [get_sites -quiet $site]] {
+        if {[regexp $func [get_property PIN_FUNC $x]]} { set pp $x; break }
+    }
+    if {$pp eq "" || [llength [get_ports -quiet -of_objects $pp]]} {
+        nl_log "padless $name $site"
+        catch {remove_cell [get_cells -of_objects $p]}
+        return
+    }
+    if {[catch {
+        create_port -direction $dir $name
+        create_net ${name}_pad
+        connect_net -net ${name}_pad -objects [list [get_ports $name] $p]
+        set_property PACKAGE_PIN $pp [get_ports $name]
+    } e]} {
+        nl_log "padpinerr $name [string range $e 0 200]"
+    }
+}
+
 # Returns generated cell names mentioned in ERROR messages written to
 # vivado.log since the last call.
 set nl_logpos 0
