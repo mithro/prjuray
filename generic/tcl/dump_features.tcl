@@ -422,7 +422,9 @@ proc dump_features {out} {
     foreach r [_df_props REF_NAME $placed] { dict set refs $r 1 }
     set sitepin [dict create]
     set tries [dict create]
-    set seen [dict create]
+    # (An array: 'dict set' on the seen lines was quadratic here, 90 s for
+    # 35k lines on an xcku025 design.)
+    array unset seenline
     foreach ref [dict keys $refs] {
         set cells [filter -quiet $placed "REF_NAME == \"$ref\""]
         set props [list_property [lindex $cells 0] IS_*_INVERTED]
@@ -456,8 +458,8 @@ proc dump_features {out} {
                 } else {
                     set line "cfg $s $where $p $v"
                 }
-                if {[dict exists $seen $line]} continue
-                dict set seen $line 1
+                if {[info exists seenline($line)]} continue
+                set seenline($line) 1
                 puts $fp $line
             }
         }
