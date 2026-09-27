@@ -14,6 +14,8 @@ Feature naming (relative to the tile, prefixed by the tile type in the DB):
   <SITEKEY>.<BEL>.<CFG>[i]=0       bit i is 0 (vectors of <= 64 bits)
   <SITEKEY>.<BEL>.INIT[i]          LUT truth table bit (from EQN)
   <SITEKEY>.BANK.IOSTD=<std>       an I/O standard used in the pad's bank
+  <SITEKEY>.BANK.VCCO=<volts>      the bank's VCCO (from its I/O standards)
+  <SITEKEY>.PAD.PULLTYPE=<v>       pull resistor of a used pad
   <vector bit feature>@<W>=<v>     vector bit together with a WIDTH setting
                                    <W> of the same BEL (same port suffix)
 
@@ -32,6 +34,19 @@ _VEC = re.compile(r"^(\d+)'([bh])([0-9a-fA-F_]+)$")
 
 # Widest vector configuration whose 0 bits are features too.
 MAX_ZERO_VEC = 64
+
+def _std_vcco():
+    """I/O standard -> VCCO (None when it differs between bank types)."""
+    import gen_design
+    out = {}
+    for se, diff in gen_design.IO_SITES.values():
+        for sv in se + diff:
+            std, v = sv.split(':')
+            out[std] = v if out.get(std, v) == v else None
+    return out
+
+
+_VCCO = None
 
 PAD_SITE = re.compile(r'^(IOB|HPIOB|HRIO|HDIOB|IOPAD|IPAD|OPAD)')
 
@@ -131,6 +146,7 @@ def tile_features(path, sitekeys):
     site_map = {}
     glob_opts = {}
     bel_cfgs = collections.defaultdict(dict)
+    bank_stds = collections.defaultdict(set)
     with open_any(path) as f:
         for line in f:
             p = line.rstrip('\n').split(' ')
@@ -161,11 +177,22 @@ def tile_features(path, sitekeys):
                 if len(p) >= 4 and p[1] in sitekeys.key:
                     tile, key = sitekeys.key[p[1]]
                     feats[tile].add(f'{key}.BANK.{p[2]}={p[3]}')
+                    if p[2] == 'IOSTD':
+                        bank_stds[(tile, key)].add(p[3])
             elif kind == 'cfg':
                 tile, key = site_map[p[1]]
                 value = ' '.join(p[4:])
                 feats[tile].update(cfg_features(f'{key}.{p[2]}', p[3], value))
                 bel_cfgs[(tile, f'{key}.{p[2]}')][p[3]] = value
+    # Bank VCCO (bank wide settings such as the 7-series STEPDOWN depend on
+    # it rather than on single standards).
+    global _VCCO
+    if bank_stds and _VCCO is None:
+        _VCCO = _std_vcco()
+    for (tile, key), stds in bank_stds.items():
+        vs = {_VCCO.get(x) for x in stds}
+        if len(vs) == 1 and None not in vs:
+            feats[tile].add(f'{key}.BANK.VCCO={vs.pop()}')
     # The physical layout of some vector settings depends on a width setting
     # of the same BEL (e.g. BRAM INIT_A/SRVAL_A are replicated for narrow
     # READ_WIDTH_A): also name the vector bits together with the width.

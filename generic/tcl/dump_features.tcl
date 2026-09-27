@@ -370,6 +370,15 @@ proc dump_features {out} {
             }
         }
     }
+    # Pad pull resistors (a port property, not in the BEL configuration):
+    # reported like a BEL setting of the pad site (NONE when not set).
+    foreach port [get_ports -quiet] {
+        set s [get_sites -quiet -of_objects $port]
+        if {![string match IOB_* $s]} continue
+        set v [get_property -quiet PULLTYPE $port]
+        if {$v eq ""} { set v NONE }
+        puts $fp "cfg $s PAD PULLTYPE $v"
+    }
     # Bank wide settings (e.g. the 7-series STEPDOWN of low voltage banks)
     # also change unused pads: report the I/O standards used in each bank on
     # every pad site of the bank.
