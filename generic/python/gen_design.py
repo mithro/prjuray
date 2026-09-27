@@ -51,6 +51,33 @@ class Die:
                 self.sites[name] = (stype, tile, ttype, gx, gy)
                 self.by_type[stype].append(name)
 
+    def restrict(self, rng, frac):
+        """Keep only the sites in a random rectangle of clock regions
+        covering about `frac` of the die (smaller, faster designs on large
+        dies).  Returns the kept clock region range."""
+        crs = {}
+        for tile, cr in self.tile_cr.items():
+            m = re.match(r'X(\d+)Y(\d+)$', cr)
+            if m:
+                crs[tile] = (int(m.group(1)), int(m.group(2)))
+        if not crs:
+            return None
+        nx = max(x for x, _ in crs.values()) + 1
+        ny = max(y for _, y in crs.values()) + 1
+        w = max(1, min(nx, round(nx * frac ** 0.5)))
+        h = max(1, min(ny, round(ny * frac / (w / nx))))
+        x0 = rng.randrange(nx - w + 1)
+        y0 = rng.randrange(ny - h + 1)
+        keep = {t for t, (x, y) in crs.items()
+                if x0 <= x < x0 + w and y0 <= y < y0 + h}
+        self.sites = {s: v for s, v in self.sites.items() if v[1] in keep}
+        for st in list(self.by_type):
+            self.by_type[st] = [s for s in self.by_type[st]
+                                if s in self.sites]
+            if not self.by_type[st]:
+                del self.by_type[st]
+        return f'X{x0}Y{y0}:X{x0 + w - 1}Y{y0 + h - 1}'
+
 
 # Parameter values that are listed as legal but break Vivado.
 BAD_VALUES = {('CE_TYPE', 'HARDSYNC')}
@@ -1842,10 +1869,18 @@ def main():
     ap.add_argument('--pips', default=None, help='target pip list')
     ap.add_argument('--focus', default=None,
                     help='regexp: only use hard site types matching it')
+    ap.add_argument('--region', type=float, default=None,
+                    help='use only a random block of clock regions covering '
+                    'about this fraction of the die')
     args = ap.parse_args()
     die = Die(args.tiles)
     if args.part:
         die.part = args.part
+    if args.region:
+        cr = die.restrict(random.Random(args.seed * 7919 + 1), args.region)
+        with open(os.path.join(os.path.dirname(os.path.abspath(args.out)),
+                               'design.region'), 'w') as f:
+            f.write(f'{cr}\n')
     prims = primlib.load(args.prims)
     generate(die, prims, args.seed, args.out, args.density, pips=args.pips,
              focus=args.focus)
