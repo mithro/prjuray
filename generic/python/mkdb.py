@@ -708,7 +708,7 @@ def pair_bits_of(parts, budget=None):
     return cands[:Correlator.PAIR_BUDGET if budget is None else budget]
 
 
-PAIR_CHUNK = int(os.environ.get('MKDB_PAIR_CHUNK', 200))
+PAIR_CHUNK = int(os.environ.get('MKDB_PAIR_CHUNK', 50))
 
 
 def _pairs_task(item):
