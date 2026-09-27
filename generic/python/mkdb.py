@@ -37,6 +37,7 @@ import bitstream
 import designdata as DD
 import dies as dieslib
 import features as featlib
+import regionmap
 
 
 def tile_regions(tg):
@@ -67,43 +68,50 @@ class Collector:
         self.tile_regions = collections.defaultdict(list)
         for i, r in enumerate(self.regions):
             self.tile_regions[r[0]].append(i)
+        self._rmap = None
+
+    @property
+    def rmap(self):
+        """Vectorised region lookup (regionmap.RegionMap), built lazily."""
+        if self._rmap is None:
+            self._rmap = regionmap.RegionMap(self.regions, self.nbf)
+        return self._rmap
 
     def region_bits(self, ids):
         """Global bit ids -> {region idx: [relative bit names]}"""
+        pos, reg, code = self.rmap.pairs(ids)
+        names = self.rmap.names(code)
         out = collections.defaultdict(list)
-        fis = ids // self.nbf
-        offs = ids % self.nbf
-        for f, o in zip(fis.tolist(), offs.tolist()):
-            for off, n, i in self.by_frame.get(f, ()):
-                if off <= o < off + n:
-                    rfi = self.regions[i][2]
-                    out[i].append(f'{f - rfi:02d}_{o - off:03d}')
+        if not len(reg):
+            return out
+        cut = np.flatnonzero(reg[1:] != reg[:-1]) + 1
+        starts = [0] + cut.tolist()
+        ends = cut.tolist() + [len(reg)]
+        for r, a, b in zip(reg[starts].tolist(), starts, ends):
+            out[r] = names[a:b]
         return out
 
-    def unowned(self, ids):
+    def unowned(self, ids, owned=None):
         """Set bits in no tile's region.  Frame rows without any tile region
         (e.g. fabric the device does not expose, configured but without
         tiles) are not a tile grid gap: their bits that are also set in the
         empty design (baseline) are counted in self.hidden instead (constant
-        baseline bits), the others stay unowned."""
+        baseline bits), the others stay unowned.  owned: optional mask of
+        the ids in some region (RegionMap.owned)."""
         if not hasattr(self, "_hidden_frame"):
             key = [bitstream.far_fields(self.die.arch, f)[:3]
                    for f in self.df.frames]
             used = {key[f] for f in self.by_frame}
-            self._hidden_frame = [k not in used for k in key]
-            self._base = set(self.df.base.tolist())
-        fis = ids // self.nbf
-        offs = ids % self.nbf
-        n = 0
-        self.hidden = 0
-        for i, f, o in zip(ids.tolist(), fis.tolist(), offs.tolist()):
-            if not any(off <= o < off + k
-                       for off, k, _ in self.by_frame.get(f, ())):
-                if self._hidden_frame[f] and i in self._base:
-                    self.hidden += 1
-                else:
-                    n += 1
-        return n
+            self._hidden_frame = np.array([k not in used for k in key],
+                                          dtype=bool)
+            self._base = np.unique(self.df.base)
+        ids = np.asarray(ids, dtype=np.int64)
+        if owned is None:
+            owned = self.rmap.owned(ids)
+        free = ids[~owned]
+        hid = self._hidden_frame[free // self.nbf] & np.isin(free, self._base)
+        self.hidden = int(hid.sum())
+        return int(len(free) - self.hidden)
 
     def samples(self, design_dir, empty_keep=0.2, rng=None):
         """Yields (tile type, region idx within tile, features, bits)."""
