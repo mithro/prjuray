@@ -673,7 +673,22 @@ def _fmt(x):
 # Pins (by regexp) that only connect to package pads or other hard blocks.
 DEDICATED_RE = {
     'PS8': re.compile(r'_PAD_'),
+    # 7-series memory interface blocks: clocks and PHY buses only reach
+    # the SERDES / FIFOs / PHY_CONTROL of the byte group (unroutable from
+    # or to the fabric: "PHASER_IN_PHY.ICLK -> SLICEL.B5").
+    'PHASER_IN_PHY': re.compile(
+        r'^(ICLK|ICLKDIV|RCLK|ISERDESRST|WRENABLE|BURSTPENDINGPHY|'
+        r'RANKSELPHY|ENCALIBPHY|FREQREFCLK|MEMREFCLK|PHASEREFCLK|SYNCIN)'),
+    'PHASER_OUT_PHY': re.compile(
+        r'^(OCLK|OSERDESRST|RDENABLE|CTSBUS|DQSBUS|DTSBUS|'
+        r'BURSTPENDINGPHY|ENCALIBPHY|FREQREFCLK|MEMREFCLK|PHASEREFCLK|'
+        r'SYNCIN)'),
+    'PHY_CONTROL': re.compile(
+        r'^(INBURSTPENDING|INRANK|OUTBURSTPENDING|PCENABLECALIB|MEMREFCLK|'
+        r'SYNCIN|AUXOUTPUT)'),
 }
+DEDICATED_RE['PHASER_IN'] = DEDICATED_RE['PHASER_IN_PHY']
+DEDICATED_RE['PHASER_OUT'] = DEDICATED_RE['PHASER_OUT_PHY']
 # Clock outputs of hard blocks that must drive a given clock buffer.
 CLOCK_OUT_BUFFERS = {
     'PS8': (re.compile(r'^(PLCLK\[\d\]|DP(AUDIO|VIDEO)REFCLK|FMIO\w*TOPLBUFG|'
