@@ -404,12 +404,15 @@ proc dump_features {out} {
     # inverter to produce the constant level.  Such pins are reported as
     # "cfg <site> <site pin> <pin>_LEVEL <0|1>" (the constant after the
     # cell's inversion) instead.
-    set constpin [dict create]
-    foreach n [get_nets -quiet -hierarchical -filter {TYPE == GROUND || TYPE == POWER}] t [_df_props TYPE [get_nets -quiet -hierarchical -filter {TYPE == GROUND || TYPE == POWER}]] {
-        foreach q [get_pins -quiet -leaf -of_objects $n -filter {DIRECTION == IN}] {
-            dict set constpin $q [expr {$t eq "POWER"}]
+    array unset constpin
+    foreach {t lv} {GROUND 0 POWER 1} {
+        set cn [get_nets -quiet -hierarchical -filter "TYPE == $t"]
+        if {![llength $cn]} continue
+        foreach q [get_pins -quiet -leaf -of_objects $cn -filter {DIRECTION == IN}] {
+            set constpin($q) $lv
         }
     }
+    puts $fp "# t_const [expr {[clock milliseconds] - $t0}]"
     set placed [get_cells -quiet -hierarchical -filter {IS_PRIMITIVE && LOC != ""}]
     set byref [dict create]
     foreach c $placed r [_df_props REF_NAME $placed] { dict lappend byref $r $c }
@@ -441,8 +444,8 @@ proc dump_features {out} {
                 }
                 set where [dict get $sitepin $k]
                 if {$where eq ""} { set where [lindex [split $b .] end] }
-                if {[dict exists $constpin $c/$pin]} {
-                    set level [expr {[dict get $constpin $c/$pin] ^ [string match *1 $v]}]
+                if {[info exists constpin($c/$pin)]} {
+                    set level [expr {$constpin($c/$pin) ^ [string match *1 $v]}]
                     set line "cfg $s $where ${pin}_LEVEL $level"
                 } else {
                     set line "cfg $s $where $p $v"
