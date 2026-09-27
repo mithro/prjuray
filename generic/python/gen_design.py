@@ -62,6 +62,8 @@ class Die:
                 crs[tile] = (int(m.group(1)), int(m.group(2)))
         if not crs:
             return None
+        self.nslices_full = sum(len(self.by_type.get(st, []))
+                                for st in ('SLICEL', 'SLICEM'))
         nx = max(x for x, _ in crs.values()) + 1
         ny = max(y for _, y in crs.values()) + 1
         w = max(1, min(nx, round(nx * frac ** 0.5)))
@@ -1786,8 +1788,10 @@ def generate(die, prims, seed, out, density, hard=True, pips=None,
     for s in rng.sample(bufg_sites, min(len(bufg_sites), rng.randint(1, 6))):
         recipe_bufg(d, s)
     nslices = sum(len(die.by_type.get(st, [])) for st in ('SLICEL', 'SLICEM'))
-    # Bound the design size on large dies.
-    density = min(density, 4000.0 / max(1, nslices))
+    # Bound the design size on large dies (a --region design keeps the
+    # density bound of the whole die: denser blocks hang the router).
+    density = min(density, 4000.0 / max(1, getattr(die, 'nslices_full',
+                                                    nslices)))
     for st in ('SLICEL', 'SLICEM'):
         for s in die.by_type.get(st, []):
             if rng.random() < density:
