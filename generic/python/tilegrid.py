@@ -317,16 +317,31 @@ def collect(die, design_root, verbose=False):
     cols = frame_columns(dframes)
     block0 = {k: v for k, v in cols.items() if k[0] == 0}
 
+    # The per frame change patterns of the windows at the current rows
+    # (lo, n), cached per frame column: the tiles are visited sorted by
+    # window, so consecutive tiles share them (big dies: hours without).
+    mask_cache = {}
+    cache_rows = [None]
+
+    def window_masks(first, nfr, lo, n):
+        if cache_rows[0] != (lo, n):
+            mask_cache.clear()
+            cache_rows[0] = (lo, n)
+        m = mask_cache.get((first, nfr))
+        if m is None:
+            masks = np.bitwise_or.reduce(act[first:first + nfr, lo:lo + n],
+                                         axis=1)
+            m = mask_cache[(first, nfr)] = set(to_int(x) for x in masks)
+        return m
+
     def col_score(u, col, lo, n):
         """Similarity between a tile usage mask and a column window: the
         better of the whole window change pattern and the best single frame
         change pattern (tiles sharing a column use different frames)."""
         _, first, nfr = col
-        masks = np.bitwise_or.reduce(act[first:first + nfr, lo:lo + n],
-                                     axis=1)
         best = 0.0
         whole = 0
-        for m in set(to_int(x) for x in masks):
+        for m in window_masks(first, nfr, lo, n):
             whole |= m
             if m:
                 best = max(best, bin(u & m).count('1') / bin(u | m).count('1'))
@@ -346,6 +361,7 @@ def collect(die, design_root, verbose=False):
         if w is None:
             continue
         tiles_used.append((t, u, w))
+    tiles_used.sort(key=lambda x: (x[2][1], x[2][2], x[0]))
     # 1. Frame row of each clock region row: vote with sparse used tiles.
     rowvote = collections.defaultdict(collections.Counter)
     for t, u, (cr, lo, n) in tiles_used:
