@@ -50,6 +50,11 @@ def _std_vcco():
 
 _VCCO = None
 
+_OLOGIC_CLKINV = re.compile(r'^(OLOGIC_X\d+Y\d+)\.CLKINV\.SP\.(CLK|CLK_B)\.OUT$')
+_OCLK_TO_OLOGIC = re.compile(r'^IOI_OCLK_(\d)->IOI_OLOGIC\1_CLK$')
+_TO_OCLK = re.compile(r'^(\S+)->IOI_OCLK_(\d)$')
+_TO_OCLKM = re.compile(r'^\S+->IOI_OCLKM_(\d)$')
+
 # BEL -> (setting, conditioning setting) pairs, see tile_features.
 _STD_CONDITIONED = {
     'OUTBUF': (('SLEW', 'OSTANDARD'), ('DRIVE', 'OSTANDARD')),
@@ -207,6 +212,36 @@ def tile_features(path, sitekeys):
         vs = {_VCCO.get(x) for x in stds}
         if len(vs) == 1 and None not in vs:
             feats[tile].add(f'{key}.BANK.VCCO={vs.pop()}')
+    # 7-series IOI: an OLOGIC clocked through IOI_OCLK_<n> also gets the
+    # OCLKM_<n> mux (its inverted clock) set to the same source, a pip the
+    # route does not report (prjxray IOI_OCLKM_1.IOI_LEAF_GCLK5 = 30_30
+    # 30_38 30_44: set with GCLK5->OCLK_1 only when OLOGIC1 uses OCLK_1).
+    for tile, fs in feats.items():
+        used = {m.group(1) for f in fs
+                for m in [_OCLK_TO_OLOGIC.match(f)] if m}
+        if not used:
+            continue
+        have_m = {m.group(1) for f in fs for m in [_TO_OCLKM.match(f)] if m}
+        for f in list(fs):
+            m = _TO_OCLK.match(f)
+            if m and m.group(2) in used and m.group(2) not in have_m:
+                fs.add(f'{m.group(1)}->IOI_OCLKM_{m.group(2)}')
+    # 7-series OLOGIC: one bit per OLOGIC (prjxray "ODDR.DDR_CLK_EDGE.
+    # SAME_EDGE", LIOI3 31_92 / 30_35) is set when the clock edge setting
+    # and the clock inversion agree: SAME_EDGE (ODDR, and OSERDES / FF
+    # which are same edge) with CLK, or OPPOSITE_EDGE with CLK_B (xa7a12t:
+    # exact over 41 set / 36 clear samples).  Name the pair.
+    for tile, fs in feats.items():
+        for f in list(fs):
+            m = _OLOGIC_CLKINV.match(f)
+            if not m:
+                continue
+            key, inv = m.group(1), m.group(2)
+            edge = 'SAME_EDGE'
+            if f'{key}.OUTFF.ODDR_CLK_EDGE=OPPOSITE_EDGE' in fs and \
+                    f'{key}.OUTFF.OUTFFTYPE=DDR' in fs:
+                edge = 'OPPOSITE_EDGE'
+            fs.add(f'{key}.CLKINV.SP.{inv}.OUT@CLK_EDGE={edge}')
     # 7-series FIFO almost full / empty offsets are stored adjusted (and
     # inverted): full = ALMOST_FULL_OFFSET + 1 without EN_SYN, empty =
     # ALMOST_EMPTY_OFFSET - 1 without EN_SYN with FIRST_WORD_FALL_THROUGH
