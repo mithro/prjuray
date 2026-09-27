@@ -50,6 +50,7 @@ def _std_vcco():
 
 _VCCO = None
 
+_DSP_REG = re.compile(r'^(DSP48_X\d+Y\d+)\.DSP48E1\.([AB])REG=(\d)$')
 _OLOGIC_CLKINV = re.compile(r'^(OLOGIC_X\d+Y\d+)\.CLKINV\.SP\.(CLK|CLK_B)\.OUT$')
 _OCLK_TO_OLOGIC = re.compile(r'^IOI_OCLK_(\d)->IOI_OLOGIC\1_CLK$')
 _TO_OCLK = re.compile(r'^(\S+)->IOI_OCLK_(\d)$')
@@ -253,6 +254,26 @@ def tile_features(path, sitekeys):
                     f'{key}.OUTFF.OUTFFTYPE=DDR' in fs:
                 edge = 'OPPOSITE_EDGE'
             fs.add(f'{key}.CLKINV.SP.{inv}.OUT@CLK_EDGE={edge}')
+    # 7-series DSP48E1: the "AREG_0" / "BREG_0" bits (prjxray, DSP_L 27_111
+    # / 27_038, 27_271 / 27_198) are set for AREG=0, and for AREG=1 when
+    # INMODE[0] (A1/A2 select; INMODE[4] for B) is tied to ground
+    # (xa7a12t r9: exact, 93 / 84 set samples).  Name the register setting
+    # together with the source of its select input.
+    for tile, fs in feats.items():
+        for f in list(fs):
+            m = _DSP_REG.match(f)
+            if not m:
+                continue
+            key, port, val = m.group(1), m.group(2), m.group(3)
+            k = key[-1]
+            pin = f'DSP_{k}_INMODE{0 if port == "A" else 4}'
+            src = 'NONE'
+            for g in fs:
+                if g.endswith('->' + pin):
+                    src = ('GND' if '_GND_' in g else 'VCC' if '_VCC_' in g
+                           else 'FABRIC')
+                    break
+            fs.add(f'{key}.DSP48E1.{port}REG={val}@{pin[6:]}={src}')
     # 7-series FIFO almost full / empty offsets are stored adjusted (and
     # inverted): full = ALMOST_FULL_OFFSET + 1 without EN_SYN, empty =
     # ALMOST_EMPTY_OFFSET - 1 without EN_SYN with FIRST_WORD_FALL_THROUGH
