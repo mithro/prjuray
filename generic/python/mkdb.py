@@ -26,6 +26,8 @@ import collections
 import json
 import os
 import pickle
+import resource
+import time
 import zlib
 
 import numpy as np
@@ -111,46 +113,104 @@ class Collector:
                 yield self.regions[i][1], k, fs, bits
 
 
+def _packed(rows, S, n):
+    """Bit-packed (n x ceil(S/64) uint64) matrix from rows: a list, per
+    sample s, of the row indices set in column s (bit s % 64 of word
+    s // 64, as np.packbits(..., bitorder='little') of a dense matrix)."""
+    W = (S + 63) // 64
+    P = np.zeros((n, W), dtype=np.uint64)
+    lens = np.fromiter((len(r) for r in rows), dtype=np.int64, count=S)
+    if lens.sum():
+        r = np.concatenate([np.asarray(x, dtype=np.int64) for x in rows])
+        s = np.repeat(np.arange(S, dtype=np.int64), lens)
+        np.bitwise_or.at(P, (r, s // 64),
+                         np.left_shift(np.uint64(1),
+                                       (s % 64).astype(np.uint64)))
+    return P
+
+
+class PackedRows:
+    """Bit-packed row x sample matrix built one sample at a time, rows
+    created on first use (names interned).  Records, per row, the first
+    sample (and position in that sample's list) it appeared in."""
+
+    def __init__(self, S):
+        self.S = S
+        self.W = (S + 63) // 64
+        self.P = np.zeros((1024, self.W), dtype=np.uint64)
+        self.ids = {}
+        self.first = np.full(1024, np.iinfo(np.int64).max, dtype=np.int64)
+        self.firstpos = np.zeros(1024, dtype=np.int64)
+
+    def add(self, s, names):
+        if not names:
+            return
+        ids = np.fromiter((self.ids.setdefault(n, len(self.ids))
+                           for n in names), dtype=np.int64, count=len(names))
+        n = len(self.ids)
+        if n > len(self.P):
+            cap = max(n, 2 * len(self.P))
+            self.P = np.concatenate(
+                [self.P, np.zeros((cap - len(self.P), self.W), np.uint64)])
+            self.first = np.concatenate([self.first, np.full(
+                cap - len(self.first), np.iinfo(np.int64).max, np.int64)])
+            self.firstpos = np.concatenate(
+                [self.firstpos, np.zeros(cap - len(self.firstpos), np.int64)])
+        # Names within one sample are distinct: plain fancy indexing.
+        self.P[ids, s // 64] |= np.uint64(1) << np.uint64(s % 64)
+        m = s < self.first[ids]
+        self.first[ids[m]] = s
+        self.firstpos[ids[m]] = np.nonzero(m)[0]
+
+    def rows(self, order):
+        """(matrix, names) with the rows in the given name order."""
+        return self.P[[self.ids[n] for n in order]], list(order)
+
+    def first_order(self):
+        """Names in order of first appearance over the samples."""
+        n = len(self.ids)
+        names = list(self.ids)
+        o = np.lexsort((self.firstpos[:n], self.first[:n]))
+        return [names[i] for i in o]
+
+
 def correlate(samples):
     """samples: list of (features set, bits list).  Returns dict."""
-    S = len(samples)
     # Features in sorted order: the greedy covers break ties by index, and
     # the iteration order of sets of strings changes from run to run.
-    fidx = {f: i for i, f in enumerate(sorted(set().union(
-        *(fs for fs, _ in samples))))}
+    fnames = sorted(set().union(*(fs for fs, _ in samples)))
+    fidx = {f: i for i, f in enumerate(fnames)}
     bidx = {}
     for fs, bs in samples:
         for b in bs:
             bidx.setdefault(b, len(bidx))
-    nF, nB = len(fidx), len(bidx)
-    Fm = np.zeros((nF, S), dtype=bool)
-    Bm = np.zeros((nB, S), dtype=bool)
-    empty = np.zeros(S, dtype=bool)
-    for s, (fs, bs) in enumerate(samples):
-        for f in fs:
-            Fm[fidx[f], s] = True
-        for b in bs:
-            Bm[bidx[b], s] = True
-        empty[s] = not fs
-    def pack64(m):
-        pad = (-m.shape[1]) % 64
-        if pad:
-            m = np.concatenate([m, np.zeros((m.shape[0], pad), dtype=bool)],
-                               axis=1)
-        return np.packbits(m, axis=1, bitorder='little').view(np.uint64)
+    return correlate_ids([[fidx[f] for f in fs] for fs, _ in samples],
+                         [[bidx[b] for b in bs] for _, bs in samples],
+                         fnames, list(bidx))
 
-    PF = pack64(Fm)
-    PB = pack64(Bm)
-    nf = Fm.sum(axis=1)
-    nb = Bm.sum(axis=1)
-    nempty = int(empty.sum())
-    fnames = [None] * nF
-    for f, i in fidx.items():
-        fnames[i] = f
-    bnames = [None] * nB
-    for b, i in bidx.items():
-        bnames[i] = b
-    full = pack64(np.ones((1, S), dtype=bool))[0]
+
+def correlate_ids(frows, brows, fnames, bnames):
+    """correlate() on samples given as feature / bit index lists (frows[s],
+    brows[s]) into fnames / bnames.  Works on bit-packed matrices only
+    (memory ~ (features + bits) x samples / 8 bytes)."""
+    S = len(frows)
+    emptyv = np.fromiter((not len(r) for r in frows), dtype=bool, count=S)
+    return correlate_packed(_packed(frows, S, len(fnames)),
+                            _packed(brows, S, len(bnames)), emptyv, fnames,
+                            bnames)
+
+
+def correlate_packed(PF, PB, emptyv, fnames, bnames):
+    """correlate() on bit-packed feature / bit matrices (rows fnames /
+    bnames, bit s of the rows = sample s; emptyv[s]: sample s has no
+    features)."""
+    S = len(emptyv)
+    nF, nB = len(fnames), len(bnames)
+    nf = np.bitwise_count(PF).sum(axis=1).astype(np.int64)
+    nb = np.bitwise_count(PB).sum(axis=1).astype(np.int64)
+    nempty = int(emptyv.sum())
+    EM = _packed([[0] if e else [] for e in emptyv], S, 1)[0]
+    full = _packed([[0]] * S, S, 1)[0]
 
     def popcount(a):
         return int(np.bitwise_count(a).sum())
@@ -233,7 +293,7 @@ def correlate(samples):
     feat_bits = collections.defaultdict(list)
     defaults = {}
     unexplained = {}
-    empty_rows = Bm[:, empty]
+    empty_set = np.bitwise_count(PB & EM).sum(axis=1)
     # Fast path: features whose sample pattern equals the bit pattern.
     exact = collections.defaultdict(list)
     for f in range(nF):
@@ -243,7 +303,7 @@ def correlate(samples):
         pb = PB[b]
         # Default: set in (almost) every unused instance; the few exceptions
         # are tiles used in ways the feature dump does not see.
-        is_default = nempty > 0 and empty_rows[b].sum() >= 0.97 * nempty
+        is_default = nempty > 0 and empty_set[b] >= 0.97 * nempty
         key = (full & ~pb).tobytes() if is_default else pb.tobytes()
         if key in exact:
             if is_default:
@@ -406,30 +466,46 @@ def _type_task(task):
     """Worker: gathers the selected samples of one (tile type, region) from
     the design caches, correlates them and writes the database files."""
     outdir, (tt, k), designs, sel_used, sel_empty = task
-    pos_u = {g: i for i, g in enumerate(sel_used)}
-    pos_e = {g: i for i, g in enumerate(sel_empty)}
-    used = [None] * len(sel_used)
-    empty = [None] * len(sel_empty)
+    t0 = time.time()
+    nu_sel = len(sel_used)
+    pos = {('u', g): i for i, g in enumerate(sel_used)}
+    pos.update({('e', g): nu_sel + i for i, g in enumerate(sel_empty)})
+    # The samples go straight into bit-packed matrices (holding them as
+    # lists of strings took tens of GiB for block RAM tiles with thousands
+    # of INIT features per sample).
+    S = nu_sel + len(sel_empty)
+    FR, BR = PackedRows(S), PackedRows(S)
+    emptyv = np.zeros(S, dtype=bool)
     gu = ge = 0
     for path, nu, ne in designs:
-        if not any(g in pos_u for g in range(gu, gu + nu)) and \
-                not any(g in pos_e for g in range(ge, ge + ne)):
+        if not any(('u', g) in pos for g in range(gu, gu + nu)) and \
+                not any(('e', g) in pos for g in range(ge, ge + ne)):
             gu += nu
             ge += ne
             continue
         off, n = dict(_read_index(path)['keys'])[(tt, k)][:2]
         cu, ce = _read_chunk(path, off, n)
-        for x in cu:
-            i = pos_u.get(gu)
-            if i is not None:
-                used[i] = x
-            gu += 1
-        for x in ce:
-            i = pos_e.get(ge)
-            if i is not None:
-                empty[i] = x
-            ge += 1
-    res = correlate(used + empty)
+        for kind, chunk in (('u', cu), ('e', ce)):
+            for fs, bs in chunk:
+                g = gu if kind == 'u' else ge
+                i = pos.get((kind, g))
+                if i is not None:
+                    FR.add(i, fs)
+                    BR.add(i, bs)
+                    emptyv[i] = not fs
+                if kind == 'u':
+                    gu += 1
+                else:
+                    ge += 1
+        del cu, ce
+    # Same indexing as correlate(): features sorted, bits in order of first
+    # appearance over the samples.
+    del pos
+    PF, fnames = FR.rows(sorted(FR.ids))
+    del FR
+    PB, bnames = BR.rows(BR.first_order())
+    del BR
+    res = correlate_packed(PF, PB, emptyv, fnames, bnames)
     write_db(outdir, tt, k, res)
     nexp = len(res['unexplained'])
     summary = dict(samples=res['samples'], empty=res['empty'],
@@ -438,7 +514,9 @@ def _type_task(task):
     line = (f'{tt}.{k}: samples {res["samples"]} empty {res["empty"]} '
             f'feat {res["nfeat"]} with-bits {len(res["feat_bits"])} '
             f'defaults {len(res["defaults"])} unexplained {nexp}')
-    return (tt, k), summary, line
+    # Peak memory of this worker process (one task per process).
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+    return (tt, k), summary, line, peak, time.time() - t0
 
 
 def main():
@@ -455,7 +533,7 @@ def main():
     args = ap.parse_args()
     import random
     import time
-    from concurrent.futures import ProcessPoolExecutor
+    from concurrent.futures import ProcessPoolExecutor, as_completed
     rng = random.Random(0)
     outdir = os.path.join(dieslib.DB, args.arch)
     cache = args.cache or os.path.join(outdir, 'cache')
@@ -474,11 +552,16 @@ def main():
     t0 = time.time()
     per_key = {}  # key -> [(cache path, used, empty)], first seen order
     with ProcessPoolExecutor(args.jobs) as ex:
-        for item, keys in zip(work, ex.map(_cache_one, work, chunksize=2)):
+        for n, (item, keys) in enumerate(
+                zip(work, ex.map(_cache_one, work, chunksize=2)), 1):
             for key, nu, ne in keys:
                 if only and key[0] not in only:
                     continue
                 per_key.setdefault(key, []).append((item[3], nu, ne))
+            if n % 50 == 0 or n == len(work):
+                el = time.time() - t0
+                print(f'# samples {n}/{len(work)} designs, {el:.0f} s, eta '
+                      f'{el / n * (len(work) - n):.0f} s', flush=True)
     print(f'# samples of {len(work)} designs in {time.time() - t0:.0f} s',
           flush=True)
     # Bound the work per tile type: keep a random subset of the samples
@@ -495,9 +578,19 @@ def main():
     # Phase 2: one task per (tile type, region), largest first.
     tasks.sort(key=lambda t: -(len(t[3]) + len(t[4])))
     results = {}
-    with ProcessPoolExecutor(min(len(tasks), args.jobs) or 1) as ex:
-        for key, summary, line in ex.map(_type_task, tasks):
+    t0 = time.time()
+    # One task per process: a task's peak memory is returned to the system
+    # when it ends (and measured).
+    with ProcessPoolExecutor(min(len(tasks), args.jobs) or 1,
+                             max_tasks_per_child=1) as ex:
+        futs = {ex.submit(_type_task, t): t for t in tasks}
+        for n, f in enumerate(as_completed(futs), 1):
+            key, summary, line, peak, dt = f.result()
             results[key] = (summary, line)
+            el = time.time() - t0
+            print(f'# task {n}/{len(tasks)} {key[0]}.{key[1]} samples '
+                  f'{summary["samples"]} {dt:.0f} s peak '
+                  f'{peak / 2**30:.2f} GiB; elapsed {el:.0f} s', flush=True)
     summary = {}
     for (tt, k) in sorted(results):
         s, line = results[(tt, k)]
