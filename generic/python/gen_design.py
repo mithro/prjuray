@@ -1925,7 +1925,19 @@ def generate(die, prims, seed, out, density, hard=True, pips=None,
         delays = any(r.startswith(('IDELAYE', 'ODELAYE')) for r in used) or \
             any(re.search(r' (IDELAYE|ODELAYE)\w* ', l) for l in d.lines)
         if delays and 'IDELAYCTRL' in prims and 'IDELAYCTRL' not in used:
-            n = d.cell('IDELAYCTRL')
+            if not is_us(die):
+                # One I/O delay group with the controller: a delay that is
+                # not tied to a pad (DELAY_SRC DATAIN, no LOC) is otherwise
+                # not associated with it ("Found un-associated IO delay
+                # instances", Place 30-578); Vivado replicates the grouped
+                # controller per clock region.
+                d.lines = [re.sub(r'^(nl_cell \S+ (IDELAYE2|ODELAYE2) \{)',
+                                  r'\1IODELAY_GROUP {nl_dly} ', l)
+                           for l in d.lines]
+                n = d.cell('IDELAYCTRL', None, None,
+                           {'IODELAY_GROUP': 'nl_dly'})
+            else:
+                n = d.cell('IDELAYCTRL')
             # REFCLK: from a global buffer (not a pad: unroutable).
             d.add_sink(f'{n}/REFCLK', die.by_type['SLICEL'][0], 'gclock')
             d.add_sink(f'{n}/RST', die.by_type['SLICEL'][0])
