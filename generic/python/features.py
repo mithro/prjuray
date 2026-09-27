@@ -16,6 +16,8 @@ Feature naming (relative to the tile, prefixed by the tile type in the DB):
   <SITEKEY>.BANK.IOSTD=<std>       an I/O standard used in the pad's bank
   <SITEKEY>.BANK.VCCO=<volts>      the bank's VCCO (from its I/O standards)
   <SITEKEY>.PAD.PULLTYPE=<v>       pull resistor of a used pad
+  <SITEKEY>.<BEL>.<CFG>=<v>@<STD>=<s>  I/O buffer setting together with its
+                                   I/O standard (SLEW, DRIVE, IN_TERM, ...)
   <vector bit feature>@<W>=<v>     vector bit together with a WIDTH setting
                                    <W> of the same BEL (same port suffix)
 
@@ -47,6 +49,12 @@ def _std_vcco():
 
 
 _VCCO = None
+
+# BEL -> (setting, conditioning setting) pairs, see tile_features.
+_STD_CONDITIONED = {
+    'OUTBUF': (('SLEW', 'OSTANDARD'), ('DRIVE', 'OSTANDARD')),
+    'INBUF_EN': (('IN_TERM', 'ISTANDARD'), ('IBUF_LOW_PWR', 'ISTANDARD')),
+}
 
 PAD_SITE = re.compile(r'^(IOB|HPIOB|HRIO|HDIOB|IOPAD|IPAD|OPAD)')
 
@@ -199,6 +207,15 @@ def tile_features(path, sitekeys):
         vs = {_VCCO.get(x) for x in stds}
         if len(vs) == 1 and None not in vs:
             feats[tile].add(f'{key}.BANK.VCCO={vs.pop()}')
+    # I/O buffer settings whose bits depend on the I/O standard (7-series
+    # SLEW / DRIVE / IN_TERM bits differ between standard families): also
+    # name them together with the standard.
+    for (tile, prefix), cfgs in bel_cfgs.items():
+        bel = prefix.rsplit('.', 1)[-1]
+        for name, cond in _STD_CONDITIONED.get(bel, ()):
+            if name in cfgs and cond in cfgs:
+                feats[tile].add(f'{prefix}.{name}={cfgs[name]}@{cond}='
+                                f'{cfgs[cond]}')
     # The physical layout of some vector settings depends on a width setting
     # of the same BEL (e.g. BRAM INIT_A/SRVAL_A are replicated for narrow
     # READ_WIDTH_A): also name the vector bits together with the width.
