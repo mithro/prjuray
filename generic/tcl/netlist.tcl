@@ -36,9 +36,11 @@ proc nl_init {part} {
     set threads 2
     if {[info exists ::env(NL_THREADS)]} { set threads $::env(NL_THREADS) }
     set_param general.maxThreads $threads
-    # Router time limit (seconds): route_design otherwise can iterate for
-    # hours on a few overlapping nodes; stopped, it reports the unrouted
-    # nets and the repair loop goes on.
+    # Router time limit (seconds, NL_ROUTE_TIMELIMIT).  Note: it does not
+    # interrupt a global router iteration (an xazu7ev design spent 42 min
+    # in 'Global Iteration 0' with a 300 s limit); the repair budget and
+    # the runner's time limit (scaled for --region designs) are what bound
+    # hung routes.
     if {[info exists ::env(NL_ROUTE_TIMELIMIT)]} {
         set_param route.timeLimit $::env(NL_ROUTE_TIMELIMIT)
     }
