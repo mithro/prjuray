@@ -60,6 +60,16 @@ throughput:
 * `--threads T`: Vivado `general.maxThreads` (default 2).  Vivado runs
   mostly single threaded; T=1 uses the same CPU time per design.
 
+Memory: always start runs through `generic/vrun.sh <name> <MemoryMax>
+<command...>`, which puts the job into its own transient systemd scope in
+the shared `vivado.slice` with a hard memory cap (out of memory only kills
+that job, never the shell it was started from) and prints the scope's
+`memory.peak` on exit.  Size `--jobs` from measured peaks, not cores:
+`jobs ≈ cap / (peak × 1.2)`.  Measured single job peaks (Vivado 2025.2):
+xa7s15 2.8 GiB (`--reuse 4`), xc7k160t 4.8 GiB (`--reuse 2`), xcku025
+7.4 GiB per design.  An OOM kill (exit 143) is a retryable failure: lower
+`--jobs`.
+
 For long campaigns and several machines, `python/scheduler.py` keeps the
 work items as files in a queue directory (`submit` them, start any number
 of `work` runners on machines sharing the file system, `status`,
