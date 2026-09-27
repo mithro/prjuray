@@ -216,6 +216,8 @@ def main():
     w.add_argument('--jobs', type=int, default=16)
     w.add_argument('--reuse', type=int, default=1)
     w.add_argument('--threads', type=int, default=2)
+    w.add_argument('--directive', default=None,
+                   help='place_design/route_design directive (e.g. Quick)')
     w.add_argument('--timeout', type=int, default=None)
     w.add_argument('--wait', action='store_true',
                    help='keep polling for new work (stop: touch <queue>/STOP)')
@@ -227,6 +229,8 @@ def main():
                    help='also items of live runners of this host')
     args = ap.parse_args()
     rd.install_cleanup()
+    if args.cmd == 'work':
+        rd.set_directive(args.directive)
     {'submit': submit, 'work': work, 'status': status,
      'requeue': requeue}[args.cmd](args)
 

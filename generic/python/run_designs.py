@@ -143,6 +143,14 @@ def tree_cpu(pid):
     return tree_stats(pid)[0]
 
 
+def set_directive(d):
+    """place_design/route_design -directive for the designs run by this
+    process (netlist.tcl reads NL_PLACE_DIRECTIVE/NL_ROUTE_DIRECTIVE)."""
+    if d:
+        os.environ['NL_PLACE_DIRECTIVE'] = d
+        os.environ['NL_ROUTE_DIRECTIVE'] = d
+
+
 def vivado_env(threads):
     env = dict(os.environ)
     env['NL_THREADS'] = str(threads)
@@ -364,7 +372,8 @@ def run_one(die, seed, wdir, gen_args, timeout, threads, pool=None):
         return seed, 'cached'
     t0 = time.time()
     stats = {'start': t0, 'host': socket.gethostname(), 'threads': threads,
-             'reuse': pool.reuse if pool else 1}
+             'reuse': pool.reuse if pool else 1,
+             'directive': os.environ.get('NL_PLACE_DIRECTIVE', '')}
     status, cpu, rss = 'generror', 0.0, 0
     if not timeout:
         timeout = timeout_of(die)
@@ -415,6 +424,8 @@ def main():
     ap.add_argument('--jobs', type=int, default=16)
     ap.add_argument('--timeout', type=int, default=None,
                     help='seconds per design (default: 2 x repair budget + 600)')
+    ap.add_argument('--directive', default=None,
+                    help='place_design/route_design directive (e.g. Quick)')
     ap.add_argument('--threads', type=int, default=2,
                     help='Vivado general.maxThreads')
     ap.add_argument('--reuse', type=int, default=1,
@@ -425,6 +436,7 @@ def main():
     ap.add_argument('gen_args', nargs='*')
     args = ap.parse_args()
     install_cleanup()
+    set_directive(args.directive)
     alldies = dieslib.load()
     dlist = [alldies[n] for n in args.die.split(',')]
     first, last = map(int, args.seeds.split(':'))
