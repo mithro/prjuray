@@ -742,6 +742,18 @@ def edge_variants(grid, out, verbose=False):
         print('edge variants', ' '.join(sorted(split)))
 
 
+def inert_types(die):
+    """Tile types with neither PIPs nor sites (Vivado tile type table)."""
+    out = set()
+    with open(die.types_txt) as f:
+        for line in f:
+            p = line.split()
+            if p and p[0] == 'tiletype' and int(p[4]) == 0 and \
+                    int(p[5]) == 0:
+                out.add(p[1])
+    return out
+
+
 def build(grid, dframes, cols, crmap, colmap, colmap1, verbose=False,
           tilemap=None, frame_caps=None):
     """Returns the tilegrid dict: tile -> {type, gx, gy, bits: [...]}.
@@ -758,10 +770,13 @@ def build(grid, dframes, cols, crmap, colmap, colmap1, verbose=False,
         for col, first, nfr in clist:
             colinfo[(key, col)] = (first, nfr)
     out = {}
+    # Tile types without PIPs and sites (e.g. Series7 HCLK_FIFO_L, breaks,
+    # terminations) own no configuration bits: no region (like prjxray).
+    inert = inert_types(grid.die)
     for name, t in grid.tiles.items():
         w = grid.tile_window(name)
         entry = dict(type=t['type'], gx=t['gx'], gy=t['gy'], bits=[])
-        if w is not None:
+        if w is not None and t['type'] not in inert:
             cr, lo, n = w
             key = crmap.get(cr)
             col = tilemap.get(name, colmap.get((cr, t['gx'])))

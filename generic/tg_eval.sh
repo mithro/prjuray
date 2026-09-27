@@ -24,8 +24,11 @@ one() {  # one <name> <tilegrid.json>
     URAY_DB=$E "$G/vrun.sh" "tg-mkdb-$1" 8G python3 "$G/python/mkdb.py" --arch "$arch" \
         --dies "$die" --tag "$tags" --jobs 6 > "$B/logs/tg_mkdb_$1.log" 2>&1 ||
         { echo "mkdb $1 failed: $(tail -n 1 "$B/logs/tg_mkdb_$1.log")"; return 1; }
+    # check.py exits 1 whenever there are undocumented bits: judge by its
+    # summary line instead
     URAY_DB=$E "$G/vrun.sh" "tg-check-$1" 6G python3 "$G/python/check.py" --die "$die" \
-        --designs "$B/designs/$die/$ctag" --max 20 --jobs 3 > "$E/check_$die.log.tmp" 2>&1 ||
+        --designs "$B/designs/$die/$ctag" --max 20 --jobs 3 > "$E/check_$die.log.tmp" 2>&1
+    grep -q '^unowned total' "$E/check_$die.log.tmp" ||
         { echo "check $1 failed: $(tail -n 1 "$E/check_$die.log.tmp")"; return 1; }
     mv "$E/check_$die.log.tmp" "$E/check_$die.log"
 }
