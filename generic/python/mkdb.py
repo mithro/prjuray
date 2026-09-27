@@ -300,16 +300,34 @@ class Correlator:
                 PF[r:r + step][:, nzw] & t).sum(axis=1)
         return cnt
 
-    def pair_cover(self, target, is_default, pb, K=40):
+    def pair_cover(self, target, is_default, pb, K=40, residual=None):
         """Greedy cover of target with single features and pairwise
-        conjunctions of the K features most often present in target."""
+        conjunctions of the K features most often present in target.
+        With residual (the part of target single features do not explain),
+        residual is covered, with the K features most over-represented in
+        it (count minus the count expected from their overall frequency:
+        ubiquitous features do not crowd out the informative ones)."""
         PF, nF, fnames, popcount = self.PF, self.nF, self.fnames, \
             self.popcount
+        if residual is not None:
+            cnt = self.count_in(residual).astype(np.int64)
+            score = cnt - self.nf * (popcount(residual) / self.S)
+            score[cnt < 2] = -np.inf
+            top = [int(i) for i in np.argsort(-score, kind='stable')[:K]
+                   if cnt[i] >= 2]
+            return self._pairs_from(top, residual, is_default, pb)
         # (Signed: with the unsigned counts -cnt sorted the absent features
         # first and top was empty for almost every bit.)
         cnt = self.count_in(target).astype(np.int64)
         top = [int(i) for i in np.argsort(-cnt, kind='stable')[:K]
                if cnt[i] > 0]
+        return self._pairs_from(top, target, is_default, pb)
+
+    def _pairs_from(self, top, target, is_default, pb):
+        """Greedy cover of target with the candidate features top and
+        their pairwise conjunctions (only ones never present without the
+        bit set / clear, seen at least twice and unlikely by chance)."""
+        PF, fnames, popcount = self.PF, self.fnames, self.popcount
         if not top:
             return [], popcount(target)
         T = PF[top]  # K x W
@@ -394,15 +412,33 @@ class Correlator:
                         left, bool(left and nb[b] >= 10)))
         return out
 
-    def pairs(self, bs):
-        """Pair covers of bits bs: {b: (names, left)}."""
+    def pairs(self, bs, parts=None):
+        """Pair covers of bits bs: {b: (names, left)}.  With the bits()
+        parts (and PAIR_RESIDUAL), of what the single features chosen for
+        the bit leave unexplained."""
+        chosen = {}
+        if parts is not None and PAIR_RESIDUAL:
+            if not hasattr(self, 'fidx'):
+                self.fidx = {f: i for i, f in enumerate(self.fnames)}
+            want = set(bs)
+            for part in parts:
+                for r in part:
+                    if r[0] in want:
+                        chosen[r[0]] = [self.fidx[n] for n in r[2]]
         res = {}
         for b in bs:
             pb = self.PB[b]
             is_default = self.nempty > 0 and self.popcount(
                 pb & self.EM) >= 0.97 * self.nempty
             target = (self.full & ~pb) if is_default else pb
-            res[b] = self.pair_cover(target, is_default, pb)
+            if b in chosen:
+                residual = target.copy()
+                for f in chosen[b]:
+                    residual &= ~self.PF[f]
+                res[b] = self.pair_cover(target, is_default, pb,
+                                         residual=residual)
+            else:
+                res[b] = self.pair_cover(target, is_default, pb)
         return res
 
     def pair_bits(self, parts):
@@ -445,7 +481,7 @@ def correlate_packed(PF, PB, emptyv, fnames, bnames):
     """correlate() on bit-packed matrices (see Correlator), in one go."""
     c = Correlator(PF, PB, emptyv, fnames, bnames)
     parts = [c.bits()]
-    return c.finish(parts, c.pairs(c.pair_bits(parts)))
+    return c.finish(parts, c.pairs(c.pair_bits(parts), parts))
 
 
 def write_db(outdir, ttype, k, res):
@@ -641,6 +677,7 @@ def split_parts(nF, nB, S):
 
 SPLIT_COST = int(float(os.environ.get('MKDB_SPLIT_COST', 2e11)))
 PAIR_CHANCE = os.environ.get("MKDB_PAIR_CHANCE", "1") == "1"
+PAIR_RESIDUAL = os.environ.get("MKDB_PAIR_RESIDUAL", "1") == "1"
 
 
 def _load_split(sdir):
@@ -667,7 +704,7 @@ def _finish_task(item):
     outdir, (tt, k), sdir, parts = item
     t0 = time.time()
     c = _load_split(sdir)
-    res = c.finish(parts, c.pairs(c.pair_bits(parts)))
+    res = c.finish(parts, c.pairs(c.pair_bits(parts), parts))
     del c
     shutil.rmtree(sdir, ignore_errors=True)
     return _written(outdir, tt, k, res, t0)
