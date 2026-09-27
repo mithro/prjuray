@@ -305,27 +305,28 @@ class Correlator:
         conjunctions of the K features most often present in target."""
         PF, nF, fnames, popcount = self.PF, self.nF, self.fnames, \
             self.popcount
-        # cnt is unsigned: -cnt sorts the absent features (cnt 0) first, so
-        # with K or more absent features top is empty.  Checked on a few
-        # rows first (most features are absent from most targets).
-        nzw = np.nonzero(target)[0]
-        zeros = 0
-        for r in range(0, nF, 256):
-            blk = PF[r:r + 256][:, nzw] & target[nzw]
-            zeros += int((~np.any(blk, axis=1)).sum())
-            if zeros >= K:
-                return [], popcount(target)
-            if r >= 4096:
-                break
-        cnt = self.count_in(target)
-        top = [int(i) for i in np.argsort(-cnt)[:K] if cnt[i] > 0]
+        # (Signed: with the unsigned counts -cnt sorted the absent features
+        # first and top was empty for almost every bit.)
+        cnt = self.count_in(target).astype(np.int64)
+        top = [int(i) for i in np.argsort(-cnt, kind='stable')[:K]
+               if cnt[i] > 0]
         if not top:
             return [], popcount(target)
         T = PF[top]  # K x W
         iu, ju = np.triu_indices(len(top))  # includes i == j (singles)
         G = T[iu] & T[ju]  # pairs x W
         bad = (G & pb) if is_default else (G & ~pb)
-        ok = ~np.any(bad, axis=1) & (np.bitwise_count(G).sum(axis=1) >= 2)
+        ng = np.bitwise_count(G).sum(axis=1).astype(np.int64)
+        ok = ~np.any(bad, axis=1) & (ng >= 2)
+        if PAIR_CHANCE:
+            # As for single features: a conjunction seen n times that
+            # implies a bit set (clear) in a fraction p of the samples by
+            # chance with probability p**n is accepted only below CHANCE.
+            p = self.popcount(pb) / self.S
+            if is_default:
+                p = 1.0 - p
+            if 0.0 < p < 1.0:
+                ok &= ng * np.log(p) < np.log(self.CHANCE)
         G = G[ok]
         pi, pj = iu[ok], ju[ok]
         remaining = target.copy()
@@ -639,6 +640,7 @@ def split_parts(nF, nB, S):
 
 
 SPLIT_COST = int(float(os.environ.get('MKDB_SPLIT_COST', 2e11)))
+PAIR_CHANCE = os.environ.get("MKDB_PAIR_CHANCE", "1") == "1"
 
 
 def _load_split(sdir):
