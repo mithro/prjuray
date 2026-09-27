@@ -420,7 +420,13 @@ def recipe_slice(d, site, slicem):
         ref = 'CARRY8' if us else 'CARRY4'
         last_co = 'CO[7]' if us else 'CO[3]'
         prev = None
-        for _ in range(rng.choice((1, 1, 2, 3))):
+        nchain = rng.choice((1, 1, 2, 3))
+        # 7-series: the last CO and the last O share the D output mux of the
+        # slice; using both makes Vivado insert a pass-through CARRY4 (with
+        # GND/VCC cells) above the chain, often unplaceable in the pblock.
+        last_o = 'O[7]' if us else 'O[3]'
+        co_out = us or rng.random() < 0.5
+        for i in range(nchain):
             props = d.random_params(ref) if us else {}
             n = cell(ref, props)
             for direction, pin in pins_of(d.prims, ref):
@@ -445,10 +451,13 @@ def recipe_slice(d, site, slicem):
                 elif pin == last_co:
                     # Kept for the next element of the chain only.
                     continue
+                elif pin == last_o and i == nchain - 1 and co_out and not us:
+                    continue
                 else:
                     d.add_source(full, site)
             prev = n
-        d.add_source(f'{prev}/{last_co}', site)
+        if co_out:
+            d.add_source(f'{prev}/{last_co}', site)
     # Flip flops sharing a control set.
     nff = rng.randint(0, 2 * nletters)
     kind = rng.random()
@@ -459,6 +468,11 @@ def recipe_slice(d, site, slicem):
     else:
         choices = ['LDCE', 'LDPE']
     cinv = "1'b1" if ctl['cinv'] else "1'b0"
+    # Set/reset inversion: shared by the control set like the clock one
+    # (FFs of a site share the SR pin and its inverter).  UltraScale only:
+    # 7-series slices have no SR inverter (Vivado then cannot commit the
+    # placement: "failed to commit all instances").
+    srinv = "1'b1" if us and rng.random() < 0.3 else "1'b0"
     clk, ce, sr = [], [], []
     for i in range(nff):
         ref = rng.choice(choices)
@@ -467,6 +481,10 @@ def recipe_slice(d, site, slicem):
             props['IS_C_INVERTED'] = cinv
         else:
             props['IS_G_INVERTED'] = cinv
+        for p in ('IS_R_INVERTED', 'IS_S_INVERTED', 'IS_CLR_INVERTED',
+                  'IS_PRE_INVERTED'):
+            if p in d.prims[ref].params:
+                props[p] = srinv
         n = cell(ref, props)
         for direction, pin in pins_of(d.prims, ref):
             full = f'{n}/{pin}'
@@ -522,7 +540,10 @@ _CFG_US = ['STARTUPE3', 'ICAPE3', 'BSCANE2', 'DNA_PORTE2', 'USR_ACCESSE2',
            'EFUSE_USR', 'FRAME_ECCE3', 'DCIRESET', 'MASTER_JTAG']
 SITE_REFS = {
     'Series7': {
-        'RAMB18E1': ['RAMB18E1', 'FIFO18E1'],
+        # The lower 18 Kb site of a tile has site type FIFO18E1 (RAM or
+        # FIFO), the upper one RAMB18E1 (RAM only).
+        'RAMB18E1': ['RAMB18E1'],
+        'FIFO18E1': ['RAMB18E1', 'FIFO18E1'],
         'RAMBFIFO36E1': ['RAMB36E1', 'FIFO36E1'],
         'DSP48E1': ['DSP48E1'],
         'IDELAYE2': ['IDELAYE2'],
@@ -956,7 +977,11 @@ def recipe_hard(d, site, ref, pconn=0.6):
                 not pin_mapped(ref, props, pin):
             continue
         if direction == 'IN':
-            if rng.random() < pconn or CLOCK_BUFFERS.match(ref):
+            # (7-series IN/OUT_FIFO clocks left open are tied to VCC by
+            # Vivado with VCC cells it cannot place: always clocked.)
+            if rng.random() < pconn or CLOCK_BUFFERS.match(ref) or (
+                    ref in ('IN_FIFO', 'OUT_FIFO') and
+                    pin in ('RDCLK', 'WRCLK')):
                 kind = 'clock' if (DIRECT_CLOCKS.search(pin) or (
                     CLOCK_BUFFERS.match(ref) and pin in ('I', 'I0', 'I1'))) \
                     else 'data'
@@ -1787,10 +1812,15 @@ def generate(die, prims, seed, out, density, hard=True, pips=None,
         if focus:
             # Experiments: only the site types matching the focus pattern.
             chosen = [st for st in avail if re.search(focus, st)]
-        # Core blocks (block RAM, DSP) in about half of the designs.
+        # Core blocks (block RAM, DSP) in about half of the designs, clock
+        # generators (few sites, many configuration bits) in 40%.
         for st in avail if not focus else ():
-            if re.match(r'^(RAMB|RAMBFIFO|DSP|URAM)', st) and \
-                    st not in chosen and rng.random() < 0.5:
+            if st in chosen:
+                continue
+            if re.match(r'^(RAMB|RAMBFIFO|FIFO18E1|DSP|URAM)', st) and \
+                    rng.random() < 0.5:
+                chosen.append(st)
+            elif re.match(r'^(MMCM|PLL$|PLLE)', st) and rng.random() < 0.4:
                 chosen.append(st)
         # 18 Kb and 36 Kb block RAM sites share tiles and the first type
         # processed takes them: alternate which one goes first (RAMB18
@@ -1818,7 +1848,7 @@ def generate(die, prims, seed, out, density, hard=True, pips=None,
                 if rng.random() < p:
                     # A block RAM tile is either one 36 Kb RAM or two 18 Kb
                     # RAMs (the sites overlap physically).
-                    if re.match(r'^(RAMB|RAMBFIFO)', st):
+                    if re.match(r'^(RAMB|RAMBFIFO|FIFO18E1)', st):
                         tile = die.sites[s][1]
                         kind = '36' if '36' in st else '18'
                         if bram_tiles.setdefault(tile, kind) != kind:

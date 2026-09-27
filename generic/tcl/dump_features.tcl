@@ -399,6 +399,20 @@ proc dump_features {out} {
     # kept: a latch gate and a flip-flop clock invert oppositely), or on the
     # BEL when the pin reaches no site pin.  The BEL pin -> site pin wiring is
     # looked up once per (BEL, pin).  (Vectorised per cell type.)
+    # A pin tied to a constant (e.g. a clock whose driver the repair loop
+    # removed) is not inverted by its inverter setting: Vivado sets the
+    # inverter to produce the constant level.  Such pins are reported as
+    # "cfg <site> <site pin> <pin>_LEVEL <0|1>" (the constant after the
+    # cell's inversion) instead.
+    array unset constpin
+    foreach {t lv} {GROUND 0 POWER 1} {
+        set cn [get_nets -quiet -hierarchical -filter "TYPE == $t"]
+        if {![llength $cn]} continue
+        foreach q [get_pins -quiet -leaf -of_objects $cn -filter {DIRECTION == IN}] {
+            set constpin($q) $lv
+        }
+    }
+    puts $fp "# t_const [expr {[clock milliseconds] - $t0}]"
     set placed [get_cells -quiet -hierarchical -filter {IS_PRIMITIVE && LOC != ""}]
     set byref [dict create]
     foreach c $placed r [_df_props REF_NAME $placed] { dict lappend byref $r $c }
@@ -430,7 +444,12 @@ proc dump_features {out} {
                 }
                 set where [dict get $sitepin $k]
                 if {$where eq ""} { set where [lindex [split $b .] end] }
-                set line "cfg $s $where $p $v"
+                if {[info exists constpin($c/$pin)]} {
+                    set level [expr {$constpin($c/$pin) ^ [string match *1 $v]}]
+                    set line "cfg $s $where ${pin}_LEVEL $level"
+                } else {
+                    set line "cfg $s $where $p $v"
+                }
                 if {[dict exists $seen $line]} continue
                 dict set seen $line 1
                 puts $fp $line

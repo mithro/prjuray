@@ -207,6 +207,29 @@ def tile_features(path, sitekeys):
         vs = {_VCCO.get(x) for x in stds}
         if len(vs) == 1 and None not in vs:
             feats[tile].add(f'{key}.BANK.VCCO={vs.pop()}')
+    # 7-series FIFO almost full / empty offsets are stored adjusted (and
+    # inverted): full = ALMOST_FULL_OFFSET + 1 without EN_SYN, empty =
+    # ALMOST_EMPTY_OFFSET - 1 without EN_SYN with FIRST_WORD_FALL_THROUGH
+    # (xa7s15: 86 FIFO18 samples, prjxray ZALMOST_*_OFFSET bits).  The
+    # carry of the adjustment defeats per bit features: also name the
+    # stored value (<name>_STORED).
+    for (tile, prefix), cfgs in bel_cfgs.items():
+        if not prefix.endswith(('.FIFO18E1', '.FIFO36E1')):
+            continue
+        async_ = cfgs.get('EN_SYN') == 'FALSE'
+        fwft = cfgs.get('FIRST_WORD_FALL_THROUGH') == 'TRUE'
+        for name, adj in (('ALMOST_FULL_OFFSET', 1 if async_ else 0),
+                          ('ALMOST_EMPTY_OFFSET',
+                           -1 if async_ and fwft else 0)):
+            m = _VEC.match(cfgs.get(name, ''))
+            if not m:
+                continue
+            width = int(m.group(1))
+            v = int(m.group(3).replace('_', ''),
+                    2 if m.group(2) == 'b' else 16)
+            v = (v + adj) % (1 << width)
+            feats[tile].update(cfg_features(prefix, name + '_STORED',
+                                            f"{width}'h{v:X}"))
     # I/O buffer settings whose bits depend on the I/O standard (7-series
     # SLEW / DRIVE / IN_TERM bits differ between standard families): also
     # name them together with the standard.
