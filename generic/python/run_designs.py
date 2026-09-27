@@ -345,26 +345,54 @@ class WorkerPool:
         self.threads = threads
         self.logdir = logdir
         self.local = threading.local()
-        self.all = []
+        self.open = []
         self.lock = threading.Lock()
+
+    def _close(self, w):
+        with self.lock:
+            if w in self.open:
+                self.open.remove(w)
+        w.close()
+        if getattr(self.local, 'w', None) is w:
+            self.local.w = None
 
     def get(self, die):
         w = getattr(self.local, 'w', None)
         if w and (w.die is not die or w.ndone >= self.reuse or
                   not w.alive()):
-            w.close()
+            self._close(w)
             w = None
         if w is None:
             w = Worker(die, self.threads, self.logdir)
             with self.lock:
-                self.all.append(w)
+                self.open.append(w)
             self.local.w = w
         return w
 
+    def done(self, pending):
+        """After a design of this thread: close its worker when it is used
+        up, or when fewer designs of its die are pending (pending(die))
+        than workers of that die are open (idle workers hold GiBs)."""
+        w = getattr(self.local, 'w', None)
+        if w is None:
+            return
+        if w.ndone >= self.reuse or not w.alive():
+            self._close(w)
+            return
+        with self.lock:
+            same = sum(1 for x in self.open if x.die is w.die)
+            close = pending(w.die) < same
+            if close:
+                self.open.remove(w)
+        if close:
+            w.close()
+            self.local.w = None
+
     def close(self):
-        for w in self.all:
-            if w.alive():
-                w.close()
+        with self.lock:
+            ws, self.open = self.open, []
+        for w in ws:
+            w.close()
 
 
 def run_one(die, seed, wdir, gen_args, timeout, threads, pool=None):
@@ -392,6 +420,25 @@ def run_one(die, seed, wdir, gen_args, timeout, threads, pool=None):
     return seed, status
 
 
+def job_memory(workdir, die):
+    """Memory to reserve per job for a die: the larger of the 90th
+    percentile and 1.2 x the median of the peak memory recorded in the
+    run.stats of its earlier designs (0 when there are none)."""
+    import glob
+    rss = []
+    for p in glob.glob(os.path.join(workdir, die, '*', 's*', 'run.stats')):
+        try:
+            v = json.load(open(p)).get('maxrss')
+        except (OSError, ValueError):
+            continue
+        if v:
+            rss.append(v)
+    if not rss:
+        return 0
+    rss.sort()
+    return max(rss[int(0.9 * (len(rss) - 1))], 1.2 * rss[len(rss) // 2])
+
+
 class JobQueue:
     """Jobs handed to threads preferring the die a thread worked on last
     (a Vivado worker keeps its device loaded)."""
@@ -415,6 +462,10 @@ class JobQueue:
         self.local.die = job[0]
         return job
 
+    def pending(self, die):
+        with self.lock:
+            return sum(1 for j in self.jobs if j[0] is die)
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -422,6 +473,9 @@ def main():
     ap.add_argument('--tag', default='fabric')
     ap.add_argument('--seeds', required=True, help='first:last')
     ap.add_argument('--jobs', type=int, default=16)
+    ap.add_argument('--mem-budget', type=float, default=None,
+                    help='GiB for all jobs: --jobs is lowered to fit the '
+                    'peak memory measured on earlier designs of the dies')
     ap.add_argument('--timeout', type=int, default=None,
                     help='seconds per design (default: 2 x repair budget + 600)')
     ap.add_argument('--directive', default=None,
@@ -439,6 +493,16 @@ def main():
     set_directive(args.directive)
     alldies = dieslib.load()
     dlist = [alldies[n] for n in args.die.split(',')]
+    if args.mem_budget:
+        per = max(job_memory(args.workdir, d.name) for d in dlist)
+        if per:
+            jobs = max(1, min(args.jobs, int(args.mem_budget * 2**30 // per)))
+            print(f'# {per / 2**30:.1f} GiB per job: {jobs} jobs in '
+                  f'{args.mem_budget} GiB', flush=True)
+            args.jobs = jobs
+        else:
+            print('# no memory measurements for these dies: --jobs '
+                  f'{args.jobs}', flush=True)
     first, last = map(int, args.seeds.split(':'))
     jobs = [(die, s) for s in range(first, last + 1) for die in dlist]
     pool = None
@@ -458,6 +522,9 @@ def main():
                                         pool)[1]
         except Exception as e:  # keep going on post-processing errors
             return die.name, s, f'exception {e}'
+        finally:
+            if pool:
+                pool.done(queue.pending)
 
     t0 = time.time()
     done = 0

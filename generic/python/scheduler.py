@@ -132,6 +132,10 @@ def work(args):
                                        args.threads, pool)
             except Exception as e:  # keep going
                 status = f'exception {e}'
+            if pool:
+                # Close the Vivado worker if no queued item needs it.
+                pool.done(lambda d: sum(1 for n in os.listdir(q['todo'])
+                                        if f'_{d.name}_' in n))
             item['status'] = status
             item['host'] = HOST
             item['end'] = time.time()
