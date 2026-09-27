@@ -11,6 +11,8 @@
 #   site <site> <site_type> <tile>
 #   sp <site> <bel> <from_pin> <to_pin>             used site pip (routing mux)
 #   cfg <site> <bel> <name> <value>                 physical BEL configuration
+#                                                    (also IS_<pin>_INVERTED of
+#                                                    the cell placed on the BEL)
 
 proc _df_cfg_props {bel} {
     global _df_prop_cache
@@ -370,6 +372,27 @@ proc dump_features {out} {
             }
         }
     }
+    puts $fp "# t_sp [expr {[clock milliseconds] - $t0}]"
+    # Pin inversions of placed cells (IS_<pin>_INVERTED, e.g. the flip-flop
+    # clock and set/reset inversion of a slice): a BEL setting Vivado does
+    # not expose as BEL configuration nor as a site pip.  Reported as a
+    # configuration of the cell's BEL.  (Vectorised per cell type.)
+    set placed [get_cells -quiet -hierarchical -filter {IS_PRIMITIVE && LOC != ""}]
+    set byref [dict create]
+    foreach c $placed r [_df_props REF_NAME $placed] { dict lappend byref $r $c }
+    dict for {ref cells} $byref {
+        set props [list_property [lindex $cells 0] IS_*_INVERTED]
+        if {![llength $props]} continue
+        set sites [_df_props SITE $cells]
+        set bels [_df_props BEL $cells]
+        foreach p $props {
+            foreach s $sites b $bels v [_df_props $p $cells] {
+                if {$s eq "" || $b eq "" || $v eq ""} continue
+                puts $fp "cfg $s [lindex [split $b .] end] $p $v"
+            }
+        }
+    }
+    puts $fp "# t_inv [expr {[clock milliseconds] - $t0}]"
     # Bank wide settings (e.g. the 7-series STEPDOWN of low voltage banks)
     # also change unused pads: report the I/O standards used in each bank on
     # every pad site of the bank.
