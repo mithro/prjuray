@@ -6,6 +6,7 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 from concurrent.futures import ProcessPoolExecutor
 
 import dies as dieslib
@@ -142,6 +143,10 @@ def main():
                     'check the designs against it (consistency.py) and leave '
                     'the suspects out of the new database')
     ap.add_argument('--jobs', type=int, default=24)
+    ap.add_argument('--sample-jobs', type=int, default=None,
+                    help='mkdb per design sample cache workers (mkdb '
+                    '--sample-jobs; default --jobs).  The phase is light '
+                    'per worker (Series7 ~0.3 GB, xcku025 ~2.4 GB)')
     args = ap.parse_args()
     alldies = dieslib.load()
     dlist = args.dies.split(',')
@@ -185,14 +190,32 @@ def main():
         path = consistency(dlist, arch, tags, logdir)
         if path:
             exclude = ['--exclude', path]
+    sj = []
+    if args.sample_jobs:
+        with open(os.path.join(HERE, 'mkdb.py')) as f:
+            if '--sample-jobs' not in f.read():
+                sys.exit('mkdb.py has no --sample-jobs')
+        sj = ['--sample-jobs', str(args.sample_jobs)]
+    t0 = time.time()
     rc = run([
         sys.executable,
         os.path.join(HERE, 'mkdb.py'), '--arch', arch, '--dies',
         args.dies, '--tag', args.tags, '--jobs',
         str(args.jobs)
-    ] + exclude, os.path.join(logdir, f'mkdb_{arch}.log'))
+    ] + sj + exclude, os.path.join(logdir, f'mkdb_{arch}.log'))
+    print(f'mkdb {time.time() - t0:.0f} s', flush=True)
     print('build_db rc', rc, flush=True)
-    # Checks of all dies in parallel (each checks its designs in parallel).
+    # Checks of all dies in parallel, each checking its designs in
+    # parallel with a share of --jobs proportional to its size (the tile
+    # grid's size: bits per design), so that the big dies do not finish
+    # last with one job.
+    size = {d: os.path.getsize(os.path.join(dieslib.DB, arch, d,
+                                            'tilegrid.json'))
+            for d in dlist}
+    cjobs = {d: max(1, min(20, round(args.jobs * size[d] /
+                                     sum(size.values()))))
+             for d in dlist}
+
     def check(d):
         roots = ','.join(
             os.path.join(dieslib.BUILD, 'designs', d, t)
@@ -201,13 +224,15 @@ def main():
         run([
             sys.executable,
             os.path.join(HERE, 'check.py'), '--die', d, '--designs', roots,
-            '--max', '20', '--jobs',
-            str(max(1, min(20, args.jobs // len(dlist))))
+            '--max', '20', '--jobs', str(cjobs[d])
         ], log)
         return log
     from concurrent.futures import ThreadPoolExecutor
+    t0 = time.time()
     with ThreadPoolExecutor(len(dlist)) as ex:
         logs = list(ex.map(check, dlist))
+    print(f'checks {time.time() - t0:.0f} s (jobs per die '
+          f'{" ".join(f"{d}:{cjobs[d]}" for d in dlist)})', flush=True)
     for d, log in zip(dlist, logs):
         tail = open(log).read().strip().split('\n')
         summary = [l for l in tail if not l.startswith('/')]
