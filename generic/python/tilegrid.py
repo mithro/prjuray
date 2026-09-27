@@ -152,10 +152,41 @@ class Grid:
                 elif o_lo >= base:
                     hi = min(hi, o_lo)
         if w is not None:
-            lo, hi = min(lo, w[1]), max(hi, w[1] + w[2])
+            # The structural part beyond the learnt window stops where the
+            # learnt window of another tile of the grid column begins (GT
+            # channels: the empty rows above a channel tile belong to the
+            # next channel).
+            s_lo, s_hi = w[1], w[1] + w[2]
+            if not self.probe:
+                for o_lo, o_hi in self._column_learnt(t):
+                    if o_lo >= hi and o_lo < s_hi:
+                        s_hi = o_lo
+                    if o_hi <= lo and o_hi > s_lo:
+                        s_lo = o_hi
+            lo, hi = min(lo, s_lo), max(hi, s_hi)
         if not self.probe:
             lo, hi = max(lo, 0), min(hi, self.frame_bits)
         return self.crrow[t['gy']], lo, hi - lo
+
+    def _column_learnt(self, t):
+        """(first, end bit) of the learnt windows of the other tiles of t's
+        grid column in its clock region row."""
+        out = []
+        cr = self.crrow[t['gy']]
+        if not hasattr(self, '_col_all'):
+            self._col_all = collections.defaultdict(list)
+            for n, x in self.tiles.items():
+                if x['type'] in self.type_windows:
+                    self._col_all[x['gx']].append(n)
+        for n in self._col_all.get(t['gx'], ()):
+            x = self.tiles[n]
+            if n == t['name'] or self.crrow[x['gy']] != cr:
+                continue
+            b = self.row_bit(x['gy'])
+            if b is not None:
+                tw = self.type_windows[x['type']]
+                out.append((b + tw[0], b + tw[1]))
+        return out
 
     def _column_owners(self, t):
         """Tiles of t's grid column (other than t) with sites whose type has

@@ -116,46 +116,97 @@ def learn(die, design_root, tg, verbose=False):
     return out
 
 
-def from_probe(dbdir, grid, span, types, mincount=3, minshare=0.02):
+def from_probe(dbdir, grid, span, types, mincount=3, minshare=0.02,
+               spread_retry=True):
     """Windows from a bit database built with probe windows (tilegrid.py
-    --probe: +-span bits around the tile's grid row): the hull of the rows
-    (bits per row units) holding bits of at least max(3, minshare x
-    features) features of the type.  Only features seen at least mincount
-    times, and not spread over more than half a clock region (e.g. bank
-    wide settings replicated in every row), count.  Returns {type: (first
+    --probe: +-span bits around the tile's grid row): among the rows (bits
+    per row units) holding bits of at least max(3, minshare x features)
+    features of the type, the contiguous run around the tile's row of rows
+    with at least CORE_FRAC of the busiest row's when it holds CORE_MASS of
+    them (a GT channel between its neighbours), else their hull.  Only features seen at
+    least mincount times, and not spread over more than half a clock region
+    (e.g. bank wide settings replicated in every row), count; if none is
+    left (a type whose features all catch bits of neighbouring tiles, e.g.
+    GTX_CHANNEL_0), all of them.  Returns {type: (first
     bit, end bit, {row: features})} relative to the tile's grid row (the
     rows' feature counts decide which of overlapping tiles owns a row)."""
     import os
     bpr = grid.bpr
     maxspread = grid.rows_per_cr // 2
+    # The probe window is clipped at the frame ends (e.g. Series7
+    # GTX_CHANNEL_0 five rows above the bottom): the offset of a type's
+    # region relative to its grid row, from the probe tile grid.
+    shift = collections.defaultdict(set)
+    tgpath = os.path.join(dbdir, grid.die.name, 'tilegrid.json')
+    if os.path.exists(tgpath):
+        with open(tgpath) as f:
+            ptg = json.load(f)
+        for name, e in ptg.items():
+            base = grid.row_bit(e['gy'])
+            if base is not None and e['bits'] and e['type'] in types:
+                shift[e['type']].add(base - e['bits'][0]['offset'])
     out = {}
     for tt in types:
         suf = tt.lower()
         path = os.path.join(dbdir, f'segbits_{suf}.db')
         if not os.path.exists(path):
             continue
+        sh = shift.get(tt, {span})
+        if len(sh) != 1:
+            continue  # tiles of the type clipped differently
+        sh = sh.pop()
         counts = {}
         for line in open(os.path.join(dbdir, f'counts_{suf}.txt')):
             p = line.split()
             counts[p[0]] = int(p[1])
-        rows = collections.Counter()
-        nf = 0
-        for line in open(path):
-            p = line.split()
-            if counts.get(p[0], 0) < mincount:
-                continue
-            r = {(int(b.split('_')[1]) - span) // bpr for b in p[1:]
-                 if not b.startswith('!')}
-            if not r or max(r) - min(r) > maxspread:
-                continue
-            nf += 1
-            rows.update(r)
+        rows, nf = _probe_rows(path, counts, mincount, sh, bpr, maxspread)
+        retried = False
+        if not rows and spread_retry:
+            rows, nf = _probe_rows(path, counts, mincount, sh, bpr, None)
+            retried = True
         need = max(3, minshare * nf)
         keep = {r: n for r, n in rows.items() if n >= need}
         if keep:
-            out[tt] = (min(keep) * bpr, (max(keep) + 1) * bpr,
+            # The contiguous run of rows around the tile's own row (or the
+            # busiest row) with at least CORE_FRAC of the busiest row's
+            # features: rows of other tiles caught in the probe window
+            # (neighbouring GT channels, ...) stay out.
+            mx = max(keep.values())
+            core = {r for r, n in keep.items() if n >= CORE_FRAC * mx}
+            start = 0 if 0 in core else max(keep, key=keep.get)
+            lo = hi = start
+            while lo - 1 in core:
+                lo -= 1
+            while hi + 1 in core:
+                hi += 1
+            run = {r: n for r, n in keep.items() if lo <= r <= hi}
+            if retried or sum(run.values()) >= CORE_MASS * sum(keep.values()):
+                keep = run
+            else:  # no dominant block (e.g. CMT): the hull
+                lo, hi = min(keep), max(keep)
+            out[tt] = (lo * bpr, (hi + 1) * bpr,
                        {str(r): n for r, n in sorted(keep.items())})
     return out
+
+
+CORE_FRAC = 0.25
+CORE_MASS = 0.8  # share of the features' rows the run must hold
+
+
+def _probe_rows(path, counts, mincount, sh, bpr, maxspread):
+    rows = collections.Counter()
+    nf = 0
+    for line in open(path):
+        p = line.split()
+        if counts.get(p[0], 0) < mincount:
+            continue
+        r = {(int(b.split('_')[1]) - sh) // bpr for b in p[1:]
+             if not b.startswith('!')}
+        if not r or (maxspread is not None and max(r) - min(r) > maxspread):
+            continue
+        nf += 1
+        rows.update(r)
+    return rows, nf
 
 
 def merge(paths):
