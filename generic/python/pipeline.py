@@ -96,6 +96,37 @@ def probe(args):
     ], os.path.join(out, 'windows.log'))
 
 
+def consistency(dlist, arch, tags, logdir):
+    """Checks the designs of every die against the existing bit database
+    (consistency.py, one die at a time) and writes the suspects to
+    <logdir>/suspects_<arch>.txt.  Returns that path, or None when there is
+    no database (or no suspect)."""
+    dbdir = os.path.join(dieslib.DB, arch)
+    if not any(f.startswith('segbits_') for f in os.listdir(dbdir)):
+        print('consistency: no bit database yet', flush=True)
+        return None
+    suspects = []
+    for d in dlist:
+        roots = ','.join(
+            os.path.join(dieslib.BUILD, 'designs', d, t) for t in tags)
+        log = os.path.join(logdir, f'consistency_{d}.log')
+        rc = run([
+            sys.executable,
+            os.path.join(HERE, 'consistency.py'), '--die', d, '--designs',
+            roots
+        ], log)
+        found = [line.split(None, 1)[1].strip() for line in open(log)
+                 if line.startswith('SUSPECT ')]
+        print(f'consistency {d} rc {rc} suspects {len(found)}', flush=True)
+        suspects += found
+    if not suspects:
+        return None
+    path = os.path.join(logdir, f'suspects_{arch}.txt')
+    with open(path, 'w') as f:
+        f.write('\n'.join(suspects) + '\n')
+    return path
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--dies', required=True)
@@ -106,6 +137,10 @@ def main():
                     help='learn the tile type windows of hard blocks (a '
                     'probe bit database per die) into <db>/<arch>/'
                     'windows.json before building the tile grids')
+    ap.add_argument('--consistency', action='store_true',
+                    help='when a bit database of the architecture exists, '
+                    'check the designs against it (consistency.py) and leave '
+                    'the suspects out of the new database')
     ap.add_argument('--jobs', type=int, default=24)
     args = ap.parse_args()
     alldies = dieslib.load()
@@ -145,12 +180,17 @@ def main():
         with ProcessPoolExecutor(min(len(dlist), 8)) as ex:
             for die, rc in ex.map(tilegrid, [(d, arch) for d in dlist]):
                 print('tilegrid', die, 'rc', rc, flush=True)
+    exclude = []
+    if args.consistency:
+        path = consistency(dlist, arch, tags, logdir)
+        if path:
+            exclude = ['--exclude', path]
     rc = run([
         sys.executable,
         os.path.join(HERE, 'mkdb.py'), '--arch', arch, '--dies',
         args.dies, '--tag', args.tags, '--jobs',
         str(args.jobs)
-    ], os.path.join(logdir, f'mkdb_{arch}.log'))
+    ] + exclude, os.path.join(logdir, f'mkdb_{arch}.log'))
     print('build_db rc', rc, flush=True)
     # Checks of all dies in parallel (each checks its designs in parallel).
     def check(d):
