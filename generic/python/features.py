@@ -159,6 +159,185 @@ def cfg_features(prefix, name, value):
     return out
 
 
+# Clock generator (MMCM/PLL) dynamic reconfiguration register fields.
+# Vivado's BEL configuration reports default counter settings; the values
+# bitgen writes are derived from the divide / duty cycle / phase
+# parameters as in Xilinx XAPP888 (mmcm_pll_drp_func_*.vh), reproduced
+# here in the same fixed point arithmetic (10 fractional bits).
+_FRAC = 10
+
+
+def _round_frac(v, precision):
+    if v >> (_FRAC - precision - 1) & 1:
+        v += 1 << (_FRAC - precision)
+    return v
+
+
+def _drp_divider(divide, duty):
+    """(high_time, low_time, edge, no_count) of a counter (mod 64)."""
+    if divide == 1:
+        return 1, 1, 0, 1
+    duty_fix = (round(duty * 100000) << _FRAC) // 100000
+    t = _round_frac(duty_fix * divide, 1)
+    ht = (t >> _FRAC) & 0x7f
+    edge = (t >> (_FRAC - 1)) & 1
+    if ht == 0:
+        ht, edge = 1, 0
+    if ht == divide:
+        ht, edge = divide - 1, 1
+    return ht & 63, (divide - ht) & 63, edge, 0
+
+
+def _milli_phase(phase):
+    p = round(phase * 1000)
+    return p + 360000 if p < 0 else p
+
+
+def _drp_phase(divide, phase):
+    """(delay_time, phase_mux) of an integer counter (phase in degrees)."""
+    fixed = (_milli_phase(phase) << _FRAC) // 1000
+    t = _round_frac(fixed * divide // 360, 3)
+    return (t >> _FRAC) & 63, (t >> (_FRAC - 3)) & 7
+
+
+def _drp_frac(divide_f, phase):
+    """Fractional counter fields (CLKOUT0 / CLKFBOUT, .125 steps)."""
+    d = int(divide_f)
+    frac = int(round((divide_f - d) * 8)) & 7
+    even = d >> 1
+    odd = d - 2 * even
+    odd_and_frac = 8 * odd + frac
+    lt = even - (odd_and_frac <= 9)
+    ht = even - (odd_and_frac <= 8)
+    pm_fall = (odd << 2) + (frac >> 1)
+    wf_fall = int(2 <= odd_and_frac <= 9 or (frac == 1 and d == 2))
+    wf_rise = int(1 <= odd_and_frac <= 8)
+    octets = 8 * d + frac
+    p = _milli_phase(phase) + 10
+    a = p * octets // 360000
+    pm_rise = 0 if a & 0xff == 0 else a & 7
+    dt = (p * octets // 8) // 360000
+    return dict(HIGH_TIME=ht & 63, LOW_TIME=lt & 63, FRAC=frac,
+                FRAC_WF_R=wf_rise, FRAC_WF_F=wf_fall, PHASE_MUX=pm_rise,
+                PHASE_MUX_F=(pm_fall + pm_rise) & 7, DELAY_TIME=dt & 63)
+
+
+# Lock / loop filter lookup tables, from clockgen_tables.py.
+_TABLES = None
+_TABLE_FAMILY = {'MMCME2_ADV': '7s_mmcm', 'PLLE2_ADV': '7s_pll',
+                 'MMCME3_ADV': 'us_mmcm', 'PLLE3_ADV': 'us_pll',
+                 'MMCME4_ADV': 'usp_mmcm', 'PLLE4_ADV': 'usp_pll'}
+# Field layout of the entries (most significant first).
+_LOCK_FIELDS = (('LOCK_REF_DLY', 5), ('LOCK_FB_DLY', 5), ('LOCK_CNT', 10),
+                ('LOCK_SAT_HIGH', 10), ('UNLOCK_CNT', 10))
+_FILTER_FIELDS = (('CP', 4), ('RES', 4), ('LFHF', 2))
+
+
+def _tables():
+    global _TABLES
+    if _TABLES is None:
+        import json
+        import os
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         'clockgen_tables.json')
+        with open(p) as f:
+            _TABLES = json.load(f)
+    return _TABLES
+
+
+def _drp_bits(prefix, name, value, width):
+    return [f'{prefix}.DRP.{name}[{i}]' + ('' if (value >> i) & 1 else '=0')
+            for i in range(width)]
+
+
+def _drp_fields(prefix, entry, fields):
+    out = []
+    shift = sum(w for _, w in fields)
+    for name, w in fields:
+        shift -= w
+        out += _drp_bits(prefix, name, (entry >> shift) & ((1 << w) - 1), w)
+    return out
+
+
+def clockgen_drp_features(prefix, cfgs):
+    """Derived counter / lock / filter register features of an MMCM or PLL
+    BEL (<prefix> = <SITEKEY>.<BEL>, <cfgs> = its BEL configuration)."""
+    out = []
+
+    def num(k, default=None):
+        try:
+            return float(cfgs[k])
+        except (KeyError, ValueError):
+            return default
+    counters = []
+    for i in range(7):
+        d = num(f'CLKOUT{i}_DIVIDE_F') if i == 0 else None
+        if d is None:
+            d = num(f'CLKOUT{i}_DIVIDE')
+        if d is None:
+            continue
+        counters.append((f'CLKOUT{i}', d, num(f'CLKOUT{i}_DUTY_CYCLE', 0.5),
+                         num(f'CLKOUT{i}_PHASE', 0.0)))
+    m = num('CLKFBOUT_MULT_F')
+    if m is None:
+        m = num('CLKFBOUT_MULT')
+    if m is not None:
+        counters.append(('CLKFBOUT', m, 0.5, num('CLKFBOUT_PHASE', 0.0)))
+    dv = num('DIVCLK_DIVIDE')
+    if dv is not None:
+        counters.append(('DIVCLK', dv, 0.5, 0.0))
+    ss = cfgs.get('SS_EN') == 'TRUE'
+    for name, d, duty, phase in counters:
+        if ss and name in ('CLKOUT2', 'CLKOUT3', 'CLKFBOUT'):
+            continue  # spread spectrum programs these counters itself
+        # Dynamic (fine) phase shift: the static phase mux stays at 0.
+        fine = cfgs.get(f'{name}_USE_FINE_PS') == 'TRUE'
+        is_frac = d != int(d)
+        # Edge / no count come from the integer part in both modes.
+        ht, lt, edge, nc = _drp_divider(int(d), duty)
+        dt, pm = _drp_phase(int(d), phase)
+        if fine:
+            pm = 0
+        if name in ('CLKOUT0', 'CLKFBOUT'):
+            # Counters with a fractional mode.  Its falling edge phase mux
+            # (in the CLKOUT5 / CLKOUT6 registers) repeats the phase mux in
+            # integer mode, the wave form bits are 0.
+            if is_frac:
+                fields = _drp_frac(d, phase)
+                ht, lt = fields['HIGH_TIME'], fields['LOW_TIME']
+                dt = fields['DELAY_TIME']
+                if not fine:
+                    pm = fields['PHASE_MUX']
+            else:
+                fields = dict(FRAC=0, PHASE_MUX_F=pm, FRAC_WF_R=0,
+                              FRAC_WF_F=0)
+            out += _drp_bits(prefix, f'{name}_FRAC', fields['FRAC'], 3)
+            out += _drp_bits(prefix, f'{name}_PHASE_MUX_F',
+                             fields['PHASE_MUX_F'], 3)
+            for k in ('FRAC_WF_R', 'FRAC_WF_F'):
+                out.append(f'{prefix}.DRP.{name}_{k}={fields[k]}')
+        out += _drp_bits(prefix, f'{name}_HIGH_TIME', ht, 6)
+        out += _drp_bits(prefix, f'{name}_LOW_TIME', lt, 6)
+        out += _drp_bits(prefix, f'{name}_DELAY_TIME', dt, 6)
+        out += _drp_bits(prefix, f'{name}_PHASE_MUX', pm, 3)
+        out.append(f'{prefix}.DRP.{name}_EDGE={edge}')
+        out.append(f'{prefix}.DRP.{name}_NO_COUNT={nc}')
+        out.append(f'{prefix}.DRP.{name}_FRAC_EN={int(is_frac)}')
+    fam = _TABLE_FAMILY.get(prefix.rsplit('.', 1)[-1])
+    if m is not None and fam:
+        # Lock and loop filter tables are looked up from the (integer)
+        # multiplier and the bandwidth.
+        t = _tables()[fam]
+        mi = int(m)
+        if 1 <= mi <= len(t['lock']):
+            out += _drp_fields(prefix, t['lock'][mi - 1], _LOCK_FIELDS)
+        filt = t.get('filter_low' if cfgs.get('BANDWIDTH') == 'LOW'
+                     else 'filter_high', t.get('filter'))
+        if filt and 1 <= mi <= len(filt):
+            out += _drp_fields(prefix, filt[mi - 1], _FILTER_FIELDS)
+    return out
+
+
 def open_any(path):
     if path.endswith('.gz'):
         return gzip.open(path, 'rt')
@@ -254,6 +433,10 @@ def tile_features(path, sitekeys):
                     f'{key}.OUTFF.OUTFFTYPE=DDR' in fs:
                 edge = 'OPPOSITE_EDGE'
             fs.add(f'{key}.CLKINV.SP.{inv}.OUT@CLK_EDGE={edge}')
+    # Clock generator counter registers (derived, see clockgen_drp_features).
+    for (tile, prefix), cfgs in bel_cfgs.items():
+        if re.search(r'\.(MMCME\d_ADV|PLLE\d_ADV|MMCM|PLL)$', prefix):
+            feats[tile].update(clockgen_drp_features(prefix, cfgs))
     # 7-series DSP48E1: the "AREG_0" / "BREG_0" bits (prjxray, DSP_L 27_111
     # / 27_038, 27_271 / 27_198) are set for AREG=0, and for AREG=1 when
     # INMODE[0] (A1/A2 select; INMODE[4] for B) is tied to ground
