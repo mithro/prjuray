@@ -190,6 +190,19 @@ class DieRows:
             n += 1
         return n
 
+    def order_conflicts(self, order):
+        """Clock region rows whose learnt frame row contradicts the ordering
+        when strictly more learnt rows fit it; else []."""
+        crs = sorted(self.rows)
+        keys = sorted(self.row_keys(), key=order)
+        if len(keys) != len(crs):
+            return []
+        want = dict(zip(crs, keys))
+        bad = [cr for cr, k in self.crmap.items() if want.get(cr) != k]
+        if bad and len(self.crmap) - len(bad) > len(bad):
+            return sorted(bad)
+        return []
+
     def apply_order(self, order):
         crs = sorted(self.rows)
         keys = sorted(self.row_keys(), key=order)
@@ -579,6 +592,26 @@ def claim_unused(dr, cr, full, ref=None):
             out[gx] = n
             used.add(n)
             break
+    # The first (last) grid column of a row without activity, placed away
+    # from its neighbour across unused frame columns, moves next to it
+    # (xcu25 rows with the PS: INT_INTF_LEFT_TERM_PSS right of the PS's
+    # unused frame columns, not at their start).
+    order = sorted(out.items())
+    for (gx, j), (ng, nj), step in ((order[0], order[1], 1),
+                                    (order[-1], order[-2], -1)) \
+            if len(order) > 1 else ():
+        n = nj - step
+        v = dr.ev['scores'].get(cr, {}).get(gx)
+        if n == j or (v is not None and v.max() > 0):
+            continue
+        between = range(min(j, n) + 1, max(j, n)) if step > 0 else \
+            range(min(j, n), max(j, n))
+        if (n > j) != (step > 0) or n in used or \
+                any(m in used for m in between if m != j):
+            continue
+        used.discard(j)
+        out[gx] = n
+        used.add(n)
     return out
 
 
@@ -705,6 +738,17 @@ def main():
         best = votes.most_common(1)[0][0]
         print(f'frame row order: {best} ({dict(votes)})', flush=True)
         for d, dr in rows.items():
+            # Learnt frame rows contradicting the order while most of the
+            # die's learnt rows fit it are dropped with their activity
+            # (scored against the wrong frame row; xcu25 with few designs:
+            # row 1 -> frame row 2).
+            bad = dr.order_conflicts(orders[best])
+            if bad:
+                print(f'  {d}: learnt frame rows against the order dropped: '
+                      f'{ {cr: dr.crmap[cr] for cr in bad} }', flush=True)
+                for cr in bad:
+                    del dr.crmap[cr]
+                    dr.ev['scores'].pop(cr, None)
             if len(dr.crmap) < len(dr.rows) and \
                     dr.order_consistent(orders[best]) is not None:
                 dr.apply_order(orders[best])
