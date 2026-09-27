@@ -30,6 +30,22 @@ import dies as dieslib
 import mkdb
 
 
+def _part_index(db, tt, k, feats):
+    """({part: [feature index]}, [number of distinct parts]) of a
+    (tile type, region index), cached on the database."""
+    cache = db.__dict__.setdefault('_part_index', {})
+    if (tt, k) not in cache:
+        by = collections.defaultdict(list)
+        nparts = []
+        for i, (name, _, _) in enumerate(feats):
+            parts = set(name.split('.', 1)[1].split('&'))
+            for p in parts:
+                by[p].append(i)
+            nparts.append(len(parts))
+        cache[(tt, k)] = (dict(by), nparts)
+    return cache[(tt, k)]
+
+
 def design_violations(col, db, d):
     """(checked, violated, Counter(feature -> violations), Counter(feature
     -> occurrences))"""
@@ -43,10 +59,12 @@ def design_violations(col, db, d):
         if not feats:
             continue
         bits = set(bits)
-        for name, pos, neg in feats:
-            parts = name.split('.', 1)[1].split('&')
-            if not all(p in fs for p in parts):
-                continue
+        # The features of the database whose parts are all present (in
+        # database order), through an index part -> features.
+        idx = _part_index(db, tt, k, feats)
+        hits = collections.Counter(i for f in fs for i in idx[0].get(f, ()))
+        for i in sorted(i for i, n in hits.items() if n == idx[1][i]):
+            name, pos, neg = feats[i]
             checked += 1
             key = f'{tt}.{name.split(".", 1)[1]}'
             occ[key] += 1
