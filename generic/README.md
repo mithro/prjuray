@@ -159,7 +159,12 @@ not reinforce its own mistakes.  The learnt table is printed (Series7: CLB
 36, BRAM / DSP 28, IO 42, CMT / CLK / CFG 30, GT 32 frames; INT and
 interface kinds take the count of their neighbour; UltraScale+: INT 76, CLE
 16, BRAM 6, DSP 8, ...).  Silent columns left out join their nearest
-neighbour's frame column.  Hard block tiles over part of another kind's
+neighbour's frame column; a column sharing its neighbour's frame column
+takes an unused frame column right next to it on its own side when it
+shows activity there or has it in every other clock region row
+(UltraScale+ INT_INTF_LEFT_TERM_IO_FT between CMT_L and INT).  PS8 tiles
+(UltraScale+ PSS_ALTO) own no frame column: the PS is configured through
+its registers.  Hard block tiles over part of another kind's
 column (e.g. PCIE) take the frame column of their neighbours in their grid
 row when the other columns of their column's frame column are absent there.
 Clock region rows without activity get their frame row from the frame row
@@ -180,7 +185,9 @@ python3 generic/python/tilegrid.py --die <die> \
 ```
 
 The bits of a tile within its frame column (its *window*) are structural
-for fabric tiles: its INT row and the empty grid rows above it.  Hard blocks
+for fabric tiles: its INT row and the empty grid rows above it (on
+UltraScale(+) through an empty RCLK row: a GT quad or CMT in the bottom
+INT row spans the clock region).  Hard blocks
 (CMT, CFG, clock rows, GT, IO bank tiles, ...) whose windows are doubtful
 (taller than one INT row, in the centre row, without an INT row, or
 between site-less filler tiles such as the Series7 PCIE_BOT among
