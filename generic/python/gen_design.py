@@ -513,7 +513,10 @@ _CFG_US = ['STARTUPE3', 'ICAPE3', 'BSCANE2', 'DNA_PORTE2', 'USR_ACCESSE2',
            'EFUSE_USR', 'FRAME_ECCE3', 'DCIRESET', 'MASTER_JTAG']
 SITE_REFS = {
     'Series7': {
-        'RAMB18E1': ['RAMB18E1', 'FIFO18E1'],
+        # The lower 18 Kb site of a tile has site type FIFO18E1 (RAM or
+        # FIFO), the upper one RAMB18E1 (RAM only).
+        'RAMB18E1': ['RAMB18E1'],
+        'FIFO18E1': ['RAMB18E1', 'FIFO18E1'],
         'RAMBFIFO36E1': ['RAMB36E1', 'FIFO36E1'],
         'DSP48E1': ['DSP48E1'],
         'IDELAYE2': ['IDELAYE2'],
@@ -1787,7 +1790,7 @@ def generate(die, prims, seed, out, density, hard=True, pips=None,
         for st in avail if not focus else ():
             if st in chosen:
                 continue
-            if re.match(r'^(RAMB|RAMBFIFO|DSP|URAM)', st) and \
+            if re.match(r'^(RAMB|RAMBFIFO|FIFO18E1|DSP|URAM)', st) and \
                     rng.random() < 0.5:
                 chosen.append(st)
             elif re.match(r'^(MMCM|PLL$|PLLE)', st) and rng.random() < 0.4:
@@ -1818,7 +1821,7 @@ def generate(die, prims, seed, out, density, hard=True, pips=None,
                 if rng.random() < p:
                     # A block RAM tile is either one 36 Kb RAM or two 18 Kb
                     # RAMs (the sites overlap physically).
-                    if re.match(r'^(RAMB|RAMBFIFO)', st):
+                    if re.match(r'^(RAMB|RAMBFIFO|FIFO18E1)', st):
                         tile = die.sites[s][1]
                         kind = '36' if '36' in st else '18'
                         if bram_tiles.setdefault(tile, kind) != kind:
