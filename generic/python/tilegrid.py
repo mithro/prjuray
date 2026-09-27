@@ -183,13 +183,21 @@ class Grid:
             return None
         r = self.rowidx[gy]
         # Height: grid rows above the anchor occupied by nothing else.
+        # UltraScale(+): an empty centre (RCLK) row does not end the tile:
+        # a GT quad or CMT in the bottom INT row with nothing above it spans
+        # the whole clock region, centre bits included.  (Series7 hard
+        # blocks get learnt windows; wider structural windows there would
+        # clip their neighbours' learnt windows.)
+        through = self.centre_rows if self.arch != 'Series7' else ()
         h = 1
         cr = self.crrow[gy]
         y = gy - 1
-        while (y in self.rowidx and self.crrow[y] == cr and
+        while ((y in self.rowidx or y in through) and
+               self.crrow[y] == cr and
                self.tiles.get(self.at.get((t['gx'], y)),
                               {}).get('type', 'NULL') == 'NULL'):
-            h += 1
+            if y in self.rowidx:
+                h += 1
             y -= 1
         off = r * self.bpr
         half = self.rows_per_cr // 2

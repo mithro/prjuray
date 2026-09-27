@@ -545,6 +545,43 @@ def attach_silent(rows_all, assigned, model=None, maxdist=16):
     return out
 
 
+def claim_unused(dr, cr, full, ref=None):
+    """A grid column sharing its neighbour's frame column moves to an unused
+    frame column right next to it on its own side, when its activity there
+    is positive or it has that frame column (index and frame count) in
+    all other clock region rows (ref: gx -> {(index, frames)}) (UltraScale+
+    INT_INTF_LEFT_TERM_IO_FT: the 4 minor column between CMT_L and INT;
+    the HMM lets interface columns share INT's)."""
+    M = dr.majors(cr)
+    out = dict(full)
+    used = set(out.values())
+    order = sorted(out.items())
+    for i, (gx, j) in enumerate(order):
+        mates = [g for g, k in order if k == j and g != gx]
+        if not mates:
+            continue
+        v = dr.ev['scores'].get(cr, {}).get(gx)
+        # own side: below the mates' columns -> the frame column before
+        for step, side in ((-1, all(gx < g for g in mates)),
+                           (1, all(gx > g for g in mates))):
+            n = j + step
+            if not side or n < 0 or n >= len(M) or n in used:
+                continue
+            if not ((v is not None and n < len(v) and v[n] > 0) or
+                    (ref and (n, M[n][2]) in ref.get(gx, ()))):
+                continue
+            # nothing between gx and the next grid column on that side may
+            # use a frame column beyond n
+            nb = [k for g, k in order if (g < gx if step < 0 else g > gx)]
+            near = max(nb) if step < 0 and nb else (min(nb) if nb else None)
+            if near is not None and (near >= n if step < 0 else near <= n):
+                continue
+            out[gx] = n
+            used.add(n)
+            break
+    return out
+
+
 def minority_tiles(dr, cr, full):
     """Hard block tiles (with sites) of another type than their column's
     kind, e.g. a PCIE block over part of a CLB column, where the other grid
@@ -817,13 +854,25 @@ def main():
         colmap = []
         tilemap = {}
         rep = collections.Counter()
+        first = {}
+        for cr in sorted(dr.rows):
+            if dr.majors(cr):
+                first[cr] = claim_unused(dr, cr, attach_silent(
+                    dr.rows[cr], cur[(d, cr)], model))
         for cr in sorted(dr.rows):
             m = dr.majors(cr)
             if not m:
                 rep['rows without frame row'] += 1
                 continue
             asg = cur[(d, cr)]
-            full = attach_silent(dr.rows[cr], asg, model)
+            # Only a frame column the grid column has in every other row.
+            ref = collections.defaultdict(set)
+            for c2, f2 in first.items():
+                if c2 != cr:
+                    for gx, j in f2.items():
+                        ref[gx].add((j, dr.majors(c2)[j][2]))
+            ref = {gx: v for gx, v in ref.items() if len(v) == 1}
+            full = claim_unused(dr, cr, first[cr], ref)
             for gx, j in sorted(full.items()):
                 colmap.append([cr, gx, m[j][0]])
             for name, j in minority_tiles(dr, cr, full).items():
