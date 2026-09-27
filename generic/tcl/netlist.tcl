@@ -36,6 +36,12 @@ proc nl_init {part} {
     set threads 2
     if {[info exists ::env(NL_THREADS)]} { set threads $::env(NL_THREADS) }
     set_param general.maxThreads $threads
+    # Router time limit (seconds): route_design otherwise can iterate for
+    # hours on a few overlapping nodes; stopped, it reports the unrouted
+    # nets and the repair loop goes on.
+    if {[info exists ::env(NL_ROUTE_TIMELIMIT)]} {
+        set_param route.timeLimit $::env(NL_ROUTE_TIMELIMIT)
+    }
     create_cell -reference GND nl_gnd
     create_cell -reference VCC nl_vcc
     create_net nl_const0
