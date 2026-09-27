@@ -134,6 +134,14 @@ def _packed(rows, S, n):
     return P
 
 
+class _Interner(dict):
+    """name -> id, new names numbered in order of first lookup."""
+
+    def __missing__(self, key):
+        v = self[key] = len(self)
+        return v
+
+
 class PackedRows:
     """Bit-packed row x sample matrix built one sample at a time, rows
     created on first use (names interned).  Records, per row, the first
@@ -143,15 +151,15 @@ class PackedRows:
         self.S = S
         self.W = (S + 63) // 64
         self.P = np.zeros((1024, self.W), dtype=np.uint64)
-        self.ids = {}
+        self.ids = _Interner()
         self.first = np.full(1024, np.iinfo(np.int64).max, dtype=np.int64)
         self.firstpos = np.zeros(1024, dtype=np.int64)
 
     def add(self, s, names):
         if not names:
             return
-        ids = np.fromiter((self.ids.setdefault(n, len(self.ids))
-                           for n in names), dtype=np.int64, count=len(names))
+        ids = np.fromiter(map(self.ids.__getitem__, names), dtype=np.int64,
+                          count=len(names))
         n = len(self.ids)
         if n > len(self.P):
             cap = max(n, 2 * len(self.P))
@@ -234,10 +242,37 @@ def correlate_packed(PF, PB, emptyv, fnames, bnames):
             remaining &= ~PF[cand[j]]
         return chosen, popcount(remaining)
 
+    def count_in(target):
+        """Samples of target each feature is present in (only the words of
+        target with samples, in row blocks: the full PF & target temporary
+        is up to hundreds of MiB for block RAM tiles)."""
+        nzw = np.nonzero(target)[0]
+        cnt = np.zeros(nF, dtype=np.uint64)
+        if len(nzw) == 0:
+            return cnt
+        t = target[nzw]
+        step = max(1, (1 << 21) // len(nzw))
+        for r in range(0, nF, step):
+            cnt[r:r + step] = np.bitwise_count(
+                PF[r:r + step][:, nzw] & t).sum(axis=1)
+        return cnt
+
     def pair_cover(target, is_default, pb, K=40):
         """Greedy cover of target with single features and pairwise
         conjunctions of the K features most often present in target."""
-        cnt = np.bitwise_count(PF & target).sum(axis=1)
+        # cnt is unsigned: -cnt sorts the absent features (cnt 0) first, so
+        # with K or more absent features top is empty.  Checked on a few
+        # rows first (most features are absent from most targets).
+        nzw = np.nonzero(target)[0]
+        zeros = 0
+        for r in range(0, nF, 256):
+            blk = PF[r:r + 256][:, nzw] & target[nzw]
+            zeros += int((~np.any(blk, axis=1)).sum())
+            if zeros >= K:
+                return [], popcount(target)
+            if r >= 4096:
+                break
+        cnt = count_in(target)
         top = [int(i) for i in np.argsort(-cnt)[:K] if cnt[i] > 0]
         if not top:
             return [], popcount(target)
