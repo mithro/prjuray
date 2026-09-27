@@ -96,8 +96,41 @@ class Claimer:
         return None, None
 
 
+class MemGate:
+    """Admission of jobs within a memory budget (bytes): a job reserving
+    n bytes waits until they fit (a single job always runs)."""
+
+    def __init__(self, budget):
+        self.budget = budget
+        self.used = 0
+        self.cond = threading.Condition()
+
+    def acquire(self, n):
+        with self.cond:
+            while self.used and self.used + n > self.budget:
+                self.cond.wait(30)
+            self.used += n
+
+    def release(self, n):
+        with self.cond:
+            self.used -= n
+            self.cond.notify_all()
+
+
 def work(args):
     q = qdirs(args.queue)
+    gate = MemGate(args.mem_budget * 2**30) if args.mem_budget else None
+    mem_est = {}  # (workdir, die) -> (time, bytes)
+
+    def job_mem(workdir, die):
+        """Memory to reserve for a job of a die (measured peaks of its
+        earlier designs, refreshed every 10 min; --job-mem without)."""
+        k = (workdir, die)
+        if k not in mem_est or time.time() - mem_est[k][0] > 600:
+            m = rd.job_memory(workdir, die) or args.job_mem * 2**30
+            mem_est[k] = (time.time(), m)
+        return mem_est[k][1]
+
     alldies = dieslib.load()
     pool = None
     if args.reuse > 1:
@@ -125,6 +158,9 @@ def work(args):
                                                           'designs')
             wdir = os.path.join(workdir, die.name, item['tag'],
                                 f's{item["seed"]}')
+            need = job_mem(workdir, die.name) if gate else 0
+            if gate:
+                gate.acquire(need)
             try:
                 _, status = rd.run_one(die, item['seed'], wdir,
                                        item.get('gen_args', []),
@@ -132,6 +168,9 @@ def work(args):
                                        args.threads, pool)
             except Exception as e:  # keep going
                 status = f'exception {e}'
+            finally:
+                if gate:
+                    gate.release(need)
             if pool:
                 # Close the Vivado worker if no queued item needs it.
                 pool.done(lambda d: sum(1 for n in os.listdir(q['todo'])
@@ -220,6 +259,11 @@ def main():
     w.add_argument('--jobs', type=int, default=16)
     w.add_argument('--reuse', type=int, default=1)
     w.add_argument('--threads', type=int, default=2)
+    w.add_argument('--mem-budget', type=float, default=None,
+                   help='GiB: run jobs only while their expected peak '
+                   'memory (measured on earlier designs of the die) fits')
+    w.add_argument('--job-mem', type=float, default=4.0,
+                   help='GiB expected for a die without measurements')
     w.add_argument('--directive', default=None,
                    help='place_design/route_design directive (e.g. Quick)')
     w.add_argument('--timeout', type=int, default=None)
