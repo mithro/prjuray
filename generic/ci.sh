@@ -15,7 +15,7 @@
 #
 # Everything lives under $URAY_BUILD/ci (never touches build/db):
 #   ci/golden/<die>/{tilegrid.json,summary.txt,info}  pinned tile grid + golden
-#   ci/work/<die>/                                     scratch tree, logs,
+#   ci/work/<checkout>/<die>/                          scratch tree, logs,
 #                                                      persistent sample cache
 # The tile grid is pinned in the golden directory (the production one when
 # the golden is first made), so production tile grid updates do not move
@@ -59,7 +59,7 @@ for die in "$@"; do
     c=$(conf "$die") || { echo "ci: no configuration for $die"; exit 2; }
     read -r arch train hold hmax <<< "$c"
     GD=$B/ci/golden/$die
-    X=$B/ci/work/$die
+    X=$B/ci/work/$(basename "$(dirname "$G")")/$die
     mkdir -p "$GD" "$X"
     t0=$(now)
     # Pinned tile grid.

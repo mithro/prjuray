@@ -126,6 +126,24 @@ class Collector:
                     continue
                 yield self.regions[i][1], k, fs, bits
 
+    def sample_codes(self, design_dir, empty_keep=0.2, rng=None):
+        """samples() with the bits as regionmap codes (numpy array, same
+        order) instead of names."""
+        ids = DD.load_bits(self.df, design_dir)
+        _, reg, code = self.rmap.pairs(ids)
+        cut = (np.flatnonzero(reg[1:] != reg[:-1]) + 1).tolist()
+        starts = [0] + cut
+        sl = dict(zip(reg[starts].tolist() if len(reg) else [],
+                      zip(starts, cut + [len(reg)])))
+        feats = DD.load_features(design_dir, self.sk)
+        for tile, rlist in self.tile_regions.items():
+            fs = feats.get(tile, set())
+            for k, i in enumerate(rlist):
+                if not fs and rng is not None and rng.random() > empty_keep:
+                    continue
+                a, b = sl.get(i, (0, 0))
+                yield self.regions[i][1], k, fs, code[a:b]
+
 
 def _packed(rows, S, n):
     """Bit-packed (n x ceil(S/64) uint64) matrix from rows: a list, per
@@ -167,8 +185,13 @@ class PackedRows:
     def add(self, s, names):
         if not names:
             return
-        ids = np.fromiter(map(self.ids.__getitem__, names), dtype=np.int64,
-                          count=len(names))
+        self.add_ids(s, np.fromiter(map(self.ids.__getitem__, names),
+                                    dtype=np.int64, count=len(names)))
+
+    def add_ids(self, s, ids):
+        """add() of names already interned (ids, in the sample's order)."""
+        if not len(ids):
+            return
         n = len(self.ids)
         if n > len(self.P):
             cap = max(n, 2 * len(self.P))
@@ -534,14 +557,62 @@ def _collect_one(item):
     return list(_COLLECTORS[dn].samples(d, rng=rng))
 
 
-# Per design sample cache.  One file per design: pickled chunks, one per
-# (tile type, region), then the pickled index {key: (offset, length, used,
-# empty)} plus stamp, then an 8 byte trailer with the index offset.  A
-# chunk is ([(sorted feature tuple, bit list)] of used tiles, same for
-# empty tiles).  The stamp (inputs' mtimes and sizes, features.py checksum)
-# invalidates it.
+# Per design sample cache.  One file per design: zlib compressed pickled
+# chunks, one per (tile type, region), then the pickled index {'stamp',
+# 'keys': [(key, (offset, length, used, empty, digest))]}, then an 8 byte
+# trailer with the index offset.  A chunk (_encode_chunk) holds the sorted
+# feature names and the bit names of its samples once, and per sample the
+# uint16 / int32 indices of its features (ascending: sorted names) and bits (in
+# the sample's bit order), for the used then the empty tiles.  digest is a
+# hash of the compressed chunk (phase 2 reuses the results of tasks whose
+# inputs did not change, see _task_digest).  The stamp (inputs' mtimes and
+# sizes, features.py checksum) invalidates the file.
 # (pickle: the cache is private to the build tree and written only here.)
-CACHE_VERSION = 2  # 2: zlib compressed chunks
+CACHE_VERSION = 3  # 2: zlib compressed chunks, 3: vocabulary encoded
+
+
+def _ids_dtype(vocab):
+    return np.uint16 if len(vocab) <= 1 << 16 else np.int32
+
+
+def _encode_chunk(used, empty, names):
+    """used: [(feature set, bit codes)], empty: [bit codes] -> bytes.
+    names: bit codes -> names (RegionMap.names)."""
+    flat = [f for fs, _ in used for f in fs]
+    fv = sorted(set(flat))
+    fidx = dict(zip(fv, range(len(fv))))
+    fid = np.fromiter(map(fidx.__getitem__, flat), dtype=_ids_dtype(fv),
+                      count=len(flat))
+    flen = np.array([len(fs) for fs, _ in used], dtype=np.int32)
+    # ascending within each sample (deterministic bytes: set order varies)
+    fid = fid[np.lexsort((fid, np.repeat(np.arange(len(flen)), flen)))]
+    codes = [c for _, c in used] + empty
+    allc = np.concatenate(codes) if codes else np.zeros(0, np.int64)
+    uc = np.unique(allc)
+    bid = np.searchsorted(uc, allc).astype(_ids_dtype(uc))
+    blen = np.array([len(c) for c in codes], dtype=np.int32)
+    data = (fv, names(uc), fid, flen, bid, blen, len(used))
+    return zlib.compress(pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL),
+                         1)
+
+
+def _read_raw(path, off, n):
+    with open(path, 'rb') as f:
+        f.seek(off)
+        return pickle.loads(zlib.decompress(f.read(n)))
+
+
+def _chunk_samples(raw):
+    """Decoded chunk: per sample (kind 'u' / 'e', feature ids, bit ids)
+    into raw's vocabularies (fv = raw[0], bit names = raw[1])."""
+    fv, bn, fflat, flen, bflat, blen, nu = raw
+    fo = np.concatenate(([0], np.cumsum(flen, dtype=np.int64)))
+    bo = np.concatenate(([0], np.cumsum(blen, dtype=np.int64)))
+    for j in range(len(blen)):
+        if j < nu:
+            yield 'u', fflat[fo[j]:fo[j + 1]], bflat[bo[j]:bo[j + 1]]
+        else:
+            yield 'e', fflat[:0], bflat[bo[j]:bo[j + 1]]
 
 
 def _code_stamp():
@@ -571,42 +642,73 @@ def _read_index(path):
 
 
 def _read_chunk(path, off, n):
-    with open(path, 'rb') as f:
-        f.seek(off)
-        return pickle.loads(zlib.decompress(f.read(n)))
+    """A chunk as ([(sorted feature tuple, bit list)] of the used tiles,
+    the same of the empty tiles)."""
+    raw = _read_raw(path, off, n)
+    fv, bn = raw[0], raw[1]
+    out = ([], [])
+    for kind, f, b in _chunk_samples(raw):
+        out[kind == 'e'].append((tuple(fv[i] for i in f.tolist()),
+                                 [bn[i] for i in b.tolist()]))
+    return out
 
 
 def _cache_one(item):
     """Worker: makes sure the sample cache of one design is current.
-    Returns [(key, used count, empty count)] in sample order."""
+    Returns [(key, used count, empty count, chunk digest)] in sample
+    order."""
+    import hashlib
+    import random
     arch, dn, d, path = item
     stamp = _cache_stamp(arch, dn, d)
     if os.path.exists(path):
         try:
             idx = _read_index(path)
             if idx['stamp'] == stamp:
-                return [(k, v[2], v[3]) for k, v in idx['keys']]
+                return [(k, v[2], v[3], v[4]) for k, v in idx['keys']]
         except (OSError, ValueError, EOFError, pickle.UnpicklingError,
-                KeyError):
+                KeyError, IndexError):
             pass
+    if dn not in _COLLECTORS:
+        die = dieslib.load()[dn]
+        tg = json.load(open(os.path.join(dieslib.DB, arch, dn,
+                                         'tilegrid.json')))
+        _COLLECTORS[dn] = Collector(die, tg)
     chunks = {}
-    for tt, k, fs, bits in _collect_one((arch, dn, d)):
+    for tt, k, fs, codes in _COLLECTORS[dn].sample_codes(
+            d, rng=random.Random(design_seed(d))):
         c = chunks.setdefault((tt, k), ([], []))
-        c[0 if fs else 1].append((tuple(sorted(fs)), bits))
+        if fs:
+            c[0].append((fs, codes))
+        else:
+            c[1].append(codes)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = f'{path}.{os.getpid()}.tmp'
     keys = []
     with open(tmp, 'wb') as f:
         for key, c in chunks.items():
-            data = zlib.compress(pickle.dumps(c, protocol=pickle.HIGHEST_PROTOCOL), 1)
-            keys.append((key, (f.tell(), len(data), len(c[0]), len(c[1]))))
+            data = _encode_chunk(*c, _COLLECTORS[dn].rmap.names)
+            keys.append((key, (f.tell(), len(data), len(c[0]), len(c[1]),
+                               hashlib.blake2b(data,
+                                               digest_size=16).hexdigest())))
             f.write(data)
         off = f.tell()
         f.write(pickle.dumps({'stamp': stamp, 'keys': keys},
                              protocol=pickle.HIGHEST_PROTOCOL))
         f.write(off.to_bytes(8, 'little'))
     os.replace(tmp, path)
-    return [(k, v[2], v[3]) for k, v in keys]
+    return [(k, v[2], v[3], v[4]) for k, v in keys]
+
+
+def _interned(rows, vmap, vocab, vids):
+    """PackedRows ids of the chunk vocabulary entries vids (vmap caches
+    them, -1 = not yet interned)."""
+    ids = vmap[vids]
+    if (ids < 0).any():
+        for v in vids[ids < 0].tolist():
+            vmap[v] = rows.ids[vocab[v]]
+        ids = vmap[vids]
+    return ids
 
 
 def _type_task(task):
@@ -624,27 +726,31 @@ def _type_task(task):
     FR, BR = PackedRows(S), PackedRows(S)
     emptyv = np.zeros(S, dtype=bool)
     gu = ge = 0
-    for path, nu, ne in designs:
+    for path, nu, ne, _ in designs:
         if not any(('u', g) in pos for g in range(gu, gu + nu)) and \
                 not any(('e', g) in pos for g in range(ge, ge + ne)):
             gu += nu
             ge += ne
             continue
         off, n = dict(_read_index(path)['keys'])[(tt, k)][:2]
-        cu, ce = _read_chunk(path, off, n)
-        for kind, chunk in (('u', cu), ('e', ce)):
-            for fs, bs in chunk:
-                g = gu if kind == 'u' else ge
-                i = pos.get((kind, g))
-                if i is not None:
-                    FR.add(i, fs)
-                    BR.add(i, bs)
-                    emptyv[i] = not fs
-                if kind == 'u':
-                    gu += 1
-                else:
-                    ge += 1
-        del cu, ce
+        raw = _read_raw(path, off, n)
+        # chunk vocabulary index -> PackedRows id, interned on first use
+        # by a selected sample (the same names in the same order as
+        # adding the names)
+        fmap = np.full(len(raw[0]), -1, dtype=np.int64)
+        bmap = np.full(len(raw[1]), -1, dtype=np.int64)
+        for kind, f, b in _chunk_samples(raw):
+            g = gu if kind == 'u' else ge
+            i = pos.get((kind, g))
+            if i is not None:
+                FR.add_ids(i, _interned(FR, fmap, raw[0], f))
+                BR.add_ids(i, _interned(BR, bmap, raw[1], b))
+                emptyv[i] = not len(f)
+            if kind == 'u':
+                gu += 1
+            else:
+                ge += 1
+        del raw
     # Same indexing as correlate(): features in feature_order, bits in order of first
     # appearance over the samples.
     del pos
@@ -755,6 +861,90 @@ def _written(outdir, tt, k, res, t0):
     return (tt, k), summary, line, peak, time.time() - t0
 
 
+# Phase 2 task reuse: <outdir>/.mkdb_tasks/<type>[.k].json records the
+# digest of a task's inputs with the hashes of the database files it wrote.
+TASK_RECORD_VERSION = 1
+
+
+_CODE_DIGEST = []
+
+
+def _code_digest():
+    """mkdb.py itself and the MKDB_* settings: any correlation change
+    invalidates every task."""
+    if _CODE_DIGEST:
+        return _CODE_DIGEST[0]
+    import hashlib
+    h = hashlib.blake2b(digest_size=16)
+    with open(os.path.abspath(__file__), 'rb') as f:
+        h.update(f.read())
+    for k in sorted(os.environ):
+        if k.startswith('MKDB_'):
+            h.update(f'{k}={os.environ[k]}'.encode())
+    _CODE_DIGEST.append(h.hexdigest())
+    return _CODE_DIGEST[0]
+
+
+def _task_digest(task, max_samples):
+    import hashlib
+    _, key, designs, su, se, _ = task
+    h = hashlib.blake2b(digest_size=16)
+    h.update(repr((TASK_RECORD_VERSION, _code_digest(), key,
+                   max_samples)).encode())
+    for _, nu, ne, dg in designs:
+        h.update(f'{nu} {ne} {dg};'.encode())
+    h.update(np.asarray(su, dtype=np.int64).tobytes())
+    h.update(b'|')
+    h.update(np.asarray(se, dtype=np.int64).tobytes())
+    return h.hexdigest()
+
+
+def _task_files(outdir, key):
+    tt, k = key
+    suffix = tt.lower() + (f'.{k}' if k else '')
+    return [os.path.join(outdir, f'{p}_{suffix}.{e}') for p, e in (
+        ('segbits', 'db'), ('defaults', 'db'), ('counts', 'txt'),
+        ('unexplained', 'txt'))]
+
+
+def _file_hash(path):
+    import hashlib
+    with open(path, 'rb') as f:
+        return hashlib.blake2b(f.read(), digest_size=16).hexdigest()
+
+
+def _task_record_path(outdir, key):
+    tt, k = key
+    return os.path.join(outdir, '.mkdb_tasks', f'{tt}.{k}.json')
+
+
+def _task_record(outdir, key, digest):
+    """The record of the task's last run if its digest is digest and its
+    database files are unchanged, else None."""
+    try:
+        with open(_task_record_path(outdir, key)) as f:
+            rec = json.load(f)
+        if rec['digest'] != digest:
+            return None
+        for p, h in zip(_task_files(outdir, key), rec['files']):
+            if _file_hash(p) != h:
+                return None
+        return rec
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def _save_task_record(outdir, key, digest, summary, line):
+    path = _task_record_path(outdir, key)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    rec = dict(digest=digest, summary=summary, line=line,
+               files=[_file_hash(p) for p in _task_files(outdir, key)])
+    tmp = f'{path}.{os.getpid()}.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(rec, f)
+    os.replace(tmp, path)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--arch', required=True)
@@ -805,10 +995,10 @@ def main():
     with ProcessPoolExecutor(args.sample_jobs or args.jobs) as ex:
         for n, (item, keys) in enumerate(
                 zip(work, ex.map(_cache_one, work, chunksize=2)), 1):
-            for key, nu, ne in keys:
+            for key, nu, ne, dg in keys:
                 if only and key[0] not in only:
                     continue
-                per_key.setdefault(key, []).append((item[3], nu, ne))
+                per_key.setdefault(key, []).append((item[3], nu, ne, dg))
             if n % 50 == 0 or n == len(work):
                 el = time.time() - t0
                 print(f'# samples {n}/{len(work)} designs, {el:.0f} s, eta '
@@ -827,9 +1017,24 @@ def main():
             if ne > args.max_samples // 5 else list(range(ne))
         tasks.append((outdir, key, designs, su, se,
                       os.path.join(cache, 'split')))
-    # Phase 2: one task per (tile type, region), largest first.
+    # Phase 2: one task per (tile type, region), largest first.  A task
+    # whose inputs are those of the task that wrote its current database
+    # files (same digest, files unchanged) is not run again.
     tasks.sort(key=lambda t: -(len(t[3]) + len(t[4])))
     results = {}
+    digests = {}
+    todo = []
+    for t in tasks:
+        dg = digests[t[1]] = _task_digest(t, args.max_samples)
+        rec = _task_record(outdir, t[1], dg)
+        if rec:
+            results[t[1]] = (rec['summary'], rec['line'])
+        else:
+            todo.append(t)
+    if len(todo) < len(tasks):
+        print(f'# {len(tasks) - len(todo)} of {len(tasks)} tasks reused '
+              '(inputs unchanged)', flush=True)
+    tasks = todo
     t0 = time.time()
     # One task per process: a task's peak memory is returned to the system
     # when it ends (and measured).
@@ -901,6 +1106,7 @@ def main():
             else:
                 key, summary, line, peak, dt = done.result()
             results[key] = (summary, line)
+            _save_task_record(outdir, key, digests[key], summary, line)
             ndone += 1
             print(f'# task {ndone}/{len(tasks)} {key[0]}.{key[1]} samples '
                   f'{summary["samples"]} {dt:.0f} s peak '
