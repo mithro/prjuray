@@ -1822,6 +1822,10 @@ def generate(die, prims, seed, out, density, hard=True, pips=None,
                 chosen.append(st)
             elif re.match(r'^(MMCM|PLL$|PLLE)', st) and rng.random() < 0.4:
                 chosen.append(st)
+            elif re.match(r'^(PCIE|GT[A-Z]E\d_CHANNEL)', st) and \
+                    rng.random() < 0.2:
+                # (single PCIe block, few GT quads: rare otherwise)
+                chosen.append(st)
         # 18 Kb and 36 Kb block RAM sites share tiles and the first type
         # processed takes them: alternate which one goes first (RAMB18
         # sorted first, leaving few RAMB36/FIFO36 tiles).
