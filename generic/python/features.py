@@ -107,6 +107,15 @@ class SiteKeys:
 _EQN_CACHE = {}
 _IDX = np.arange(64, dtype=np.uint8)
 _ENV = {f'A{k + 1}': ((_IDX >> k) & 1).astype(np.uint8) for k in range(6)}
+_IENV = {f'A{k + 1}': sum(1 << i for i in range(64) if (i >> k) & 1)
+         for k in range(6)}
+_IENV['_T'] = (1 << 64) - 1
+_LUT_LIT = re.compile(r'(?<![A\d])\d+')
+_LUT_LEAD0 = re.compile(r'(?<![A\d])0+[1-9]')
+_MASK64 = (1 << 64) - 1
+_SOP_LIT = r'(?:\(~A[1-6]\)|A[1-6])'
+_SOP_TERM = rf'\({_SOP_LIT}(?:\*{_SOP_LIT})*\)'
+_SOP = re.compile(rf'{_SOP_TERM}(?:\+{_SOP_TERM})*')
 
 
 def lut_eqn_bits(eqn):
@@ -122,12 +131,31 @@ def lut_eqn_bits(eqn):
     # eval() below (no names other than A1..A6, no calls/attributes).
     if not re.fullmatch(r'[A1-6&|^~() 01]*', py):
         return None
+    # Evaluated on 64 bit truth table masks (bit i = row i).
+    if _SOP.fullmatch(expr):
+        # Sum of products of (inverted) pins, the usual form: no eval.
+        v = 0
+        for term in expr[1:-1].split(')+('):
+            t = _MASK64
+            for lit in term.split('*'):
+                t &= _IENV[lit] if lit[0] == 'A' else ~_IENV[lit[2:4]]
+            v |= t
+        bits = [i for i in range(n) if (v >> i) & 1]
+        if len(_EQN_CACHE) < 200000:
+            _EQN_CACHE[eqn] = bits
+        return bits
+    # Otherwise eval() with the same bitwise operators on the masks; a
+    # literal is a constant row value (its bit 0): an odd literal is all
+    # rows, an even one none.  A literal with leading zeros (e.g. 01) is a
+    # syntax error in Python.
+    if _LUT_LEAD0.search(py):
+        return None
     try:
-        v = eval(py, {}, dict(_ENV))
+        v = eval(_LUT_LIT.sub(lambda m: '_T' if int(m.group()) & 1
+                              else '0', py), {}, dict(_IENV))
     except (SyntaxError, TypeError, NameError):
         return None
-    v = np.broadcast_to(np.asarray(v, dtype=np.int64) & 1, (64, ))
-    bits = [int(i) for i in np.nonzero(v[:n])[0]]
+    bits = [i for i in range(n) if (v >> i) & 1]
     if len(_EQN_CACHE) < 200000:
         _EQN_CACHE[eqn] = bits
     return bits
@@ -432,12 +460,18 @@ def tile_features(path, sitekeys):
     # route does not report (prjxray IOI_OCLKM_1.IOI_LEAF_GCLK5 = 30_30
     # 30_38 30_44: set with GCLK5->OCLK_1 only when OLOGIC1 uses OCLK_1).
     for tile, fs in feats.items():
-        used = {m.group(1) for f in fs
+        # (substring tests first: the patterns match few features)
+        if 'IOI_OCLK_' not in '\n'.join(fs):
+            continue
+        used = {m.group(1) for f in fs if f.startswith('IOI_OCLK_')
                 for m in [_OCLK_TO_OLOGIC.match(f)] if m}
         if not used:
             continue
-        have_m = {m.group(1) for f in fs for m in [_TO_OCLKM.match(f)] if m}
+        have_m = {m.group(1) for f in fs if '->IOI_OCLKM_' in f
+                  for m in [_TO_OCLKM.match(f)] if m}
         for f in list(fs):
+            if '->IOI_OCLK_' not in f:
+                continue
             m = _TO_OCLK.match(f)
             if m and m.group(2) in used and m.group(2) not in have_m:
                 fs.add(f'{m.group(1)}->IOI_OCLKM_{m.group(2)}')
@@ -447,7 +481,9 @@ def tile_features(path, sitekeys):
     # which are same edge) with CLK, or OPPOSITE_EDGE with CLK_B (xa7a12t:
     # exact over 41 set / 36 clear samples).  Name the pair.
     for tile, fs in feats.items():
-        for f in list(fs):
+        if '.CLKINV.SP.' not in '\n'.join(fs):
+            continue
+        for f in [f for f in fs if '.CLKINV.SP.' in f]:
             m = _OLOGIC_CLKINV.match(f)
             if not m:
                 continue
@@ -469,7 +505,9 @@ def tile_features(path, sitekeys):
     # (xa7a12t r9: exact, 93 / 84 set samples).  Name the register setting
     # together with the source of its select input.
     for tile, fs in feats.items():
-        for f in list(fs):
+        if '.DSP48E1.' not in '\n'.join(fs):
+            continue
+        for f in [f for f in fs if '.DSP48E1.' in f]:
             m = _DSP_REG.match(f)
             if not m:
                 continue
