@@ -152,10 +152,41 @@ class Grid:
                 elif o_lo >= base:
                     hi = min(hi, o_lo)
         if w is not None:
-            lo, hi = min(lo, w[1]), max(hi, w[1] + w[2])
+            # The structural part beyond the learnt window stops where the
+            # learnt window of another tile of the grid column begins (GT
+            # channels: the empty rows above a channel tile belong to the
+            # next channel).
+            s_lo, s_hi = w[1], w[1] + w[2]
+            if not self.probe:
+                for o_lo, o_hi in self._column_learnt(t):
+                    if o_lo >= hi and o_lo < s_hi:
+                        s_hi = o_lo
+                    if o_hi <= lo and o_hi > s_lo:
+                        s_lo = o_hi
+            lo, hi = min(lo, s_lo), max(hi, s_hi)
         if not self.probe:
             lo, hi = max(lo, 0), min(hi, self.frame_bits)
         return self.crrow[t['gy']], lo, hi - lo
+
+    def _column_learnt(self, t):
+        """(first, end bit) of the learnt windows of the other tiles of t's
+        grid column in its clock region row."""
+        out = []
+        cr = self.crrow[t['gy']]
+        if not hasattr(self, '_col_all'):
+            self._col_all = collections.defaultdict(list)
+            for n, x in self.tiles.items():
+                if x['type'] in self.type_windows:
+                    self._col_all[x['gx']].append(n)
+        for n in self._col_all.get(t['gx'], ()):
+            x = self.tiles[n]
+            if n == t['name'] or self.crrow[x['gy']] != cr:
+                continue
+            b = self.row_bit(x['gy'])
+            if b is not None:
+                tw = self.type_windows[x['type']]
+                out.append((b + tw[0], b + tw[1]))
+        return out
 
     def _column_owners(self, t):
         """Tiles of t's grid column (other than t) with sites whose type has
@@ -183,13 +214,21 @@ class Grid:
             return None
         r = self.rowidx[gy]
         # Height: grid rows above the anchor occupied by nothing else.
+        # UltraScale(+): an empty centre (RCLK) row does not end the tile:
+        # a GT quad or CMT in the bottom INT row with nothing above it spans
+        # the whole clock region, centre bits included.  (Series7 hard
+        # blocks get learnt windows; wider structural windows there would
+        # clip their neighbours' learnt windows.)
+        through = self.centre_rows if self.arch != 'Series7' else ()
         h = 1
         cr = self.crrow[gy]
         y = gy - 1
-        while (y in self.rowidx and self.crrow[y] == cr and
+        while ((y in self.rowidx or y in through) and
+               self.crrow[y] == cr and
                self.tiles.get(self.at.get((t['gx'], y)),
                               {}).get('type', 'NULL') == 'NULL'):
-            h += 1
+            if y in self.rowidx:
+                h += 1
             y -= 1
         off = r * self.bpr
         half = self.rows_per_cr // 2
@@ -309,16 +348,31 @@ def collect(die, design_root, verbose=False):
     cols = frame_columns(dframes)
     block0 = {k: v for k, v in cols.items() if k[0] == 0}
 
+    # The per frame change patterns of the windows at the current rows
+    # (lo, n), cached per frame column: the tiles are visited sorted by
+    # window, so consecutive tiles share them (big dies: hours without).
+    mask_cache = {}
+    cache_rows = [None]
+
+    def window_masks(first, nfr, lo, n):
+        if cache_rows[0] != (lo, n):
+            mask_cache.clear()
+            cache_rows[0] = (lo, n)
+        m = mask_cache.get((first, nfr))
+        if m is None:
+            masks = np.bitwise_or.reduce(act[first:first + nfr, lo:lo + n],
+                                         axis=1)
+            m = mask_cache[(first, nfr)] = set(to_int(x) for x in masks)
+        return m
+
     def col_score(u, col, lo, n):
         """Similarity between a tile usage mask and a column window: the
         better of the whole window change pattern and the best single frame
         change pattern (tiles sharing a column use different frames)."""
         _, first, nfr = col
-        masks = np.bitwise_or.reduce(act[first:first + nfr, lo:lo + n],
-                                     axis=1)
         best = 0.0
         whole = 0
-        for m in set(to_int(x) for x in masks):
+        for m in window_masks(first, nfr, lo, n):
             whole |= m
             if m:
                 best = max(best, bin(u & m).count('1') / bin(u | m).count('1'))
@@ -338,6 +392,7 @@ def collect(die, design_root, verbose=False):
         if w is None:
             continue
         tiles_used.append((t, u, w))
+    tiles_used.sort(key=lambda x: (x[2][1], x[2][2], x[0]))
     # 1. Frame row of each clock region row: vote with sparse used tiles.
     rowvote = collections.defaultdict(collections.Counter)
     for t, u, (cr, lo, n) in tiles_used:
@@ -734,6 +789,18 @@ def edge_variants(grid, out, verbose=False):
         print('edge variants', ' '.join(sorted(split)))
 
 
+def inert_types(die):
+    """Tile types with neither PIPs nor sites (Vivado tile type table)."""
+    out = set()
+    with open(die.types_txt) as f:
+        for line in f:
+            p = line.split()
+            if p and p[0] == 'tiletype' and int(p[4]) == 0 and \
+                    int(p[5]) == 0:
+                out.add(p[1])
+    return out
+
+
 def build(grid, dframes, cols, crmap, colmap, colmap1, verbose=False,
           tilemap=None, frame_caps=None):
     """Returns the tilegrid dict: tile -> {type, gx, gy, bits: [...]}.
@@ -750,10 +817,13 @@ def build(grid, dframes, cols, crmap, colmap, colmap1, verbose=False,
         for col, first, nfr in clist:
             colinfo[(key, col)] = (first, nfr)
     out = {}
+    # Tile types without PIPs and sites (e.g. Series7 HCLK_FIFO_L, breaks,
+    # terminations) own no configuration bits: no region (like prjxray).
+    inert = inert_types(grid.die)
     for name, t in grid.tiles.items():
         w = grid.tile_window(name)
         entry = dict(type=t['type'], gx=t['gx'], gy=t['gy'], bits=[])
-        if w is not None:
+        if w is not None and t['type'] not in inert:
             cr, lo, n = w
             key = crmap.get(cr)
             col = tilemap.get(name, colmap.get((cr, t['gx'])))
