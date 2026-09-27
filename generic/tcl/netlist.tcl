@@ -580,6 +580,15 @@ proc nl_const_offenders {txt} {
     return [lsort -unique $cells]
 }
 
+# Optional place_design / route_design directive from the environment
+# (NL_PLACE_DIRECTIVE, NL_ROUTE_DIRECTIVE, e.g. Quick); none by default.
+proc nl_directive {what} {
+    if {[info exists ::env(NL_${what}_DIRECTIVE)] && $::env(NL_${what}_DIRECTIVE) ne ""} {
+        return [list -directive $::env(NL_${what}_DIRECTIVE)]
+    }
+    return [list]
+}
+
 set nl_orphans [list]
 proc nl_finish {{relaxclk 0}} {
     nl_flush_nets
@@ -615,7 +624,7 @@ proc nl_finish {{relaxclk 0}} {
         }
         if {$stage eq "place"} {
             nl_fix_dangling
-            if {[catch {place_design} e]} {
+            if {[catch {place_design {*}[nl_directive PLACE]} e]} {
                 nl_log "place_design failed: [string range $e 0 200]"
                 lassign [nl_offenders "ERROR: $e"] names nets
                 global nl_lasttxt
@@ -644,7 +653,7 @@ proc nl_finish {{relaxclk 0}} {
             set stage route
         }
         if {$stage eq "route"} {
-            if {[catch {route_design} e]} {
+            if {[catch {route_design {*}[nl_directive ROUTE]} e]} {
                 nl_log "route_design failed: [string range $e 0 200]"
                 lassign [nl_offenders "ERROR: $e"] names nets
                 catch {route_design -unroute}
@@ -748,6 +757,49 @@ proc nl_pblock {name range cells} {
 #         differential ones must start with DIFF_ or be in diffstds)
 #   props: random buffer/port properties to try
 set nl_bank_vcco [dict create]
+# Input reference voltage of the single ended VREF standards (7-series /
+# UltraScale HP/HR).
+proc nl_vref_of {std} {
+    foreach {re v} {
+        {^SSTL135} 0.675
+        {^(SSTL15|HSTL_I$|HSTL_II$|HSTL_I_DCI$|HSTL_II_DCI$|HSTL_II_T_DCI$)} 0.75
+        {^(SSTL18|HSTL_I_18|HSTL_II_18|HSTL_I_DCI_18|HSTL_II_DCI_18|HSTL_II_T_DCI_18|MOBILE_DDR)} 0.9
+        {^(SSTL12|HSUL_12|HSTL_I_12|HSTL_I_DCI_12)} 0.6
+        {^POD12} 0.84
+        {^POD10} 0.7
+    } {
+        if {[regexp $re $std]} { return $v }
+    }
+    return ""
+}
+
+# Internal VREF: in banks whose single ended inputs all use one VREF
+# standard, use the bank's internal reference with probability p (the
+# INTERNAL_VREF bank property; otherwise the VREF pins supply it).
+proc nl_internal_vref {p} {
+    set want [dict create]
+    foreach port [get_ports -quiet -filter {DIRECTION != OUT}] {
+        set pin [get_package_pins -quiet -of_objects $port]
+        if {$pin eq ""} continue
+        set v [nl_vref_of [get_property IOSTANDARD $port]]
+        set b [get_property BANK $pin]
+        if {$v eq ""} continue
+        if {[dict exists $want $b] && [dict get $want $b] ne $v} {
+            dict set want $b -
+        } else {
+            dict set want $b $v
+        }
+    }
+    dict for {b v} $want {
+        if {$v eq "-" || rand() >= $p} continue
+        if {[catch {set_property INTERNAL_VREF $v [get_iobanks $b]} e]} {
+            nl_log "vreferr $b $v [string range $e 0 150]"
+        } else {
+            nl_log "internal_vref $b $v"
+        }
+    }
+}
+
 proc nl_iob {name site mode ref stds props} {
     nl_flush_nets
     global nl_bank_vcco

@@ -307,22 +307,29 @@ proc dump_features {out} {
         foreach s $sites st [_df_props SITE_TYPE $sites] {
             puts $fp "site $s $st -"
         }
+        # The BELs are kept as Vivado collections throughout: get_property
+        # on a plain list of BEL names looks every name up (several times
+        # slower).  BELs without configuration (NUM_CONFIGS == 0, cheap to
+        # test) are dropped before the costly IS_USED test.
         set used [get_sites -quiet -filter {IS_USED}]
-        set bels [get_bels -quiet -of_objects $used -filter {IS_USED}]
+        set groups [list [get_bels -quiet -of_objects $used -filter {NUM_CONFIGS > 0 && IS_USED}]]
         # Routing-only sites: all their BELs (unconfigured ones are skipped).
         set ronly [struct_diff $sites $used]
         if {[llength $ronly]} {
-            set bels [concat $bels [get_bels -quiet -of_objects $ronly]]
+            lappend groups [get_bels -quiet -of_objects [get_sites -quiet $ronly] -filter {NUM_CONFIGS > 0}]
         }
-        set bytype [dict create]
-        foreach b $bels t [_df_props TYPE $bels] { dict lappend bytype $t $b }
-        dict for {t bl} $bytype {
-            foreach p [_df_cfg_props [lindex $bl 0]] {
-                set name [string range $p 7 end]
-                foreach b $bl v [_df_props $p $bl] {
-                    if {$v eq "NOT CONFIGURED" || $v eq ""} continue
-                    set n [split $b /]
-                    puts $fp "cfg [lindex $n 0] [lindex $n end] $name [string map {" " "_"} $v]"
+        foreach bels $groups {
+            if {[llength $bels] == 0} continue
+            foreach t [lsort -unique [_df_props TYPE $bels]] {
+                set bl [filter -quiet $bels "TYPE == $t"]
+                set names [_df_props NAME $bl]
+                foreach p [_df_cfg_props [lindex $bl 0]] {
+                    set name [string range $p 7 end]
+                    foreach b $names v [_df_props $p $bl] {
+                        if {$v eq "NOT CONFIGURED" || $v eq ""} continue
+                        set n [split $b /]
+                        puts $fp "cfg [lindex $n 0] [lindex $n end] $name [string map {" " "_"} $v]"
+                    }
                 }
             }
         }
@@ -374,6 +381,15 @@ proc dump_features {out} {
         }
     }
     puts $fp "# t_sp [expr {[clock milliseconds] - $t0}]"
+    # Pad pull resistors (a port property, not in the BEL configuration):
+    # reported like a BEL setting of the pad site (NONE when not set).
+    foreach port [get_ports -quiet] {
+        set s [get_sites -quiet -of_objects $port]
+        if {![string match IOB_* $s]} continue
+        set v [get_property -quiet PULLTYPE $port]
+        if {$v eq ""} { set v NONE }
+        puts $fp "cfg $s PAD PULLTYPE $v"
+    }
     # Pin inversions of placed cells (IS_<pin>_INVERTED, e.g. the flip-flop
     # clock and set/reset inversion of a slice): a setting Vivado does not
     # expose as BEL configuration nor as a site pip.  The inverter is shared
@@ -426,16 +442,45 @@ proc dump_features {out} {
     # also change unused pads: report the I/O standards used in each bank on
     # every pad site of the bank.
     set bankstd [dict create]
+    set bankin [dict create]
     foreach port [get_ports -quiet] {
         set pin [get_package_pins -quiet -of_objects $port]
         set std [get_property IOSTANDARD $port]
         if {$pin eq "" || $std eq ""} continue
-        dict set bankstd [get_property BANK $pin] $std 1
+        set b [get_property BANK $pin]
+        dict set bankstd $b $std 1
+        # Kinds of inputs in the bank (differential / single ended).
+        if {[get_property DIRECTION $port] ne "OUT"} {
+            set diff [regexp {^(DIFF_|LVDS|TMDS|MINI_LVDS|BLVDS|RSDS|PPDS|SUB_LVDS|SLVS|LVPECL|MIPI)} $std]
+            dict set bankin $b [expr {$diff ? "DIFF" : "SE"}] 1
+        }
+    }
+    # 7-series bank settings (internal VREF, ...) live in the HCLK_IOI tile
+    # of the bank: report them on its IDELAYCTRL site too (same clock
+    # region and I/O column as the bank's pads).
+    set dlyctl [dict create]
+    foreach s [get_sites -quiet -filter {SITE_TYPE == IDELAYCTRL}] {
+        if {[regexp {_X(\d+)Y} $s - x]} {
+            dict set dlyctl [get_property CLOCK_REGION $s],$x $s
+        }
     }
     dict for {bank stds} $bankstd {
         set bsites [get_sites -quiet -of_objects [get_package_pins -quiet -filter "BANK == $bank"]]
+        set vref [get_property -quiet INTERNAL_VREF [get_iobanks -quiet $bank]]
+        if {$vref eq ""} { set vref NONE }
+        set extra [list]
         foreach s $bsites {
+            if {[regexp {^IOB_X(\d+)Y} $s - x]} {
+                set k [get_property -quiet CLOCK_REGION $s],$x
+                if {[dict exists $dlyctl $k]} { lappend extra [dict get $dlyctl $k] }
+            }
+        }
+        foreach s [concat $bsites [lsort -unique $extra]] {
             foreach std [dict keys $stds] { puts $fp "bank $s IOSTD $std" }
+            puts $fp "bank $s INTERNAL_VREF $vref"
+            if {[dict exists $bankin $bank]} {
+                puts $fp "bank $s INPUTS [join [lsort [dict keys [dict get $bankin $bank]]] _]"
+            }
         }
     }
     puts $fp "# t_done [expr {[clock milliseconds] - $t0}]"
