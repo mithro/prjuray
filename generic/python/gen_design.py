@@ -266,6 +266,7 @@ class Design:
             f.write('catch {set_property BITSTREAM.CONFIG.UNUSEDPIN '
                     f'{rng.choice(["Pulldown", "Pullup", "Pullnone"])} '
                     '[current_design]}\n')
+            f.write('nl_internal_vref 0.5\n')
             f.write(f'nl_finish {int(rng.random() < 0.5)}\n')
 
 

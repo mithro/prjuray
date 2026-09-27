@@ -383,16 +383,45 @@ proc dump_features {out} {
     # also change unused pads: report the I/O standards used in each bank on
     # every pad site of the bank.
     set bankstd [dict create]
+    set bankin [dict create]
     foreach port [get_ports -quiet] {
         set pin [get_package_pins -quiet -of_objects $port]
         set std [get_property IOSTANDARD $port]
         if {$pin eq "" || $std eq ""} continue
-        dict set bankstd [get_property BANK $pin] $std 1
+        set b [get_property BANK $pin]
+        dict set bankstd $b $std 1
+        # Kinds of inputs in the bank (differential / single ended).
+        if {[get_property DIRECTION $port] ne "OUT"} {
+            set diff [regexp {^(DIFF_|LVDS|TMDS|MINI_LVDS|BLVDS|RSDS|PPDS|SUB_LVDS|SLVS|LVPECL|MIPI)} $std]
+            dict set bankin $b [expr {$diff ? "DIFF" : "SE"}] 1
+        }
+    }
+    # 7-series bank settings (internal VREF, ...) live in the HCLK_IOI tile
+    # of the bank: report them on its IDELAYCTRL site too (same clock
+    # region and I/O column as the bank's pads).
+    set dlyctl [dict create]
+    foreach s [get_sites -quiet -filter {SITE_TYPE == IDELAYCTRL}] {
+        if {[regexp {_X(\d+)Y} $s - x]} {
+            dict set dlyctl [get_property CLOCK_REGION $s],$x $s
+        }
     }
     dict for {bank stds} $bankstd {
         set bsites [get_sites -quiet -of_objects [get_package_pins -quiet -filter "BANK == $bank"]]
+        set vref [get_property -quiet INTERNAL_VREF [get_iobanks -quiet $bank]]
+        if {$vref eq ""} { set vref NONE }
+        set extra [list]
         foreach s $bsites {
+            if {[regexp {^IOB_X(\d+)Y} $s - x]} {
+                set k [get_property -quiet CLOCK_REGION $s],$x
+                if {[dict exists $dlyctl $k]} { lappend extra [dict get $dlyctl $k] }
+            }
+        }
+        foreach s [concat $bsites [lsort -unique $extra]] {
             foreach std [dict keys $stds] { puts $fp "bank $s IOSTD $std" }
+            puts $fp "bank $s INTERNAL_VREF $vref"
+            if {[dict exists $bankin $bank]} {
+                puts $fp "bank $s INPUTS [join [lsort [dict keys [dict get $bankin $bank]]] _]"
+            }
         }
     }
     puts $fp "# t_done [expr {[clock milliseconds] - $t0}]"
