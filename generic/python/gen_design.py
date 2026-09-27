@@ -1732,6 +1732,11 @@ def generate(die, prims, seed, out, density, hard=True, pips=None,
             if re.match(r'^(RAMB|RAMBFIFO|DSP|URAM)', st) and \
                     st not in chosen and rng.random() < 0.5:
                 chosen.append(st)
+        # 18 Kb and 36 Kb block RAM sites share tiles and the first type
+        # processed takes them: alternate which one goes first (RAMB18
+        # sorted first, leaving few RAMB36/FIFO36 tiles).
+        if rng.random() < 0.5:
+            chosen.reverse()
         used = collections.Counter()
         bram_tiles = {}
         for st in chosen:

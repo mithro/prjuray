@@ -151,6 +151,12 @@ def tile_features(path, sitekeys):
         for line in f:
             p = line.rstrip('\n').split(' ')
             kind = p[0]
+            if kind == 'cfg' and len(p) >= 5 and p[2] == 'PAD' and \
+                    p[1] not in site_map and p[1] in sitekeys.key:
+                # A pad in use without a site of its own in the dump (the N
+                # side of a differential input goes through the P site):
+                # it is used (no UNUSEDPIN pull), with its own pull setting.
+                site_map[p[1]] = sitekeys.key[p[1]]
             # Skip malformed lines (older dumps could misalign values).
             if kind in ('sp', 'cfg') and (len(p) < 5 or p[1] not in site_map):
                 continue
