@@ -147,7 +147,15 @@ def cfg_features(prefix, name, value):
             out += [f'{prefix}.{name}[{i}]=0' for i in range(width)
                     if not (v >> i) & 1]
         return out
-    return [f'{prefix}.{name}={value}']
+    out = [f'{prefix}.{name}={value}']
+    if value.isdigit() and name.endswith('DELAY_VALUE'):
+        # Delay taps are stored as binary (7-series IDELAY/ODELAY_VALUE,
+        # 5 bits, prjxray [Z]IDELAY_VALUE[i]): name the bits too.
+        v = int(value)
+        width = 5 if v < 32 else max(11, v.bit_length())
+        out += [f'{prefix}.{name}[{i}]' + ('' if (v >> i) & 1 else '=0')
+                for i in range(width)]
+    return out
 
 
 def open_any(path):
