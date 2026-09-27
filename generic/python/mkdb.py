@@ -30,6 +30,7 @@ import zlib
 
 import numpy as np
 
+import bitstream
 import designdata as DD
 import dies as dieslib
 import features as featlib
@@ -77,13 +78,23 @@ class Collector:
         return out
 
     def unowned(self, ids):
+        """Set bits in no tile's region.  self.hidden counts those of them
+        in frame rows without any tile region (e.g. frame rows of fabric
+        the device does not expose, configured but without tiles)."""
+        if not hasattr(self, "_hidden_frame"):
+            key = [bitstream.far_fields(self.die.arch, f)[:3]
+                   for f in self.df.frames]
+            used = {key[f] for f in self.by_frame}
+            self._hidden_frame = [k not in used for k in key]
         fis = ids // self.nbf
         offs = ids % self.nbf
         n = 0
+        self.hidden = 0
         for f, o in zip(fis.tolist(), offs.tolist()):
             if not any(off <= o < off + k
                        for off, k, _ in self.by_frame.get(f, ())):
                 n += 1
+                self.hidden += self._hidden_frame[f]
         return n
 
     def samples(self, design_dir, empty_keep=0.2, rng=None):
@@ -320,13 +331,22 @@ def _collect_one(item):
 # (tile type, region), then the pickled index {key: (offset, length, used,
 # empty)} plus stamp, then an 8 byte trailer with the index offset.  A
 # chunk is ([(sorted feature tuple, bit list)] of used tiles, same for
-# empty tiles).  The stamp (inputs' mtimes and sizes) invalidates it.
+# empty tiles).  The stamp (inputs' mtimes and sizes, features.py checksum)
+# invalidates it.
 # (pickle: the cache is private to the build tree and written only here.)
 CACHE_VERSION = 2  # 2: zlib compressed chunks
 
 
+def _code_stamp():
+    """Checksum of the feature extraction code: changing how features are
+    derived from the dumps must invalidate cached samples."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(here, 'features.py'), 'rb') as f:
+        return zlib.crc32(f.read())
+
+
 def _cache_stamp(arch, dn, d):
-    st = [CACHE_VERSION]
+    st = [CACHE_VERSION, _code_stamp()]
     for p in (os.path.join(d, 'bits.npz'),
               os.path.join(d, 'design.features.gz'),
               os.path.join(dieslib.DB, arch, dn, 'tilegrid.json')):
