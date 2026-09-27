@@ -191,6 +191,19 @@ a bit is documented when any owner documents it).  `pipeline.py
 --probe-windows` does all of this.  `check.py` reports distinct undocumented
 bits (`bits N`) next to the per owner count.
 
+A learnt window never covers the structural window of another tile with
+sites (of a type without a learnt window) in the same grid column.  Tile
+types sharing frame columns of several sizes with other columns
+(interconnect next to CLB, BRAM, DSP, CMT and I/O columns) only use the
+frames of the smallest (`colalign.py` writes `<arch>/frames.json`,
+`tilegrid.py --frames` caps their regions; Series7 INT: 28 frames, like
+prjxray).  Tile types with sites found only in the bottom and top INT rows
+of clock region rows (Series7 `*_SING` I/O tiles, whose two instances hold
+the two different halves of a two row I/O tile) get the type `<type>@TOP`
+for their top instances.  Bits of frame rows without any tile (e.g. clock
+region rows a device does not expose) that are also set in the empty design
+are reported by `check.py` as `baseline_in_tileless_rows`, not unowned.
+
 Block RAM content (block type 1) columns map in order onto the BRAM grid
 columns of the clock region row; when the row has more of them (BRAM columns
 replaced by the PS) the extra ones are placed on the side of the unused
