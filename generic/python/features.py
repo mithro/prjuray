@@ -50,10 +50,19 @@ def _std_vcco():
 
 _VCCO = None
 
+_DSP_REG = re.compile(r'^(DSP48_X\d+Y\d+)\.DSP48E1\.([AB])REG=(\d)$')
+_OLOGIC_CLKINV = re.compile(r'^(OLOGIC_X\d+Y\d+)\.CLKINV\.SP\.(CLK|CLK_B)\.OUT$')
+_OCLK_TO_OLOGIC = re.compile(r'^IOI_OCLK_(\d)->IOI_OLOGIC\1_CLK$')
+_TO_OCLK = re.compile(r'^(\S+)->IOI_OCLK_(\d)$')
+_TO_OCLKM = re.compile(r'^\S+->IOI_OCLKM_(\d)$')
+
 # BEL -> (setting, conditioning setting) pairs, see tile_features.
 _STD_CONDITIONED = {
     'OUTBUF': (('SLEW', 'OSTANDARD'), ('DRIVE', 'OSTANDARD')),
     'INBUF_EN': (('IN_TERM', 'ISTANDARD'), ('IBUF_LOW_PWR', 'ISTANDARD')),
+    # 7-series DSP: one bit per port encodes AREG=2 with ACASCREG=1
+    # (prjxray ZAREG_2_ACASCREG_1 / ZBREG_2_BCASCREG_1).
+    'DSP48E1': (('AREG', 'ACASCREG'), ('BREG', 'BCASCREG')),
 }
 
 PAD_SITE = re.compile(r'^(IOB|HPIOB|HRIO|HDIOB|IOPAD|IPAD|OPAD)')
@@ -139,7 +148,15 @@ def cfg_features(prefix, name, value):
             out += [f'{prefix}.{name}[{i}]=0' for i in range(width)
                     if not (v >> i) & 1]
         return out
-    return [f'{prefix}.{name}={value}']
+    out = [f'{prefix}.{name}={value}']
+    if value.isdigit() and name.endswith('DELAY_VALUE'):
+        # Delay taps are stored as binary (7-series IDELAY/ODELAY_VALUE,
+        # 5 bits, prjxray [Z]IDELAY_VALUE[i]): name the bits too.
+        v = int(value)
+        width = 5 if v < 32 else max(11, v.bit_length())
+        out += [f'{prefix}.{name}[{i}]' + ('' if (v >> i) & 1 else '=0')
+                for i in range(width)]
+    return out
 
 
 def open_any(path):
@@ -207,6 +224,56 @@ def tile_features(path, sitekeys):
         vs = {_VCCO.get(x) for x in stds}
         if len(vs) == 1 and None not in vs:
             feats[tile].add(f'{key}.BANK.VCCO={vs.pop()}')
+    # 7-series IOI: an OLOGIC clocked through IOI_OCLK_<n> also gets the
+    # OCLKM_<n> mux (its inverted clock) set to the same source, a pip the
+    # route does not report (prjxray IOI_OCLKM_1.IOI_LEAF_GCLK5 = 30_30
+    # 30_38 30_44: set with GCLK5->OCLK_1 only when OLOGIC1 uses OCLK_1).
+    for tile, fs in feats.items():
+        used = {m.group(1) for f in fs
+                for m in [_OCLK_TO_OLOGIC.match(f)] if m}
+        if not used:
+            continue
+        have_m = {m.group(1) for f in fs for m in [_TO_OCLKM.match(f)] if m}
+        for f in list(fs):
+            m = _TO_OCLK.match(f)
+            if m and m.group(2) in used and m.group(2) not in have_m:
+                fs.add(f'{m.group(1)}->IOI_OCLKM_{m.group(2)}')
+    # 7-series OLOGIC: one bit per OLOGIC (prjxray "ODDR.DDR_CLK_EDGE.
+    # SAME_EDGE", LIOI3 31_92 / 30_35) is set when the clock edge setting
+    # and the clock inversion agree: SAME_EDGE (ODDR, and OSERDES / FF
+    # which are same edge) with CLK, or OPPOSITE_EDGE with CLK_B (xa7a12t:
+    # exact over 41 set / 36 clear samples).  Name the pair.
+    for tile, fs in feats.items():
+        for f in list(fs):
+            m = _OLOGIC_CLKINV.match(f)
+            if not m:
+                continue
+            key, inv = m.group(1), m.group(2)
+            edge = 'SAME_EDGE'
+            if f'{key}.OUTFF.ODDR_CLK_EDGE=OPPOSITE_EDGE' in fs and \
+                    f'{key}.OUTFF.OUTFFTYPE=DDR' in fs:
+                edge = 'OPPOSITE_EDGE'
+            fs.add(f'{key}.CLKINV.SP.{inv}.OUT@CLK_EDGE={edge}')
+    # 7-series DSP48E1: the "AREG_0" / "BREG_0" bits (prjxray, DSP_L 27_111
+    # / 27_038, 27_271 / 27_198) are set for AREG=0, and for AREG=1 when
+    # INMODE[0] (A1/A2 select; INMODE[4] for B) is tied to ground
+    # (xa7a12t r9: exact, 93 / 84 set samples).  Name the register setting
+    # together with the source of its select input.
+    for tile, fs in feats.items():
+        for f in list(fs):
+            m = _DSP_REG.match(f)
+            if not m:
+                continue
+            key, port, val = m.group(1), m.group(2), m.group(3)
+            k = key[-1]
+            pin = f'DSP_{k}_INMODE{0 if port == "A" else 4}'
+            src = 'NONE'
+            for g in fs:
+                if g.endswith('->' + pin):
+                    src = ('GND' if '_GND_' in g else 'VCC' if '_VCC_' in g
+                           else 'FABRIC')
+                    break
+            fs.add(f'{key}.DSP48E1.{port}REG={val}@{pin[6:]}={src}')
     # 7-series FIFO almost full / empty offsets are stored adjusted (and
     # inverted): full = ALMOST_FULL_OFFSET + 1 without EN_SYN, empty =
     # ALMOST_EMPTY_OFFSET - 1 without EN_SYN with FIRST_WORD_FALL_THROUGH
@@ -230,9 +297,9 @@ def tile_features(path, sitekeys):
             v = (v + adj) % (1 << width)
             feats[tile].update(cfg_features(prefix, name + '_STORED',
                                             f"{width}'h{v:X}"))
-    # I/O buffer settings whose bits depend on the I/O standard (7-series
-    # SLEW / DRIVE / IN_TERM bits differ between standard families): also
-    # name them together with the standard.
+    # Settings whose bits depend on another setting of the same BEL (7-series
+    # SLEW / DRIVE / IN_TERM bits differ between I/O standard families, DSP
+    # register / cascade register pairs): also name them together.
     for (tile, prefix), cfgs in bel_cfgs.items():
         bel = prefix.rsplit('.', 1)[-1]
         for name, cond in _STD_CONDITIONED.get(bel, ()):

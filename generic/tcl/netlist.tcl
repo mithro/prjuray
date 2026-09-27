@@ -99,6 +99,21 @@ proc nl_gnd {} {
     return $n
 }
 
+# Tie pins to ground.  Clock / set-reset pins of flip-flops, latches and
+# shift registers lose their inversion: with it the tied pin is a logic 1
+# on the site's shared inverter, and a neighbouring cell tied to ground
+# without inversion makes the site unroutable ("Conflicting nets for
+# physical connection CLK1INV_OUT / RST_ABCDINV_OUT: GROUND, POWER").
+proc nl_tie_gnd {pins} {
+    foreach p $pins {
+        set c [get_cells -quiet -of_objects $p]
+        if {$c eq "" || ![regexp {^(FD|LD|SRL)} [get_property REF_NAME $c]]} continue
+        set prop IS_[get_property REF_PIN_NAME $p]_INVERTED
+        catch {set_property $prop 1'b0 $c}
+    }
+    connect_net -net [nl_gnd] -objects $pins
+}
+
 # Create net <name> connecting the given pins (first one is the driver).
 # A missing driver (e.g. an I/O buffer that could not be created) ties the
 # loads to ground; I/O logic left without loads is removed.
@@ -119,7 +134,7 @@ proc nl_net {name pins} {
             }
         }
         if {[llength $tie]} {
-            if {[catch {connect_net -net [nl_gnd] -objects $tie} e]} {
+            if {[catch {nl_tie_gnd $tie} e]} {
                 nl_log "connerr $name [string range $e 0 200]"
             }
         }
@@ -492,7 +507,7 @@ proc nl_unroutable {bad} {
             }
         }
         if {[llength $fab]} {
-            if {[catch {connect_net -net [nl_gnd] -objects $fab} e]} {
+            if {[catch {nl_tie_gnd $fab} e]} {
                 nl_log "tieerr [string range $e 0 150]"
             }
         }
@@ -556,7 +571,7 @@ proc nl_fix_dangling {} {
     }
     if {[llength $dangling]} {
         nl_log "tying [llength $dangling] dangling pins"
-        if {[catch {connect_net -net [nl_gnd] -objects $dangling} e]} {
+        if {[catch {nl_tie_gnd $dangling} e]} {
             nl_log "tieerr [string range $e 0 150]"
         }
     }
@@ -837,6 +852,13 @@ proc nl_iob {name site mode ref stds props} {
         set ref [dict get {in IBUF out OBUF tri OBUFT} $mode]
     }
     set bank [get_iobanks -quiet -of_objects $s]
+    # A quarter of the banks take only differential inputs (bank settings
+    # such as the 7-series HCLK_IOI ONLY_DIFF_IN_USE depend on it).
+    global nl_bank_diffonly
+    if {![info exists nl_bank_diffonly]} { set nl_bank_diffonly [dict create] }
+    if {![dict exists $nl_bank_diffonly $bank]} {
+        dict set nl_bank_diffonly $bank [expr {rand() < 0.25}]
+    }
     if {[string match diff* $mode] && ![regexp {_L\d+P} [get_property PIN_FUNC $pin]]} {
         # Not the P side of a pair: use the single ended equivalent.
         set mode [dict get {diffin in diffout out difftri tri} $mode]
@@ -845,8 +867,13 @@ proc nl_iob {name site mode ref stds props} {
         foreach sv $stds {
             if {![regexp {^(DIFF_|LVDS|TMDS|MINI_LVDS|BLVDS|RSDS|PPDS|SUB_LVDS|SLVS|LVPECL|MIPI)} $sv]} { lappend ses $sv }
         }
-        if {[llength $ses] == 0} { set ses {LVCMOS18:1.8 LVCMOS33:3.3 LVCMOS12:1.2} }
+        # (LVCMOS33 does not exist in High Performance banks.)
+        if {[llength $ses] == 0} { set ses {LVCMOS18:1.8 LVCMOS12:1.2} }
         set stds $ses
+    }
+    if {[dict get $nl_bank_diffonly $bank] && $mode in {in inout}} {
+        nl_log "ioberr $name diffonly"
+        return 0
     }
     global nl_bank_std
     if {![info exists nl_bank_std]} { set nl_bank_std [dict create] }

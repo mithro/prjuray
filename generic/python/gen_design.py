@@ -127,8 +127,37 @@ def _fix_oserdese2(p, rng):
         p['TBYTE_CTL'] = p['TBYTE_SRC'] = 'FALSE'
 
 
+def _fix_bram_clocks(p, rng):
+    """Block RAM / FIFO clock inversions: with one clock (COMMON / EN_SYN
+    / an unconnected clock mapped onto the other one) both ports share the
+    inverter (bitgen: "Conflicting values ... for attr 'CLKINV_SEL'")."""
+    for a, b in (('IS_CLKARDCLK_INVERTED', 'IS_CLKBWRCLK_INVERTED'),
+                 ('IS_RDCLK_INVERTED', 'IS_WRCLK_INVERTED')):
+        if a in p and b in p and (p.get('CLOCK_DOMAINS') == 'COMMON' or
+                                  p.get('EN_SYN') == 'TRUE' or
+                                  rng.random() < 0.5):
+            p[b] = p[a]
+
+
+def _fix_dsp48e1(p, rng):
+    """Legal register / cascade register pairs (UG479): AREG 0 -> ACASCREG
+    0, 1 -> 1, 2 -> 1 or 2 (same for B); illegal pairs end up at a
+    Vivado chosen value, starving the AREG=2/ACASCREG=1 bit."""
+    for port in 'AB':
+        reg = p.get(f'{port}REG')
+        if reg is None:
+            continue
+        casc = {'0': '0', '1': '1'}.get(reg) or rng.choice(['1', '2'])
+        p[f'{port}CASCREG'] = casc
+
+
 # Per primitive adjustment of random parameters to legal combinations.
 PARAM_FIXUPS = {
+    'DSP48E1': _fix_dsp48e1,
+    'RAMB18E1': _fix_bram_clocks, 'RAMB36E1': _fix_bram_clocks,
+    'FIFO18E1': _fix_bram_clocks, 'FIFO36E1': _fix_bram_clocks,
+    'RAMB18E2': _fix_bram_clocks, 'RAMB36E2': _fix_bram_clocks,
+    'FIFO18E2': _fix_bram_clocks, 'FIFO36E2': _fix_bram_clocks,
     'ISERDESE2': _fix_iserdese2,
     'OSERDESE2': _fix_oserdese2,
 }
@@ -508,7 +537,9 @@ def recipe_slice(d, site, slicem):
                 d.add_sink(full, site)
     clk += ctl['srl_clk']
     ce += ctl['srl_ce']
-    for grp, kind in ((clk, 'clock'), (ce, 'data'), (sr, 'data')):
+    # (Inverted set / reset never tied to a constant: see nl_tie_gnd.)
+    for grp, kind in ((clk, 'clock'), (ce, 'data'),
+                      (sr, 'fabric' if srinv == "1'b1" else 'data')):
         if grp:
             d.add_sink(grp, site, kind)
     # Constrain the cluster to a small region around the anchor site; regions
@@ -988,8 +1019,8 @@ def recipe_hard(d, site, ref, pconn=0.6):
             # (7-series IN/OUT_FIFO clocks left open are tied to VCC by
             # Vivado with VCC cells it cannot place: always clocked.)
             if rng.random() < pconn or CLOCK_BUFFERS.match(ref) or (
-                    ref in ('IN_FIFO', 'OUT_FIFO') and
-                    pin in ('RDCLK', 'WRCLK')):
+                    re.match(r'^(IN_FIFO|OUT_FIFO|RAMB|FIFO)', ref) and
+                    pin in ('RDCLK', 'WRCLK', 'CLKARDCLK', 'CLKBWRCLK')):
                 kind = 'clock' if (DIRECT_CLOCKS.search(pin) or (
                     CLOCK_BUFFERS.match(ref) and pin in ('I', 'I0', 'I1'))) \
                     else 'data'
@@ -1831,6 +1862,10 @@ def generate(die, prims, seed, out, density, hard=True, pips=None,
                     rng.random() < 0.5:
                 chosen.append(st)
             elif re.match(r'^(MMCM|PLL$|PLLE)', st) and rng.random() < 0.4:
+                chosen.append(st)
+            elif re.match(r'^(PCIE|GT[A-Z]E\d_CHANNEL)', st) and \
+                    rng.random() < 0.2:
+                # (single PCIe block, few GT quads: rare otherwise)
                 chosen.append(st)
         # 18 Kb and 36 Kb block RAM sites share tiles and the first type
         # processed takes them: alternate which one goes first (RAMB18
