@@ -12,7 +12,8 @@
 #   sp <site> <bel> <from_pin> <to_pin>             used site pip (routing mux)
 #   cfg <site> <bel> <name> <value>                 physical BEL configuration
 #                                                    (also IS_<pin>_INVERTED of
-#                                                    the cell placed on the BEL)
+#                                                    placed cells, on the site
+#                                                    pin the cell pin reaches)
 
 proc _df_cfg_props {bel} {
     global _df_prop_cache
@@ -374,21 +375,49 @@ proc dump_features {out} {
     }
     puts $fp "# t_sp [expr {[clock milliseconds] - $t0}]"
     # Pin inversions of placed cells (IS_<pin>_INVERTED, e.g. the flip-flop
-    # clock and set/reset inversion of a slice): a BEL setting Vivado does
-    # not expose as BEL configuration nor as a site pip.  Reported as a
-    # configuration of the cell's BEL.  (Vectorised per cell type.)
+    # clock and set/reset inversion of a slice): a setting Vivado does not
+    # expose as BEL configuration nor as a site pip.  The inverter is shared
+    # by the BELs whose pin is wired to the same site pin (e.g. the clock of
+    # all flip-flops of a slice half), so it is reported on the site pin:
+    # "cfg <site> <site pin> IS_<pin>_INVERTED <value>" (the property name is
+    # kept: a latch gate and a flip-flop clock invert oppositely), or on the
+    # BEL when the pin reaches no site pin.  The BEL pin -> site pin wiring is
+    # looked up once per (BEL, pin).  (Vectorised per cell type.)
     set placed [get_cells -quiet -hierarchical -filter {IS_PRIMITIVE && LOC != ""}]
     set byref [dict create]
     foreach c $placed r [_df_props REF_NAME $placed] { dict lappend byref $r $c }
+    set sitepin [dict create]
+    set tries [dict create]
+    set seen [dict create]
     dict for {ref cells} $byref {
         set props [list_property [lindex $cells 0] IS_*_INVERTED]
         if {![llength $props]} continue
         set sites [_df_props SITE $cells]
         set bels [_df_props BEL $cells]
         foreach p $props {
-            foreach s $sites b $bels v [_df_props $p $cells] {
+            set pin [string range $p 3 end-9]
+            foreach c $cells s $sites b $bels v [_df_props $p $cells] {
                 if {$s eq "" || $b eq "" || $v eq ""} continue
-                puts $fp "cfg $s [lindex [split $b .] end] $p $v"
+                # (an unconnected cell pin maps to no BEL pin: ask again
+                # with the next cell, up to 8 times)
+                set k "$b/$pin"
+                if {![dict exists $sitepin $k] || ([dict get $sitepin $k] eq "" && [dict get $tries $k] < 8)} {
+                    set bp [get_bel_pins -quiet -of_objects [get_pins -quiet $c/$pin]]
+                    set sp [get_site_pins -quiet -of_objects $bp]
+                    # only an unambiguous wiring (one BEL pin, one site pin)
+                    if {[llength $bp] == 1 && [llength $sp] == 1} {
+                        dict set sitepin $k [lindex [split $sp /] end]
+                    } else {
+                        dict set sitepin $k ""
+                    }
+                    dict incr tries $k
+                }
+                set where [dict get $sitepin $k]
+                if {$where eq ""} { set where [lindex [split $b .] end] }
+                set line "cfg $s $where $p $v"
+                if {[dict exists $seen $line]} continue
+                dict set seen $line 1
+                puts $fp $line
             }
         }
     }
