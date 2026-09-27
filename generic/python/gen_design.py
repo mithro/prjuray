@@ -441,6 +441,9 @@ def recipe_slice(d, site, slicem):
     else:
         choices = ['LDCE', 'LDPE']
     cinv = "1'b1" if ctl['cinv'] else "1'b0"
+    # Set/reset inversion: shared by the control set like the clock one
+    # (FFs of a site share the SR pin and its inverter).
+    srinv = "1'b1" if rng.random() < 0.3 else "1'b0"
     clk, ce, sr = [], [], []
     for i in range(nff):
         ref = rng.choice(choices)
@@ -449,6 +452,10 @@ def recipe_slice(d, site, slicem):
             props['IS_C_INVERTED'] = cinv
         else:
             props['IS_G_INVERTED'] = cinv
+        for p in ('IS_R_INVERTED', 'IS_S_INVERTED', 'IS_CLR_INVERTED',
+                  'IS_PRE_INVERTED'):
+            if p in d.prims[ref].params:
+                props[p] = srinv
         n = cell(ref, props)
         for direction, pin in pins_of(d.prims, ref):
             full = f'{n}/{pin}'
