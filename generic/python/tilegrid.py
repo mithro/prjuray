@@ -539,7 +539,7 @@ def virtual_bram_shift(clist, colmap, cr, gxs, extra):
 
 
 def build(grid, dframes, cols, crmap, colmap, colmap1, verbose=False,
-          tilemap=None):
+          tilemap=None, frame_caps=None):
     """Returns the tilegrid dict: tile -> {type, gx, gy, bits: [...]}.
     crmap: clock region row -> (block, half, row); colmap: (clock region
     row, grid x) -> block 0 frame column; colmap1: (clock region row, grid
@@ -547,6 +547,8 @@ def build(grid, dframes, cols, crmap, colmap, colmap1, verbose=False,
     the BRAM columns cannot be mapped by rank); tilemap: tile -> block 0
     frame column overriding its grid column's."""
     tilemap = tilemap or {}
+    # tile type -> frames it uses of its (shared) frame column
+    frame_caps = frame_caps or {}
     colinfo = {}
     for key, clist in cols.items():
         for col, first, nfr in clist:
@@ -561,6 +563,7 @@ def build(grid, dframes, cols, crmap, colmap, colmap1, verbose=False,
             col = tilemap.get(name, colmap.get((cr, t['gx'])))
             if key is not None and col is not None:
                 first, nfr = colinfo[(key, col)]
+                nfr = min(nfr, frame_caps.get(t['type'], nfr))
                 entry['bits'].append(
                     dict(block=key[0],
                          half=key[1],
@@ -645,6 +648,8 @@ def main():
                     'colalign.py (default: activity only)')
     ap.add_argument('--windows', help='tile type windows (windows.py '
                     '--merge output)')
+    ap.add_argument('--frames', help='frames used by tile types sharing '
+                    'frame columns (colalign.py frames.json)')
     ap.add_argument('--probe', help='comma separated tile types (or "auto": '
                     'tall and windowless ones) given a window of +-'
                     '--probe-span bits around their grid row, to learn their '
@@ -688,7 +693,12 @@ def main():
         crmap = ev['crmap']
         colmap, colmap1 = assign_activity(grid, cols, ev, True)
         tilemap = {}
-    tg = build(grid, dframes, cols, crmap, colmap, colmap1, True, tilemap)
+    frame_caps = {}
+    if args.frames:
+        with open(args.frames) as f:
+            frame_caps = json.load(f)
+    tg = build(grid, dframes, cols, crmap, colmap, colmap1, True, tilemap,
+               frame_caps)
     with open(args.out, 'w') as f:
         json.dump(tg, f, indent=0, sort_keys=True)
     nb = sum(1 for t in tg.values() if t['bits'])

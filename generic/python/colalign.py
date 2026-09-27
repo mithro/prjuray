@@ -765,6 +765,27 @@ def main():
         print(f'  {k}{mark}: ' + ', '.join(
             f'{nf} x{n}' for nf, n in sorted(c.items(), key=lambda x: -x[1])))
     # Output + self-consistency.
+    # Frame counts of the frame columns each tile type's tiles are in (over
+    # all dies): a type found in frame columns of several sizes shares them
+    # with the column's owner (e.g. interconnect next to CLB, BRAM, DSP, I/O
+    # columns) and only uses the frames of the smallest.
+    type_nf = collections.defaultdict(set)
+    for d, dr in rows.items():
+        for cr in dr.rows:
+            m = dr.majors(cr)
+            if not m:
+                continue
+            full = attach_silent(dr.rows[cr], cur[(d, cr)], model)
+            idx = {gx: m[j][2] for gx, j in full.items()}
+            for t in dr.grid.tiles.values():
+                if dr.grid.crrow.get(t['gy']) == cr and t['gx'] in idx and \
+                        t['type'] != 'NULL':
+                    type_nf[t['type']].add(idx[t['gx']])
+    frames = {t: min(v) for t, v in sorted(type_nf.items()) if len(v) > 1}
+    with open(os.path.join(base, 'frames.json'), 'w') as f:
+        json.dump(frames, f, indent=1, sort_keys=True)
+    print('frame count of shared column tile types:',
+          ' '.join(f'{t}:{n}' for t, n in frames.items()))
     for d, dr in rows.items():
         colmap = []
         tilemap = {}
