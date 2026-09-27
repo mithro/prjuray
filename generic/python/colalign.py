@@ -70,6 +70,22 @@ BETA = 1.0  # transition smoothing
 MAXSKIP = 8  # consecutive unassigned grid columns
 
 
+# Site types configured outside the configuration frames (the UltraScale+
+# PS through its own registers): their tiles own no frame column; the
+# PS8 tile in the bottom clock region row of the PS would otherwise take the
+# frame column of the PS interface column next to it (prjuray-db:
+# INT_INTF_LEFT_TERM_PSS in minor column 0 in every row).
+OUTSIDE_FRAMES = {'PS8'}
+
+
+def outside_frames(sites):
+    """True for a tile whose sites (tiles.tsv field) all are of
+    OUTSIDE_FRAMES types."""
+    if sites == '-':
+        return False
+    return all(s.split(':')[-1] in OUTSIDE_FRAMES for s in sites.split(','))
+
+
 def type_info(die):
     """tile type -> (npips, nsites)"""
     out = {}
@@ -105,7 +121,8 @@ class DieRows:
             # Tiles without PIPs or sites, or without a bit window (e.g.
             # break rows between clock regions) own no configuration bits.
             if t['type'] == 'NULL' or not cfg(t['type']) or \
-                    self.grid.tile_window(name) is None:
+                    self.grid.tile_window(name) is None or \
+                    outside_frames(t['sites']):
                 continue
             counts[(self.grid.crrow[t['gy']], t['gx'])][t['type']] += 1
             self.gyrows[t['gy']].append((t['gx'], name))
@@ -172,6 +189,19 @@ class DieRows:
                 return None
             n += 1
         return n
+
+    def order_conflicts(self, order):
+        """Clock region rows whose learnt frame row contradicts the ordering
+        when strictly more learnt rows fit it; else []."""
+        crs = sorted(self.rows)
+        keys = sorted(self.row_keys(), key=order)
+        if len(keys) != len(crs):
+            return []
+        want = dict(zip(crs, keys))
+        bad = [cr for cr, k in self.crmap.items() if want.get(cr) != k]
+        if bad and len(self.crmap) - len(bad) > len(bad):
+            return sorted(bad)
+        return []
 
     def apply_order(self, order):
         crs = sorted(self.rows)
@@ -528,6 +558,63 @@ def attach_silent(rows_all, assigned, model=None, maxdist=16):
     return out
 
 
+def claim_unused(dr, cr, full, ref=None):
+    """A grid column sharing its neighbour's frame column moves to an unused
+    frame column right next to it on its own side, when its activity there
+    is positive or it has that frame column (index and frame count) in
+    all other clock region rows (ref: gx -> {(index, frames)}) (UltraScale+
+    INT_INTF_LEFT_TERM_IO_FT: the 4 minor column between CMT_L and INT;
+    the HMM lets interface columns share INT's)."""
+    M = dr.majors(cr)
+    out = dict(full)
+    used = set(out.values())
+    order = sorted(out.items())
+    for i, (gx, j) in enumerate(order):
+        mates = [g for g, k in order if k == j and g != gx]
+        if not mates:
+            continue
+        v = dr.ev['scores'].get(cr, {}).get(gx)
+        # own side: below the mates' columns -> the frame column before
+        for step, side in ((-1, all(gx < g for g in mates)),
+                           (1, all(gx > g for g in mates))):
+            n = j + step
+            if not side or n < 0 or n >= len(M) or n in used:
+                continue
+            if not ((v is not None and n < len(v) and v[n] > 0) or
+                    (ref and (n, M[n][2]) in ref.get(gx, ()))):
+                continue
+            # nothing between gx and the next grid column on that side may
+            # use a frame column beyond n
+            nb = [k for g, k in order if (g < gx if step < 0 else g > gx)]
+            near = max(nb) if step < 0 and nb else (min(nb) if nb else None)
+            if near is not None and (near >= n if step < 0 else near <= n):
+                continue
+            out[gx] = n
+            used.add(n)
+            break
+    # The first (last) grid column of a row without activity, placed away
+    # from its neighbour across unused frame columns, moves next to it
+    # (xcu25 rows with the PS: INT_INTF_LEFT_TERM_PSS right of the PS's
+    # unused frame columns, not at their start).
+    order = sorted(out.items())
+    for (gx, j), (ng, nj), step in ((order[0], order[1], 1),
+                                    (order[-1], order[-2], -1)) \
+            if len(order) > 1 else ():
+        n = nj - step
+        v = dr.ev['scores'].get(cr, {}).get(gx)
+        if n == j or (v is not None and v.max() > 0):
+            continue
+        between = range(min(j, n) + 1, max(j, n)) if step > 0 else \
+            range(min(j, n), max(j, n))
+        if (n > j) != (step > 0) or n in used or \
+                any(m in used for m in between if m != j):
+            continue
+        used.discard(j)
+        out[gx] = n
+        used.add(n)
+    return out
+
+
 def minority_tiles(dr, cr, full):
     """Hard block tiles (with sites) of another type than their column's
     kind, e.g. a PCIE block over part of a CLB column, where the other grid
@@ -651,6 +738,17 @@ def main():
         best = votes.most_common(1)[0][0]
         print(f'frame row order: {best} ({dict(votes)})', flush=True)
         for d, dr in rows.items():
+            # Learnt frame rows contradicting the order while most of the
+            # die's learnt rows fit it are dropped with their activity
+            # (scored against the wrong frame row; xcu25 with few designs:
+            # row 1 -> frame row 2).
+            bad = dr.order_conflicts(orders[best])
+            if bad:
+                print(f'  {d}: learnt frame rows against the order dropped: '
+                      f'{ {cr: dr.crmap[cr] for cr in bad} }', flush=True)
+                for cr in bad:
+                    del dr.crmap[cr]
+                    dr.ev['scores'].pop(cr, None)
             if len(dr.crmap) < len(dr.rows) and \
                     dr.order_consistent(orders[best]) is not None:
                 dr.apply_order(orders[best])
@@ -800,13 +898,25 @@ def main():
         colmap = []
         tilemap = {}
         rep = collections.Counter()
+        first = {}
+        for cr in sorted(dr.rows):
+            if dr.majors(cr):
+                first[cr] = claim_unused(dr, cr, attach_silent(
+                    dr.rows[cr], cur[(d, cr)], model))
         for cr in sorted(dr.rows):
             m = dr.majors(cr)
             if not m:
                 rep['rows without frame row'] += 1
                 continue
             asg = cur[(d, cr)]
-            full = attach_silent(dr.rows[cr], asg, model)
+            # Only a frame column the grid column has in every other row.
+            ref = collections.defaultdict(set)
+            for c2, f2 in first.items():
+                if c2 != cr:
+                    for gx, j in f2.items():
+                        ref[gx].add((j, dr.majors(c2)[j][2]))
+            ref = {gx: v for gx, v in ref.items() if len(v) == 1}
+            full = claim_unused(dr, cr, first[cr], ref)
             for gx, j in sorted(full.items()):
                 colmap.append([cr, gx, m[j][0]])
             for name, j in minority_tiles(dr, cr, full).items():
