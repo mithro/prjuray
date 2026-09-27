@@ -179,11 +179,21 @@ class PackedRows:
         return [names[i] for i in o]
 
 
+def feature_order(name):
+    """Order of the features in the correlation: the greedy covers break
+    ties by index, so among features with identical sample patterns the
+    first is chosen.  Site / BEL features (e.g. TYPE.RAMB36E1) come before
+    PIPs (wire->wire), which usually just follow them, then by name."""
+    return ('->' in name, name)
+
+
 def correlate(samples):
     """samples: list of (features set, bits list).  Returns dict."""
-    # Features in sorted order: the greedy covers break ties by index, and
-    # the iteration order of sets of strings changes from run to run.
-    fnames = sorted(set().union(*(fs for fs, _ in samples)))
+    # Features in a fixed order (feature_order): the greedy covers break
+    # ties by index, and the iteration order of sets of strings changes
+    # from run to run.
+    fnames = sorted(set().union(*(fs for fs, _ in samples)),
+                    key=feature_order)
     fidx = {f: i for i, f in enumerate(fnames)}
     bidx = {}
     for fs, bs in samples:
@@ -503,10 +513,10 @@ def _type_task(task):
                 else:
                     ge += 1
         del cu, ce
-    # Same indexing as correlate(): features sorted, bits in order of first
+    # Same indexing as correlate(): features in feature_order, bits in order of first
     # appearance over the samples.
     del pos
-    PF, fnames = FR.rows(sorted(FR.ids))
+    PF, fnames = FR.rows(sorted(FR.ids, key=feature_order))
     del FR
     PB, bnames = BR.rows(BR.first_order())
     del BR
