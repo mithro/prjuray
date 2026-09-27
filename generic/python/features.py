@@ -75,12 +75,14 @@ class SiteKeys:
         self.key = {}
         self.tile_type = {}
         self.pads = collections.defaultdict(list)  # tile -> pad sites
+        self.region = {}  # tile -> clock region (X<c>Y<r>, '-')
         self.xy = {}  # tile -> (grid x, grid y)
         for line in open(tiles_tsv):
             p = line.split()
             if p[0] != 'tile':
                 continue
             self.tile_type[p[1]] = p[2]
+            self.region[p[1]] = p[5]
             self.xy[p[1]] = (int(p[3]), int(p[4]))
             if p[6] == '-':
                 continue
@@ -105,6 +107,15 @@ class SiteKeys:
 _EQN_CACHE = {}
 _IDX = np.arange(64, dtype=np.uint8)
 _ENV = {f'A{k + 1}': ((_IDX >> k) & 1).astype(np.uint8) for k in range(6)}
+_IENV = {f'A{k + 1}': sum(1 << i for i in range(64) if (i >> k) & 1)
+         for k in range(6)}
+_IENV['_T'] = (1 << 64) - 1
+_LUT_LIT = re.compile(r'(?<![A\d])\d+')
+_LUT_LEAD0 = re.compile(r'(?<![A\d])0+[1-9]')
+_MASK64 = (1 << 64) - 1
+_SOP_LIT = r'(?:\(~A[1-6]\)|A[1-6])'
+_SOP_TERM = rf'\({_SOP_LIT}(?:\*{_SOP_LIT})*\)'
+_SOP = re.compile(rf'{_SOP_TERM}(?:\+{_SOP_TERM})*')
 
 
 def lut_eqn_bits(eqn):
@@ -120,12 +131,31 @@ def lut_eqn_bits(eqn):
     # eval() below (no names other than A1..A6, no calls/attributes).
     if not re.fullmatch(r'[A1-6&|^~() 01]*', py):
         return None
+    # Evaluated on 64 bit truth table masks (bit i = row i).
+    if _SOP.fullmatch(expr):
+        # Sum of products of (inverted) pins, the usual form: no eval.
+        v = 0
+        for term in expr[1:-1].split(')+('):
+            t = _MASK64
+            for lit in term.split('*'):
+                t &= _IENV[lit] if lit[0] == 'A' else ~_IENV[lit[2:4]]
+            v |= t
+        bits = [i for i in range(n) if (v >> i) & 1]
+        if len(_EQN_CACHE) < 200000:
+            _EQN_CACHE[eqn] = bits
+        return bits
+    # Otherwise eval() with the same bitwise operators on the masks; a
+    # literal is a constant row value (its bit 0): an odd literal is all
+    # rows, an even one none.  A literal with leading zeros (e.g. 01) is a
+    # syntax error in Python.
+    if _LUT_LEAD0.search(py):
+        return None
     try:
-        v = eval(py, {}, dict(_ENV))
+        v = eval(_LUT_LIT.sub(lambda m: '_T' if int(m.group()) & 1
+                              else '0', py), {}, dict(_IENV))
     except (SyntaxError, TypeError, NameError):
         return None
-    v = np.broadcast_to(np.asarray(v, dtype=np.int64) & 1, (64, ))
-    bits = [int(i) for i in np.nonzero(v[:n])[0]]
+    bits = [i for i in range(n) if (v >> i) & 1]
     if len(_EQN_CACHE) < 200000:
         _EQN_CACHE[eqn] = bits
     return bits
@@ -261,9 +291,28 @@ def _drp_fields(prefix, entry, fields):
     return out
 
 
-def clockgen_drp_features(prefix, cfgs):
+def clockgen_family(bel, sitekeys):
+    """Lookup table family of a clock generator BEL: the 7-series BELs are
+    named after the primitive, UltraScale(+) ones just MMCM / PLL (the
+    architecture then from the slice tile types: CLE_M on UltraScale,
+    CLEM on UltraScale+)."""
+    if bel in _TABLE_FAMILY:
+        return _TABLE_FAMILY[bel]
+    if bel not in ('MMCM', 'PLL'):
+        return None
+    arch = getattr(sitekeys, '_clockgen_arch', None)
+    if arch is None:
+        types = set(sitekeys.tile_type.values())
+        arch = 'usp' if 'CLEM' in types else 'us' if 'CLE_M' in types \
+            else ''
+        sitekeys._clockgen_arch = arch
+    return f'{arch}_{bel.lower()}' if arch else None
+
+
+def clockgen_drp_features(prefix, cfgs, fam=None):
     """Derived counter / lock / filter register features of an MMCM or PLL
-    BEL (<prefix> = <SITEKEY>.<BEL>, <cfgs> = its BEL configuration)."""
+    BEL (<prefix> = <SITEKEY>.<BEL>, <cfgs> = its BEL configuration, <fam>
+    its clockgen_tables.json family)."""
     out = []
 
     def num(k, default=None):
@@ -325,7 +374,8 @@ def clockgen_drp_features(prefix, cfgs):
         out.append(f'{prefix}.DRP.{name}_EDGE={edge}')
         out.append(f'{prefix}.DRP.{name}_NO_COUNT={nc}')
         out.append(f'{prefix}.DRP.{name}_FRAC_EN={int(is_frac)}')
-    fam = _TABLE_FAMILY.get(prefix.rsplit('.', 1)[-1])
+    if fam is None:
+        fam = _TABLE_FAMILY.get(prefix.rsplit('.', 1)[-1])
     if m is not None and fam:
         # Lock and loop filter tables are looked up from the (integer)
         # multiplier and the bandwidth.
@@ -410,12 +460,18 @@ def tile_features(path, sitekeys):
     # route does not report (prjxray IOI_OCLKM_1.IOI_LEAF_GCLK5 = 30_30
     # 30_38 30_44: set with GCLK5->OCLK_1 only when OLOGIC1 uses OCLK_1).
     for tile, fs in feats.items():
-        used = {m.group(1) for f in fs
+        # (substring tests first: the patterns match few features)
+        if 'IOI_OCLK_' not in '\n'.join(fs):
+            continue
+        used = {m.group(1) for f in fs if f.startswith('IOI_OCLK_')
                 for m in [_OCLK_TO_OLOGIC.match(f)] if m}
         if not used:
             continue
-        have_m = {m.group(1) for f in fs for m in [_TO_OCLKM.match(f)] if m}
+        have_m = {m.group(1) for f in fs if '->IOI_OCLKM_' in f
+                  for m in [_TO_OCLKM.match(f)] if m}
         for f in list(fs):
+            if '->IOI_OCLK_' not in f:
+                continue
             m = _TO_OCLK.match(f)
             if m and m.group(2) in used and m.group(2) not in have_m:
                 fs.add(f'{m.group(1)}->IOI_OCLKM_{m.group(2)}')
@@ -425,7 +481,9 @@ def tile_features(path, sitekeys):
     # which are same edge) with CLK, or OPPOSITE_EDGE with CLK_B (xa7a12t:
     # exact over 41 set / 36 clear samples).  Name the pair.
     for tile, fs in feats.items():
-        for f in list(fs):
+        if '.CLKINV.SP.' not in '\n'.join(fs):
+            continue
+        for f in [f for f in fs if '.CLKINV.SP.' in f]:
             m = _OLOGIC_CLKINV.match(f)
             if not m:
                 continue
@@ -438,14 +496,18 @@ def tile_features(path, sitekeys):
     # Clock generator counter registers (derived, see clockgen_drp_features).
     for (tile, prefix), cfgs in bel_cfgs.items():
         if re.search(r'\.(MMCME\d_ADV|PLLE\d_ADV|MMCM|PLL)$', prefix):
-            feats[tile].update(clockgen_drp_features(prefix, cfgs))
+            feats[tile].update(clockgen_drp_features(
+                prefix, cfgs,
+                clockgen_family(prefix.rsplit('.', 1)[-1], sitekeys)))
     # 7-series DSP48E1: the "AREG_0" / "BREG_0" bits (prjxray, DSP_L 27_111
     # / 27_038, 27_271 / 27_198) are set for AREG=0, and for AREG=1 when
     # INMODE[0] (A1/A2 select; INMODE[4] for B) is tied to ground
     # (xa7a12t r9: exact, 93 / 84 set samples).  Name the register setting
     # together with the source of its select input.
     for tile, fs in feats.items():
-        for f in list(fs):
+        if '.DSP48E1.' not in '\n'.join(fs):
+            continue
+        for f in [f for f in fs if '.DSP48E1.' in f]:
             m = _DSP_REG.match(f)
             if not m:
                 continue
@@ -543,8 +605,45 @@ def tile_features(path, sitekeys):
             for s in pads:
                 if s not in site_map:
                     feats[tile].add(f'{sitekeys.key[s][1]}.UNUSEDPIN={v}')
+    hclk_row_features(feats, sitekeys)
     leaf_clock_features(feats, sitekeys)
     return feats
+
+
+_REGION = re.compile(r'X(\d+)Y(\d+)$')
+_HROW_HCLK = re.compile(r'CLK_HROW_CK_HCLK_OUT_([LR])(\d+)->CLK_HROW_CK_BUFHCLK_\1\2$')
+
+
+def hclk_row_features(feats, sitekeys):
+    """7-series: the HCLK_CMT tile of a CMT column enables the horizontal
+    clock rows its clock region's HROW drives towards it (xa7s15 CMT
+    26_1621 / 27_1621 / 29_1626 = rows 9 / 8 / 11, exact in 80 designs):
+    HCLK_CMT.BUFHCLK<n>.ACTIVE when the HROW of the clock region row drives
+    CLK_HROW_CK_BUFHCLK_<side><n>, <side> L for the left clock region
+    column (X0), R for the right one."""
+    rows = collections.defaultdict(set)
+    for tile, fs in feats.items():
+        if not sitekeys.tile_type.get(tile, '').startswith('CLK_HROW_'):
+            continue
+        m = _REGION.match(sitekeys.region.get(tile, ''))
+        if not m:
+            continue
+        for f in fs:
+            h = _HROW_HCLK.match(f)
+            if h:
+                rows[int(m.group(2))].add((h.group(1), int(h.group(2))))
+    if not rows:
+        return
+    for tile, tt in sitekeys.tile_type.items():
+        if tt not in ('HCLK_CMT', 'HCLK_CMT_L'):
+            continue
+        m = _REGION.match(sitekeys.region.get(tile, ''))
+        if not m:
+            continue
+        side = 'L' if m.group(1) == '0' else 'R'
+        for s, n in rows.get(int(m.group(2)), ()):
+            if s == side:
+                feats[tile].add(f'HCLK_CMT.BUFHCLK{n}.ACTIVE')
 
 
 # UltraScale(+) leaf clock buffers of an RCLK_INT tile: X16_0 drives the INT

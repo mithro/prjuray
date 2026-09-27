@@ -762,6 +762,9 @@ def main():
     ap.add_argument('--tag', default='fabric')
     ap.add_argument('--types', default=None, help='restrict to tile types')
     ap.add_argument('--jobs', type=int, default=32)
+    ap.add_argument('--sample-jobs', type=int, default=None,
+                    help='processes of the per design sample phase (light: '
+                    'can exceed --jobs; default --jobs)')
     ap.add_argument('--max-samples', type=int, default=50000)
     ap.add_argument('--exclude', action='append', default=[],
                     help='file of design directories to leave out, one per '
@@ -799,7 +802,7 @@ def main():
     # Phase 1: one small task per design (cached across runs).
     t0 = time.time()
     per_key = {}  # key -> [(cache path, used, empty)], first seen order
-    with ProcessPoolExecutor(args.jobs) as ex:
+    with ProcessPoolExecutor(args.sample_jobs or args.jobs) as ex:
         for n, (item, keys) in enumerate(
                 zip(work, ex.map(_cache_one, work, chunksize=2)), 1):
             for key, nu, ne in keys:

@@ -27,7 +27,8 @@ def main():
     ap.add_argument('--die', required=True)
     ap.add_argument('--tags', required=True)
     ap.add_argument('--type', required=True)
-    ap.add_argument('--site-type', required=True)
+    ap.add_argument('--site-type', required=True,
+                    help="site type in use ('-': all samples)")
     ap.add_argument('--max', type=int, default=200)
     ap.add_argument('--lo', type=int, default=0)
     ap.add_argument('--hi', type=int, default=0)
@@ -41,8 +42,8 @@ def main():
     S, names = [], []
     for dd in DD.design_dirs(roots, v2only=True)[:a.max]:
         for t, k, fs, bits in col.samples(dd):
-            if t == a.type and k == 0 and any(
-                    f.endswith('.TYPE.' + a.site_type) for f in fs):
+            if t == a.type and k == 0 and (a.site_type == '-' or any(
+                    f.endswith('.TYPE.' + a.site_type) for f in fs)):
                 S.append((frozenset(fs), frozenset(bits)))
                 names.append('/'.join(dd.split('/')[-2:]))
     n = len(S)
