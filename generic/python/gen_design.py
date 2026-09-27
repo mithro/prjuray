@@ -393,7 +393,13 @@ def recipe_slice(d, site, slicem):
         ref = 'CARRY8' if us else 'CARRY4'
         last_co = 'CO[7]' if us else 'CO[3]'
         prev = None
-        for _ in range(rng.choice((1, 1, 2, 3))):
+        nchain = rng.choice((1, 1, 2, 3))
+        # 7-series: the last CO and the last O share the D output mux of the
+        # slice; using both makes Vivado insert a pass-through CARRY4 (with
+        # GND/VCC cells) above the chain, often unplaceable in the pblock.
+        last_o = 'O[7]' if us else 'O[3]'
+        co_out = us or rng.random() < 0.5
+        for i in range(nchain):
             props = d.random_params(ref) if us else {}
             n = cell(ref, props)
             for direction, pin in pins_of(d.prims, ref):
@@ -418,10 +424,13 @@ def recipe_slice(d, site, slicem):
                 elif pin == last_co:
                     # Kept for the next element of the chain only.
                     continue
+                elif pin == last_o and i == nchain - 1 and co_out and not us:
+                    continue
                 else:
                     d.add_source(full, site)
             prev = n
-        d.add_source(f'{prev}/{last_co}', site)
+        if co_out:
+            d.add_source(f'{prev}/{last_co}', site)
     # Flip flops sharing a control set.
     nff = rng.randint(0, 2 * nletters)
     kind = rng.random()
@@ -432,6 +441,11 @@ def recipe_slice(d, site, slicem):
     else:
         choices = ['LDCE', 'LDPE']
     cinv = "1'b1" if ctl['cinv'] else "1'b0"
+    # Set/reset inversion: shared by the control set like the clock one
+    # (FFs of a site share the SR pin and its inverter).  UltraScale only:
+    # 7-series slices have no SR inverter (Vivado then cannot commit the
+    # placement: "failed to commit all instances").
+    srinv = "1'b1" if us and rng.random() < 0.3 else "1'b0"
     clk, ce, sr = [], [], []
     for i in range(nff):
         ref = rng.choice(choices)
@@ -440,6 +454,10 @@ def recipe_slice(d, site, slicem):
             props['IS_C_INVERTED'] = cinv
         else:
             props['IS_G_INVERTED'] = cinv
+        for p in ('IS_R_INVERTED', 'IS_S_INVERTED', 'IS_CLR_INVERTED',
+                  'IS_PRE_INVERTED'):
+            if p in d.prims[ref].params:
+                props[p] = srinv
         n = cell(ref, props)
         for direction, pin in pins_of(d.prims, ref):
             full = f'{n}/{pin}'
@@ -929,7 +947,11 @@ def recipe_hard(d, site, ref, pconn=0.6):
                 not pin_mapped(ref, props, pin):
             continue
         if direction == 'IN':
-            if rng.random() < pconn or CLOCK_BUFFERS.match(ref):
+            # (7-series IN/OUT_FIFO clocks left open are tied to VCC by
+            # Vivado with VCC cells it cannot place: always clocked.)
+            if rng.random() < pconn or CLOCK_BUFFERS.match(ref) or (
+                    ref in ('IN_FIFO', 'OUT_FIFO') and
+                    pin in ('RDCLK', 'WRCLK')):
                 kind = 'clock' if (DIRECT_CLOCKS.search(pin) or (
                     CLOCK_BUFFERS.match(ref) and pin in ('I', 'I0', 'I1'))) \
                     else 'data'
