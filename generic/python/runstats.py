@@ -115,6 +115,7 @@ def design_info(d):
         'ok': ok,
         'wall': stats.get('wall', t1 - t0),
         'cpu': stats.get('cpu'),
+        'rss': stats.get('maxrss'),
         'cause': None if ok else stats.get('status_cause') or
         classify(log, rlog),
         'phases': phases(log) if ok else None,
@@ -156,6 +157,10 @@ def report(root, show_list):
               f'{statistics.median(i["wall"] for i in fail) if fail else 0:.0f} s,'
               f' {sum(i["wall"] for i in fail) / max(wall, 1) * 100:.0f}% of '
               f'the time spent on failures')
+    rss = sorted(i['rss'] for i in infos if i.get('rss'))
+    if rss:
+        print(f'   peak memory per design: median {rss[len(rss) // 2] / 2**30:.1f}'
+              f' GiB, max {rss[-1] / 2**30:.1f} GiB')
     ph = [i['phases'] for i in ok if i['phases']]
     if ph:
         tot = {k: sum(p[k] for p in ph) for k in ph[0]}

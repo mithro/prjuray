@@ -580,6 +580,15 @@ proc nl_const_offenders {txt} {
     return [lsort -unique $cells]
 }
 
+# Optional place_design / route_design directive from the environment
+# (NL_PLACE_DIRECTIVE, NL_ROUTE_DIRECTIVE, e.g. Quick); none by default.
+proc nl_directive {what} {
+    if {[info exists ::env(NL_${what}_DIRECTIVE)] && $::env(NL_${what}_DIRECTIVE) ne ""} {
+        return [list -directive $::env(NL_${what}_DIRECTIVE)]
+    }
+    return [list]
+}
+
 set nl_orphans [list]
 proc nl_finish {{relaxclk 0}} {
     nl_flush_nets
@@ -615,7 +624,7 @@ proc nl_finish {{relaxclk 0}} {
         }
         if {$stage eq "place"} {
             nl_fix_dangling
-            if {[catch {place_design} e]} {
+            if {[catch {place_design {*}[nl_directive PLACE]} e]} {
                 nl_log "place_design failed: [string range $e 0 200]"
                 lassign [nl_offenders "ERROR: $e"] names nets
                 global nl_lasttxt
@@ -644,7 +653,7 @@ proc nl_finish {{relaxclk 0}} {
             set stage route
         }
         if {$stage eq "route"} {
-            if {[catch {route_design} e]} {
+            if {[catch {route_design {*}[nl_directive ROUTE]} e]} {
                 nl_log "route_design failed: [string range $e 0 200]"
                 lassign [nl_offenders "ERROR: $e"] names nets
                 catch {route_design -unroute}

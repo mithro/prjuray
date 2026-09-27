@@ -304,22 +304,29 @@ proc dump_features {out} {
         foreach s $sites st [_df_props SITE_TYPE $sites] {
             puts $fp "site $s $st -"
         }
+        # The BELs are kept as Vivado collections throughout: get_property
+        # on a plain list of BEL names looks every name up (several times
+        # slower).  BELs without configuration (NUM_CONFIGS == 0, cheap to
+        # test) are dropped before the costly IS_USED test.
         set used [get_sites -quiet -filter {IS_USED}]
-        set bels [get_bels -quiet -of_objects $used -filter {IS_USED}]
+        set groups [list [get_bels -quiet -of_objects $used -filter {NUM_CONFIGS > 0 && IS_USED}]]
         # Routing-only sites: all their BELs (unconfigured ones are skipped).
         set ronly [struct_diff $sites $used]
         if {[llength $ronly]} {
-            set bels [concat $bels [get_bels -quiet -of_objects $ronly]]
+            lappend groups [get_bels -quiet -of_objects [get_sites -quiet $ronly] -filter {NUM_CONFIGS > 0}]
         }
-        set bytype [dict create]
-        foreach b $bels t [_df_props TYPE $bels] { dict lappend bytype $t $b }
-        dict for {t bl} $bytype {
-            foreach p [_df_cfg_props [lindex $bl 0]] {
-                set name [string range $p 7 end]
-                foreach b $bl v [_df_props $p $bl] {
-                    if {$v eq "NOT CONFIGURED" || $v eq ""} continue
-                    set n [split $b /]
-                    puts $fp "cfg [lindex $n 0] [lindex $n end] $name [string map {" " "_"} $v]"
+        foreach bels $groups {
+            if {[llength $bels] == 0} continue
+            foreach t [lsort -unique [_df_props TYPE $bels]] {
+                set bl [filter -quiet $bels "TYPE == $t"]
+                set names [_df_props NAME $bl]
+                foreach p [_df_cfg_props [lindex $bl 0]] {
+                    set name [string range $p 7 end]
+                    foreach b $names v [_df_props $p $bl] {
+                        if {$v eq "NOT CONFIGURED" || $v eq ""} continue
+                        set n [split $b /]
+                        puts $fp "cfg [lindex $n 0] [lindex $n end] $name [string map {" " "_"} $v]"
+                    }
                 }
             }
         }
