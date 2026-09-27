@@ -669,13 +669,15 @@ def _type_task(task):
 
 def split_parts(nF, nB, S):
     """Number of bit ranges to correlate a (tile type, region) in: about
-    one per 2e11 feature x bit x sample-word units (block RAM tiles of
-    many dies: tens), 1 for the usual tiles."""
+    one per SPLIT_COST (3e10) feature x bit x sample-word units; the pair
+    covers of a split task run in chunks of PAIR_CHUNK bits.  (Series7
+    rebuild, 13 dies: ~2.5e-9 s per unit, block RAM bit ranges took
+    ~500 s with 2e11 and the unsplit pair phase over 20 min.)"""
     cost = nF * nB * ((S + 63) // 64)
     return int(min(64, max(1, cost // SPLIT_COST)))
 
 
-SPLIT_COST = int(float(os.environ.get('MKDB_SPLIT_COST', 2e11)))
+SPLIT_COST = int(float(os.environ.get('MKDB_SPLIT_COST', 3e10)))
 PAIR_CHANCE = os.environ.get("MKDB_PAIR_CHANCE", "1") == "1"
 PAIR_RESIDUAL = os.environ.get("MKDB_PAIR_RESIDUAL", "1") == "1"
 
@@ -699,12 +701,32 @@ def _bits_task(item):
     return part, peak, time.time() - t0
 
 
+def pair_bits_of(parts, budget=None):
+    """The bits that get a pair cover (the first PAIR_BUDGET candidate bits
+    in bit order), given the Correlator.bits() results."""
+    cands = sorted(r[0] for part in parts for r in part if r[4])
+    return cands[:Correlator.PAIR_BUDGET if budget is None else budget]
+
+
+PAIR_CHUNK = int(os.environ.get('MKDB_PAIR_CHUNK', 200))
+
+
+def _pairs_task(item):
+    """Worker: pair covers of some bits of a split task."""
+    sdir, bs, part = item
+    t0 = time.time()
+    res = _load_split(sdir).pairs(bs, [part])
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+    return res, peak, time.time() - t0
+
+
 def _finish_task(item):
-    """Worker: pair covers and database files of a split task."""
-    outdir, (tt, k), sdir, parts = item
+    """Worker: database files of a split task from its bits() parts and
+    pair covers."""
+    outdir, (tt, k), sdir, parts, pairs = item
     t0 = time.time()
     c = _load_split(sdir)
-    res = c.finish(parts, c.pairs(c.pair_bits(parts), parts))
+    res = c.finish(parts, pairs)
     del c
     shutil.rmtree(sdir, ignore_errors=True)
     return _written(outdir, tt, k, res, t0)
@@ -833,9 +855,37 @@ def main():
                       f'{dt:.0f} s peak {peak / 2**30:.2f} GiB; elapsed '
                       f'{el:.0f} s', flush=True)
                 if len(p[2]) == p[1]:
+                    # All bits done: the pair covers, in chunks.
+                    allparts = [p[2][j] for j in range(p[1])]
+                    pbits = pair_bits_of(allparts)
+                    rows = {r[0]: r for part in allparts for r in part}
+                    chunks = [pbits[i:i + PAIR_CHUNK]
+                              for i in range(0, len(pbits), PAIR_CHUNK)]
+                    p.append(allparts)
+                    p.append({'n': len(chunks), 'res': {}})
+                    for i, bs in enumerate(chunks):
+                        futs[ex.submit(_pairs_task, (
+                            p[0], bs, [rows[b] for b in bs]))] = \
+                            ('pairs', (key, i))
+                    if not chunks:
+                        futs[ex.submit(_finish_task, (
+                            outdir, key, p[0], allparts, {}))] = \
+                            ('finish', key)
+                continue
+            elif kind == 'pairs':
+                (key, i) = key
+                res, peak, dt = done.result()
+                p = parts[key]
+                pr = p[4]
+                pr['res'].update(res)
+                pr['done'] = pr.get('done', 0) + 1
+                print(f'# task {key[0]}.{key[1]} pairs {pr["done"]}/'
+                      f'{pr["n"]} {dt:.0f} s peak {peak / 2**30:.2f} GiB; '
+                      f'elapsed {el:.0f} s', flush=True)
+                if pr['done'] == pr['n']:
                     futs[ex.submit(_finish_task, (
-                        outdir, key, p[0],
-                        [p[2][j] for j in range(p[1])]))] = ('finish', key)
+                        outdir, key, p[0], p[3], pr['res']))] = \
+                        ('finish', key)
                 continue
             else:
                 key, summary, line, peak, dt = done.result()
