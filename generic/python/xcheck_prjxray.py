@@ -39,7 +39,7 @@ ARCH_FAMILIES = {
 ARCH = 'Series7'
 BLOCKS = {'CLB_IO_CLK': 0, 'BLOCK_RAM': 1}
 PX_SUFFIX = {0: '', 1: '.block_ram'}
-WORD = 32
+WORD = 32  # bits per tile grid word (prjuray-db: 16, see main)
 SAMPLE = 12
 
 
@@ -587,8 +587,11 @@ def main():
     os.environ['URAY_BUILD'] = args.build
     sys.path.insert(0, HERE)
     import dies as dieslib
-    global ARCH
+    global ARCH, WORD
     ARCH = args.arch
+    # prjuray-db counts offset / words in 16 bit units (a UltraScale(+)
+    # CLB row is 48 bits = 3 words), prjxray-db in 32 bit words.
+    WORD = 32 if ARCH == 'Series7' else 16
     if ARCH != 'Series7':
         args.tilegrid_only = True
     dbdir = args.db or os.path.join(args.build, 'db', ARCH)

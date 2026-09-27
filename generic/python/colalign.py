@@ -70,6 +70,22 @@ BETA = 1.0  # transition smoothing
 MAXSKIP = 8  # consecutive unassigned grid columns
 
 
+# Site types configured outside the configuration frames (the UltraScale+
+# PS through its own registers): their tiles own no frame column; the
+# PS8 tile in the bottom clock region row of the PS would otherwise take the
+# frame column of the PS interface column next to it (prjuray-db:
+# INT_INTF_LEFT_TERM_PSS in minor column 0 in every row).
+OUTSIDE_FRAMES = {'PS8'}
+
+
+def outside_frames(sites):
+    """True for a tile whose sites (tiles.tsv field) all are of
+    OUTSIDE_FRAMES types."""
+    if sites == '-':
+        return False
+    return all(s.split(':')[-1] in OUTSIDE_FRAMES for s in sites.split(','))
+
+
 def type_info(die):
     """tile type -> (npips, nsites)"""
     out = {}
@@ -105,7 +121,8 @@ class DieRows:
             # Tiles without PIPs or sites, or without a bit window (e.g.
             # break rows between clock regions) own no configuration bits.
             if t['type'] == 'NULL' or not cfg(t['type']) or \
-                    self.grid.tile_window(name) is None:
+                    self.grid.tile_window(name) is None or \
+                    outside_frames(t['sites']):
                 continue
             counts[(self.grid.crrow[t['gy']], t['gx'])][t['type']] += 1
             self.gyrows[t['gy']].append((t['gx'], name))
