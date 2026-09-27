@@ -75,11 +75,13 @@ class SiteKeys:
         self.key = {}
         self.tile_type = {}
         self.pads = collections.defaultdict(list)  # tile -> pad sites
+        self.region = {}  # tile -> clock region (X<c>Y<r>, '-')
         for line in open(tiles_tsv):
             p = line.split()
             if p[0] != 'tile':
                 continue
             self.tile_type[p[1]] = p[2]
+            self.region[p[1]] = p[5]
             if p[6] == '-':
                 continue
             groups = collections.defaultdict(list)
@@ -259,9 +261,28 @@ def _drp_fields(prefix, entry, fields):
     return out
 
 
-def clockgen_drp_features(prefix, cfgs):
+def clockgen_family(bel, sitekeys):
+    """Lookup table family of a clock generator BEL: the 7-series BELs are
+    named after the primitive, UltraScale(+) ones just MMCM / PLL (the
+    architecture then from the slice tile types: CLE_M on UltraScale,
+    CLEM on UltraScale+)."""
+    if bel in _TABLE_FAMILY:
+        return _TABLE_FAMILY[bel]
+    if bel not in ('MMCM', 'PLL'):
+        return None
+    arch = getattr(sitekeys, '_clockgen_arch', None)
+    if arch is None:
+        types = set(sitekeys.tile_type.values())
+        arch = 'usp' if 'CLEM' in types else 'us' if 'CLE_M' in types \
+            else ''
+        sitekeys._clockgen_arch = arch
+    return f'{arch}_{bel.lower()}' if arch else None
+
+
+def clockgen_drp_features(prefix, cfgs, fam=None):
     """Derived counter / lock / filter register features of an MMCM or PLL
-    BEL (<prefix> = <SITEKEY>.<BEL>, <cfgs> = its BEL configuration)."""
+    BEL (<prefix> = <SITEKEY>.<BEL>, <cfgs> = its BEL configuration, <fam>
+    its clockgen_tables.json family)."""
     out = []
 
     def num(k, default=None):
@@ -323,7 +344,8 @@ def clockgen_drp_features(prefix, cfgs):
         out.append(f'{prefix}.DRP.{name}_EDGE={edge}')
         out.append(f'{prefix}.DRP.{name}_NO_COUNT={nc}')
         out.append(f'{prefix}.DRP.{name}_FRAC_EN={int(is_frac)}')
-    fam = _TABLE_FAMILY.get(prefix.rsplit('.', 1)[-1])
+    if fam is None:
+        fam = _TABLE_FAMILY.get(prefix.rsplit('.', 1)[-1])
     if m is not None and fam:
         # Lock and loop filter tables are looked up from the (integer)
         # multiplier and the bandwidth.
@@ -436,7 +458,9 @@ def tile_features(path, sitekeys):
     # Clock generator counter registers (derived, see clockgen_drp_features).
     for (tile, prefix), cfgs in bel_cfgs.items():
         if re.search(r'\.(MMCME\d_ADV|PLLE\d_ADV|MMCM|PLL)$', prefix):
-            feats[tile].update(clockgen_drp_features(prefix, cfgs))
+            feats[tile].update(clockgen_drp_features(
+                prefix, cfgs,
+                clockgen_family(prefix.rsplit('.', 1)[-1], sitekeys)))
     # 7-series DSP48E1: the "AREG_0" / "BREG_0" bits (prjxray, DSP_L 27_111
     # / 27_038, 27_271 / 27_198) are set for AREG=0, and for AREG=1 when
     # INMODE[0] (A1/A2 select; INMODE[4] for B) is tied to ground
@@ -541,4 +565,41 @@ def tile_features(path, sitekeys):
             for s in pads:
                 if s not in site_map:
                     feats[tile].add(f'{sitekeys.key[s][1]}.UNUSEDPIN={v}')
+    hclk_row_features(feats, sitekeys)
     return feats
+
+
+_REGION = re.compile(r'X(\d+)Y(\d+)$')
+_HROW_HCLK = re.compile(r'CLK_HROW_CK_HCLK_OUT_([LR])(\d+)->CLK_HROW_CK_BUFHCLK_\1\2$')
+
+
+def hclk_row_features(feats, sitekeys):
+    """7-series: the HCLK_CMT tile of a CMT column enables the horizontal
+    clock rows its clock region's HROW drives towards it (xa7s15 CMT
+    26_1621 / 27_1621 / 29_1626 = rows 9 / 8 / 11, exact in 80 designs):
+    HCLK_CMT.BUFHCLK<n>.ACTIVE when the HROW of the clock region row drives
+    CLK_HROW_CK_BUFHCLK_<side><n>, <side> L for the left clock region
+    column (X0), R for the right one."""
+    rows = collections.defaultdict(set)
+    for tile, fs in feats.items():
+        if not sitekeys.tile_type.get(tile, '').startswith('CLK_HROW_'):
+            continue
+        m = _REGION.match(sitekeys.region.get(tile, ''))
+        if not m:
+            continue
+        for f in fs:
+            h = _HROW_HCLK.match(f)
+            if h:
+                rows[int(m.group(2))].add((h.group(1), int(h.group(2))))
+    if not rows:
+        return
+    for tile, tt in sitekeys.tile_type.items():
+        if tt not in ('HCLK_CMT', 'HCLK_CMT_L'):
+            continue
+        m = _REGION.match(sitekeys.region.get(tile, ''))
+        if not m:
+            continue
+        side = 'L' if m.group(1) == '0' else 'R'
+        for s, n in rows.get(int(m.group(2)), ()):
+            if s == side:
+                feats[tile].add(f'HCLK_CMT.BUFHCLK{n}.ACTIVE')
