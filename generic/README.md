@@ -190,7 +190,12 @@ turns that into per tile type windows relative to the tile's grid row;
 --windows` widens the structural windows with them (regions may overlap;
 a bit is documented when any owner documents it).  `pipeline.py
 --probe-windows` does all of this.  `check.py` reports distinct undocumented
-bits (`bits N`) next to the per owner count.
+bits (`bits N`) next to the per owner count.  `tilegrid.py --stacks RE`
+makes the overlapping learnt windows of the matching types within one grid
+column disjoint (each tile keeps its busiest contiguous rows); it is off by
+default because the rows a tile loses leave bits its features set that no
+owner documents (Series7 CMT stack: fewer undocumented bits per owner, more
+distinct ones).
 
 A learnt window never covers the structural window of another tile with
 sites (of a type without a learnt window) in the same grid column.  Tile

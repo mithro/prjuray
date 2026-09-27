@@ -56,6 +56,13 @@ class Grid:
         # tile type -> (first bit, end bit) relative to the tile's grid row
         # (row_bit), overriding the structural window (see windows.py)
         self.type_windows = {}
+        # Tile types whose overlapping learnt windows (within one grid
+        # column) are made disjoint (resolve_overlaps); None: none.
+        # Off by default: on xa7a15t / xa7s15 / xa7z010 even the CMT
+        # stack alone raised the distinct undocumented bits (the rows a
+        # tile loses to its neighbour leave bits of its features that
+        # nothing documents), although the per owner counts drop.
+        self.stack_re = stack_re(STACK_TYPES)
         self.probe = False
         for line in open(die.tiles_tsv):
             p = line.split()
@@ -538,6 +545,11 @@ def virtual_bram_shift(clist, colmap, cr, gxs, extra):
     return None
 
 
+STACK_TYPES = ''  # e.g. r'^(CMT_|HCLK_CMT)'
+
+
+def stack_re(pattern):
+    return re.compile(pattern) if pattern else None
 CORE_SHARE = 0.2  # rows with this share of a type's busiest row are core
 
 
@@ -575,10 +587,12 @@ def resolve_overlaps(grid, out, verbose=False):
         tw = grid.type_windows.get(e['type'])
         if tw is None or len(tw) < 3 or not tw[2]:
             continue
+        if grid.stack_re is None or not grid.stack_re.match(e['type']):
+            continue
         base = grid.row_bit(e['gy'])
         for r in e['bits']:
             if r['block'] == 0:
-                groups[(r['base'], r['half'], r['row'])].append(
+                groups[(r['base'], r['half'], r['row'], e['gx'])].append(
                     (name, r, row_of(base) if base is not None else None,
                      tw[2]))
     dropped = changed = 0
@@ -815,6 +829,10 @@ def main():
                     'colalign.py (default: activity only)')
     ap.add_argument('--windows', help='tile type windows (windows.py '
                     '--merge output)')
+    ap.add_argument('--stacks', default=STACK_TYPES,
+                    help='regular expression of the tile types whose '
+                    'overlapping learnt windows are made disjoint (default: '
+                    'none; e.g. "^(CMT_|HCLK_CMT)")')
     ap.add_argument('--frames', help='frames used by tile types sharing '
                     'frame columns (colalign.py frames.json)')
     ap.add_argument('--probe', help='comma separated tile types (or "auto": '
@@ -826,6 +844,7 @@ def main():
     args = ap.parse_args()
     die = dieslib.load()[args.die]
     grid = Grid(die)
+    grid.stack_re = stack_re(args.stacks)
     if args.windows:
         with open(args.windows) as f:
             grid.type_windows = {t: tuple(w) for t, w in json.load(f).items()}
