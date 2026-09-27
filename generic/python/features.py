@@ -26,6 +26,7 @@ same-prefix sites in the tile.
 """
 import collections
 import gzip
+import os
 import re
 
 import numpy as np
@@ -77,6 +78,7 @@ class SiteKeys:
         self.pads = collections.defaultdict(list)  # tile -> pad sites
         self.region = {}  # tile -> clock region (X<c>Y<r>, '-')
         self.xy = {}  # tile -> (grid x, grid y)
+        self.tiles_tsv = tiles_tsv
         for line in open(tiles_tsv):
             p = line.split()
             if p[0] != 'tile':
@@ -670,6 +672,7 @@ def leaf_clock_features(feats, sitekeys):
         for v in cols.values():
             v.sort()
         cols = _INT_COLS[key] = dict(cols)
+    touched = set()
     for tile, fs in list(feats.items()):
         if not sitekeys.tile_type.get(tile, '').startswith('RCLK_INT'):
             continue
@@ -688,3 +691,53 @@ def leaf_clock_features(feats, sitekeys):
             for k in outs.get(leaf, ()):
                 for t in tiles:
                     feats[t].add(f'LEAF_CLK_OUT{k}')
+                    touched.add(t)
+    # A live leaf clock k reaches the INTs on GCLK_B_0_<g(k)>; the INT's
+    # global node mux of the lowest numbered node it feeds is set to it
+    # whenever no PIP of the INT drives that node (xcku025: 27_011 / 25_011
+    # = GCLK_B_0_9 -> INT_NODE_GLOBAL_13_OUT1 / OUT0 for leaf output 12,
+    # 3 exceptions in 22253; 27_026 / 25_026 = GCLK_B_0_11 -> node 2 for
+    # output 13): the implied PIP is added as if routed.
+    feeds = _gclk_feeds(sitekeys)
+    for t in touched:
+        fs = feats[t]
+        used = {f.split('->', 1)[1] for f in fs if '->' in f}
+        for f in list(fs):
+            if not f.startswith('LEAF_CLK_OUT'):
+                continue
+            k = int(f[len('LEAF_CLK_OUT'):])
+            g = (2 * k) % 16 + (1 if k >= 8 else 0)
+            nodes = feeds.get(g)
+            if not nodes:
+                continue
+            low = min(n for n, _ in nodes)
+            for n, wire in nodes:
+                if n == low and wire not in used:
+                    fs.add(f'GCLK_B_0_{g}->{wire}')
+
+
+_GNODE = re.compile(r'^INT_NODE_GLOBAL_(\d+)_(?:INT_)?OUT\d$')
+_FEEDS = {}
+
+
+def _gclk_feeds(sitekeys):
+    """GCLK_B_0_g -> {(node number, node wire)} of the INT tile type (the
+    die's PIP list next to its tile list)."""
+    key = id(sitekeys)
+    if key not in _FEEDS:
+        meta = os.path.dirname(os.path.dirname(sitekeys.tiles_tsv))
+        name = os.path.splitext(os.path.basename(sitekeys.tiles_tsv))[0]
+        out = collections.defaultdict(set)
+        path = os.path.join(meta, 'pips', name + '.txt')
+        if os.path.exists(path):
+            with open(path) as f:
+                for line in f:
+                    p = line.split()
+                    if len(p) > 3 and p[0] == 'pip' and p[1] == 'INT' and \
+                            p[2].startswith('GCLK_B_0_'):
+                        m = _GNODE.match(p[3])
+                        if m:
+                            out[int(p[2].rsplit('_', 1)[1])].add(
+                                (int(m.group(1)), p[3]))
+        _FEEDS[key] = dict(out)
+    return _FEEDS[key]
