@@ -211,16 +211,33 @@ class Design:
         allsrc = [s[0] for s in self.sources]
         drive = collections.defaultdict(list)
         const0, const1 = [], []
+        # Clock budget: loads spread over too many clocks exceed the clock
+        # tracks of a clock region (12 / 24) or the 6 clocks of half an I/O
+        # bank.  Fabric clock loads use at most 8 clocks, I/O logic clock
+        # loads at most 4; unused pad clocks become data sources.
+        clocks = list(self.clocks)
+        if len(clocks) > 8:
+            keep = set(rng.sample(clocks, 8))
+            for c in clocks:
+                if c not in keep and c not in self.gclocks:
+                    allsrc.append(c)
+            clocks = [c for c in clocks if c in keep]
+        ioclocks = rng.sample(clocks, min(4, len(clocks)))
         for pin, gx, gy, kind in self.sinks:
             pins = pin if isinstance(pin, list) else [pin]
             hard = kind.endswith('_hard')
             kind = kind.replace('_hard', '')
-            if kind == 'gclock' and (self.gclocks or self.clocks):
-                drive[rng.choice(self.gclocks or self.clocks)].extend(pins)
+            if kind == 'gclock' and (self.gclocks or clocks):
+                drive[rng.choice(self.gclocks or clocks)].extend(pins)
                 continue
-            if kind in ('clock', 'gclock') and self.clocks:
-                drive[rng.choice(self.clocks)].extend(pins)
+            if kind == 'ioclock' and ioclocks:
+                drive[rng.choice(ioclocks)].extend(pins)
                 continue
+            if kind in ('clock', 'gclock', 'ioclock') and clocks:
+                drive[rng.choice(clocks)].extend(pins)
+                continue
+            if kind == 'ioclock':
+                kind = 'data'
             kind = 'data' if kind == 'gclock' else kind
             if kind in ('const', 'const0'):
                 (const0 if kind == 'const0' or rng.random() < 0.5
@@ -266,6 +283,7 @@ class Design:
             f.write('catch {set_property BITSTREAM.CONFIG.UNUSEDPIN '
                     f'{rng.choice(["Pulldown", "Pullup", "Pullnone"])} '
                     '[current_design]}\n')
+            f.write('nl_internal_vref 0.5\n')
             f.write(f'nl_finish {int(rng.random() < 0.5)}\n')
 
 
@@ -655,7 +673,22 @@ def _fmt(x):
 # Pins (by regexp) that only connect to package pads or other hard blocks.
 DEDICATED_RE = {
     'PS8': re.compile(r'_PAD_'),
+    # 7-series memory interface blocks: clocks and PHY buses only reach
+    # the SERDES / FIFOs / PHY_CONTROL of the byte group (unroutable from
+    # or to the fabric: "PHASER_IN_PHY.ICLK -> SLICEL.B5").
+    'PHASER_IN_PHY': re.compile(
+        r'^(ICLK|ICLKDIV|RCLK|ISERDESRST|WRENABLE|BURSTPENDINGPHY|'
+        r'RANKSELPHY|ENCALIBPHY|FREQREFCLK|MEMREFCLK|PHASEREFCLK|SYNCIN)'),
+    'PHASER_OUT_PHY': re.compile(
+        r'^(OCLK|OSERDESRST|RDENABLE|CTSBUS|DQSBUS|DTSBUS|'
+        r'BURSTPENDINGPHY|ENCALIBPHY|FREQREFCLK|MEMREFCLK|PHASEREFCLK|'
+        r'SYNCIN)'),
+    'PHY_CONTROL': re.compile(
+        r'^(INBURSTPENDING|INRANK|OUTBURSTPENDING|PCENABLECALIB|MEMREFCLK|'
+        r'SYNCIN|AUXOUTPUT|PHYCTLMSTREMPTY)'),
 }
+DEDICATED_RE['PHASER_IN'] = DEDICATED_RE['PHASER_IN_PHY']
+DEDICATED_RE['PHASER_OUT'] = DEDICATED_RE['PHASER_OUT_PHY']
 # Clock outputs of hard blocks that must drive a given clock buffer.
 CLOCK_OUT_BUFFERS = {
     'PS8': (re.compile(r'^(PLCLK\[\d\]|DP(AUDIO|VIDEO)REFCLK|FMIO\w*TOPLBUFG|'
@@ -1373,7 +1406,7 @@ def recipe_io(d, site, stype):
                     continue
                 full = f'{n2}/{pin}'
                 if direction == 'IN' and rng.random() < 0.7:
-                    d.add_sink(full, site, 'clock' if DIRECT_CLOCKS.search(pin)
+                    d.add_sink(full, site, 'ioclock' if DIRECT_CLOCKS.search(pin)
                                else 'data')
                 elif direction == 'OUT' and rng.random() < 0.7:
                     d.add_source(full, site)
@@ -1406,7 +1439,7 @@ def recipe_io(d, site, stype):
                     continue
                 full = f'{n2}/{pin}'
                 if direction == 'IN' and rng.random() < 0.7:
-                    d.add_sink(full, site, 'clock' if DIRECT_CLOCKS.search(pin)
+                    d.add_sink(full, site, 'ioclock' if DIRECT_CLOCKS.search(pin)
                                else 'data')
                 elif direction == 'OUT' and rng.random() < 0.7:
                     d.add_source(full, site)
@@ -1621,7 +1654,7 @@ def recipe_native(d, site, ref):
                 if rng.random() < 0.5:
                     d.add_source(f'{c}/RIU_RD_DATA[{b}]', site)
     if clk_pins:
-        d.add_sink(clk_pins, site, 'clock')
+        d.add_sink(clk_pins, site, 'ioclock')
 
 
 for _r in ('BITSLICE_CONTROL', 'RIU_OR', 'TX_BITSLICE_TRI', 'RX_BITSLICE',
@@ -1732,6 +1765,11 @@ def generate(die, prims, seed, out, density, hard=True, pips=None,
             if re.match(r'^(RAMB|RAMBFIFO|DSP|URAM)', st) and \
                     st not in chosen and rng.random() < 0.5:
                 chosen.append(st)
+        # 18 Kb and 36 Kb block RAM sites share tiles and the first type
+        # processed takes them: alternate which one goes first (RAMB18
+        # sorted first, leaving few RAMB36/FIFO36 tiles).
+        if rng.random() < 0.5:
+            chosen.reverse()
         used = collections.Counter()
         bram_tiles = {}
         for st in chosen:

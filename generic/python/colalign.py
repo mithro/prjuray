@@ -765,6 +765,37 @@ def main():
         print(f'  {k}{mark}: ' + ', '.join(
             f'{nf} x{n}' for nf, n in sorted(c.items(), key=lambda x: -x[1])))
     # Output + self-consistency.
+    # Frame counts of the frame columns each tile type's tiles are in (over
+    # all dies): a type found in frame columns of several sizes shares them
+    # with the column's owner (e.g. interconnect next to CLB, BRAM, DSP, I/O
+    # columns) and only uses the frames of the smallest.
+    type_nf = collections.defaultdict(set)
+    shared = collections.defaultdict(lambda: [0, 0])  # type -> [alone, shared]
+    for d, dr in rows.items():
+        for cr in dr.rows:
+            m = dr.majors(cr)
+            if not m:
+                continue
+            full = attach_silent(dr.rows[cr], cur[(d, cr)], model)
+            idx = {gx: m[j][2] for gx, j in full.items()}
+            nshare = collections.Counter(full.values())
+            kinds = dict(dr.rows[cr])
+            for t in dr.grid.tiles.values():
+                if dr.grid.crrow.get(t['gy']) == cr and t['gx'] in idx and \
+                        t['type'] != 'NULL' and \
+                        kinds.get(t['gx']) not in silent:
+                    type_nf[t['type']].add(idx[t['gx']])
+                    shared[t['type']][int(nshare[full[t['gx']]] > 1)] += 1
+    # Only types (nearly) always sharing their frame column with another
+    # grid column, next to several kinds of columns (at least 3 frame
+    # counts: not e.g. a hard block column seen with two sizes); columns of
+    # silent kinds (placed without activity) do not count.
+    frames = {t: min(v) for t, v in sorted(type_nf.items())
+              if len(v) >= 3 and shared[t][1] >= 0.9 * sum(shared[t])}
+    with open(os.path.join(base, 'frames.json'), 'w') as f:
+        json.dump(frames, f, indent=1, sort_keys=True)
+    print('frame count of shared column tile types:',
+          ' '.join(f'{t}:{n}' for t, n in frames.items()))
     for d, dr in rows.items():
         colmap = []
         tilemap = {}

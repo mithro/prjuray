@@ -80,23 +80,28 @@ class Collector:
         return out
 
     def unowned(self, ids):
-        """Set bits in no tile's region.  self.hidden counts those of them
-        in frame rows without any tile region (e.g. frame rows of fabric
-        the device does not expose, configured but without tiles)."""
+        """Set bits in no tile's region.  Frame rows without any tile region
+        (e.g. fabric the device does not expose, configured but without
+        tiles) are not a tile grid gap: their bits that are also set in the
+        empty design (baseline) are counted in self.hidden instead (constant
+        baseline bits), the others stay unowned."""
         if not hasattr(self, "_hidden_frame"):
             key = [bitstream.far_fields(self.die.arch, f)[:3]
                    for f in self.df.frames]
             used = {key[f] for f in self.by_frame}
             self._hidden_frame = [k not in used for k in key]
+            self._base = set(self.df.base.tolist())
         fis = ids // self.nbf
         offs = ids % self.nbf
         n = 0
         self.hidden = 0
-        for f, o in zip(fis.tolist(), offs.tolist()):
+        for i, f, o in zip(ids.tolist(), fis.tolist(), offs.tolist()):
             if not any(off <= o < off + k
                        for off, k, _ in self.by_frame.get(f, ())):
-                n += 1
-                self.hidden += self._hidden_frame[f]
+                if self._hidden_frame[f] and i in self._base:
+                    self.hidden += 1
+                else:
+                    n += 1
         return n
 
     def samples(self, design_dir, empty_keep=0.2, rng=None):

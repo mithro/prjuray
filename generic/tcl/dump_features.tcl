@@ -11,6 +11,9 @@
 #   site <site> <site_type> <tile>
 #   sp <site> <bel> <from_pin> <to_pin>             used site pip (routing mux)
 #   cfg <site> <bel> <name> <value>                 physical BEL configuration
+#                                                    (also IS_<pin>_INVERTED of
+#                                                    placed cells, on the site
+#                                                    pin the cell pin reaches)
 
 proc _df_cfg_props {bel} {
     global _df_prop_cache
@@ -377,20 +380,107 @@ proc dump_features {out} {
             }
         }
     }
+    puts $fp "# t_sp [expr {[clock milliseconds] - $t0}]"
+    # Pad pull resistors (a port property, not in the BEL configuration):
+    # reported like a BEL setting of the pad site (NONE when not set).
+    foreach port [get_ports -quiet] {
+        set s [get_sites -quiet -of_objects $port]
+        if {![string match IOB_* $s]} continue
+        set v [get_property -quiet PULLTYPE $port]
+        if {$v eq ""} { set v NONE }
+        puts $fp "cfg $s PAD PULLTYPE $v"
+    }
+    # Pin inversions of placed cells (IS_<pin>_INVERTED, e.g. the flip-flop
+    # clock and set/reset inversion of a slice): a setting Vivado does not
+    # expose as BEL configuration nor as a site pip.  The inverter is shared
+    # by the BELs whose pin is wired to the same site pin (e.g. the clock of
+    # all flip-flops of a slice half), so it is reported on the site pin:
+    # "cfg <site> <site pin> IS_<pin>_INVERTED <value>" (the property name is
+    # kept: a latch gate and a flip-flop clock invert oppositely), or on the
+    # BEL when the pin reaches no site pin.  The BEL pin -> site pin wiring is
+    # looked up once per (BEL, pin).  (Vectorised per cell type.)
+    set placed [get_cells -quiet -hierarchical -filter {IS_PRIMITIVE && LOC != ""}]
+    set byref [dict create]
+    foreach c $placed r [_df_props REF_NAME $placed] { dict lappend byref $r $c }
+    set sitepin [dict create]
+    set tries [dict create]
+    set seen [dict create]
+    dict for {ref cells} $byref {
+        set props [list_property [lindex $cells 0] IS_*_INVERTED]
+        if {![llength $props]} continue
+        set sites [_df_props SITE $cells]
+        set bels [_df_props BEL $cells]
+        foreach p $props {
+            set pin [string range $p 3 end-9]
+            foreach c $cells s $sites b $bels v [_df_props $p $cells] {
+                if {$s eq "" || $b eq "" || $v eq ""} continue
+                # (an unconnected cell pin maps to no BEL pin: ask again
+                # with the next cell, up to 8 times)
+                set k "$b/$pin"
+                if {![dict exists $sitepin $k] || ([dict get $sitepin $k] eq "" && [dict get $tries $k] < 8)} {
+                    set bp [get_bel_pins -quiet -of_objects [get_pins -quiet $c/$pin]]
+                    set sp [get_site_pins -quiet -of_objects $bp]
+                    # only an unambiguous wiring (one BEL pin, one site pin)
+                    if {[llength $bp] == 1 && [llength $sp] == 1} {
+                        dict set sitepin $k [lindex [split $sp /] end]
+                    } else {
+                        dict set sitepin $k ""
+                    }
+                    dict incr tries $k
+                }
+                set where [dict get $sitepin $k]
+                if {$where eq ""} { set where [lindex [split $b .] end] }
+                set line "cfg $s $where $p $v"
+                if {[dict exists $seen $line]} continue
+                dict set seen $line 1
+                puts $fp $line
+            }
+        }
+    }
+    puts $fp "# t_inv [expr {[clock milliseconds] - $t0}]"
     # Bank wide settings (e.g. the 7-series STEPDOWN of low voltage banks)
     # also change unused pads: report the I/O standards used in each bank on
     # every pad site of the bank.
     set bankstd [dict create]
+    set bankin [dict create]
     foreach port [get_ports -quiet] {
         set pin [get_package_pins -quiet -of_objects $port]
         set std [get_property IOSTANDARD $port]
         if {$pin eq "" || $std eq ""} continue
-        dict set bankstd [get_property BANK $pin] $std 1
+        set b [get_property BANK $pin]
+        dict set bankstd $b $std 1
+        # Kinds of inputs in the bank (differential / single ended).
+        if {[get_property DIRECTION $port] ne "OUT"} {
+            set diff [regexp {^(DIFF_|LVDS|TMDS|MINI_LVDS|BLVDS|RSDS|PPDS|SUB_LVDS|SLVS|LVPECL|MIPI)} $std]
+            dict set bankin $b [expr {$diff ? "DIFF" : "SE"}] 1
+        }
+    }
+    # 7-series bank settings (internal VREF, ...) live in the HCLK_IOI tile
+    # of the bank: report them on its IDELAYCTRL site too (same clock
+    # region and I/O column as the bank's pads).
+    set dlyctl [dict create]
+    foreach s [get_sites -quiet -filter {SITE_TYPE == IDELAYCTRL}] {
+        if {[regexp {_X(\d+)Y} $s - x]} {
+            dict set dlyctl [get_property CLOCK_REGION $s],$x $s
+        }
     }
     dict for {bank stds} $bankstd {
         set bsites [get_sites -quiet -of_objects [get_package_pins -quiet -filter "BANK == $bank"]]
+        set vref [get_property -quiet INTERNAL_VREF [get_iobanks -quiet $bank]]
+        if {$vref eq ""} { set vref NONE }
+        set extra [list]
         foreach s $bsites {
+            if {[regexp {^IOB_X(\d+)Y} $s - x]} {
+                set k [get_property -quiet CLOCK_REGION $s],$x
+                if {[dict exists $dlyctl $k]} { lappend extra [dict get $dlyctl $k] }
+            }
+        }
+        foreach s [concat $bsites [lsort -unique $extra]] {
             foreach std [dict keys $stds] { puts $fp "bank $s IOSTD $std" }
+            puts $fp "bank $s INTERNAL_VREF $vref"
+            if {[dict exists $bankin $bank]} {
+                puts $fp "bank $s INPUTS [join [lsort [dict keys [dict get $bankin $bank]]] _]"
+            }
         }
     }
     puts $fp "# t_done [expr {[clock milliseconds] - $t0}]"

@@ -538,8 +538,32 @@ def virtual_bram_shift(clist, colmap, cr, gxs, extra):
     return None
 
 
+def edge_variants(grid, out, verbose=False):
+    """Tile types with sites found only in the bottom and the top INT row of
+    clock region rows (e.g. the 7-series single I/O tiles LIOB33_SING,
+    LIOI3_SING: half of a two row I/O tile, the bottom one holding the
+    upper half's pad, the top one the lower half's) have a different
+    layout at each edge, which one bit database entry cannot describe: the
+    top instances get their own type, <type>@TOP."""
+    rows = collections.defaultdict(set)
+    sited = set()
+    for name, t in grid.tiles.items():
+        r = grid.rowidx.get(t['gy'])
+        if r is not None:
+            rows[t['type']].add(r)
+        if t['sites'] != '-':
+            sited.add(t['type'])
+    top = grid.rows_per_cr - 1
+    split = {t for t, r in rows.items() if t in sited and r == {0, top}}
+    for name, t in grid.tiles.items():
+        if t['type'] in split and grid.rowidx.get(t['gy']) == top:
+            out[name]['type'] = t['type'] + '@TOP'
+    if verbose and split:
+        print('edge variants', ' '.join(sorted(split)))
+
+
 def build(grid, dframes, cols, crmap, colmap, colmap1, verbose=False,
-          tilemap=None):
+          tilemap=None, frame_caps=None):
     """Returns the tilegrid dict: tile -> {type, gx, gy, bits: [...]}.
     crmap: clock region row -> (block, half, row); colmap: (clock region
     row, grid x) -> block 0 frame column; colmap1: (clock region row, grid
@@ -547,6 +571,8 @@ def build(grid, dframes, cols, crmap, colmap, colmap1, verbose=False,
     the BRAM columns cannot be mapped by rank); tilemap: tile -> block 0
     frame column overriding its grid column's."""
     tilemap = tilemap or {}
+    # tile type -> frames it uses of its (shared) frame column
+    frame_caps = frame_caps or {}
     colinfo = {}
     for key, clist in cols.items():
         for col, first, nfr in clist:
@@ -561,6 +587,7 @@ def build(grid, dframes, cols, crmap, colmap, colmap1, verbose=False,
             col = tilemap.get(name, colmap.get((cr, t['gx'])))
             if key is not None and col is not None:
                 first, nfr = colinfo[(key, col)]
+                nfr = min(nfr, frame_caps.get(t['type'], nfr))
                 entry['bits'].append(
                     dict(block=key[0],
                          half=key[1],
@@ -571,6 +598,7 @@ def build(grid, dframes, cols, crmap, colmap, colmap1, verbose=False,
                          offset=lo,
                          nbits=n))
         out[name] = entry
+    edge_variants(grid, out, verbose)
     # Block RAM content frames (block type 1): the k-th BRAM column of a
     # clock region row owns the k-th block type 1 frame column of that row.
     # Frame columns may also exist for BRAM grid columns of other rows (or
@@ -645,6 +673,8 @@ def main():
                     'colalign.py (default: activity only)')
     ap.add_argument('--windows', help='tile type windows (windows.py '
                     '--merge output)')
+    ap.add_argument('--frames', help='frames used by tile types sharing '
+                    'frame columns (colalign.py frames.json)')
     ap.add_argument('--probe', help='comma separated tile types (or "auto": '
                     'tall and windowless ones) given a window of +-'
                     '--probe-span bits around their grid row, to learn their '
@@ -688,7 +718,12 @@ def main():
         crmap = ev['crmap']
         colmap, colmap1 = assign_activity(grid, cols, ev, True)
         tilemap = {}
-    tg = build(grid, dframes, cols, crmap, colmap, colmap1, True, tilemap)
+    frame_caps = {}
+    if args.frames:
+        with open(args.frames) as f:
+            frame_caps = json.load(f)
+    tg = build(grid, dframes, cols, crmap, colmap, colmap1, True, tilemap,
+               frame_caps)
     with open(args.out, 'w') as f:
         json.dump(tg, f, indent=0, sort_keys=True)
     nb = sum(1 for t in tg.values() if t['bits'])
