@@ -75,11 +75,13 @@ class SiteKeys:
         self.key = {}
         self.tile_type = {}
         self.pads = collections.defaultdict(list)  # tile -> pad sites
+        self.xy = {}  # tile -> (grid x, grid y)
         for line in open(tiles_tsv):
             p = line.split()
             if p[0] != 'tile':
                 continue
             self.tile_type[p[1]] = p[2]
+            self.xy[p[1]] = (int(p[3]), int(p[4]))
             if p[6] == '-':
                 continue
             groups = collections.defaultdict(list)
@@ -358,4 +360,49 @@ def tile_features(path, sitekeys):
             for s in pads:
                 if s not in site_map:
                     feats[tile].add(f'{sitekeys.key[s][1]}.UNUSEDPIN={v}')
+    leaf_clock_features(feats, sitekeys)
     return feats
+
+
+# UltraScale(+) leaf clock buffers of an RCLK_INT tile: X16_0 drives the INT
+# rows below the RCLK row (grid y larger), X16_1 those above.
+_LEAF = re.compile(r'^CLK_BUFCE_LEAF_X16_([01])_CLK_IN\d+->'
+                   r'CLK_BUFCE_LEAF_X16_\1_CLK_OUT(\d+)$')
+LEAF_ROWS = 30  # INT rows per half clock region
+_INT_COLS = {}
+
+
+def leaf_clock_features(feats, sitekeys):
+    """Adds LEAF_CLK_OUT<k> to every INT tile of the half-column whose
+    RCLK_INT leaf clock buffer output k is used: the INTs' clock enable bits
+    (xcku025 INT 27_011 / 25_011: output 12, 27_026 / 25_026: output 13)
+    follow the leaf buffer, not the INT's own PIPs."""
+    key = id(sitekeys)
+    cols = _INT_COLS.get(key)
+    if cols is None:
+        cols = collections.defaultdict(list)  # grid x -> sorted INT grid ys
+        for t, tt in sitekeys.tile_type.items():
+            if tt == 'INT':
+                x, y = sitekeys.xy[t]
+                cols[x].append((y, t))
+        for v in cols.values():
+            v.sort()
+        cols = _INT_COLS[key] = dict(cols)
+    for tile, fs in list(feats.items()):
+        if not sitekeys.tile_type.get(tile, '').startswith('RCLK_INT'):
+            continue
+        outs = collections.defaultdict(set)
+        for f in fs:
+            m = _LEAF.match(f)
+            if m:
+                outs[m.group(1)].add(m.group(2))
+        if not outs:
+            continue
+        x, y = sitekeys.xy[tile]
+        ints = cols.get(x, [])
+        below = [t for yy, t in ints if yy > y][:LEAF_ROWS]
+        above = [t for yy, t in reversed(ints) if yy < y][:LEAF_ROWS]
+        for leaf, tiles in (('0', below), ('1', above)):
+            for k in outs.get(leaf, ()):
+                for t in tiles:
+                    feats[t].add(f'LEAF_CLK_OUT{k}')
