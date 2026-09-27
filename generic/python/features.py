@@ -257,6 +257,23 @@ def tile_features(path, sitekeys):
                     continue
                 for f in cfg_features(prefix, name, value):
                     feats[tile].add(f'{f}@{wname}={wval}')
+    # A fractured LUT (both the 6LUT and the 5LUT of a site letter in use)
+    # holds the O5 function in the low half of the physical truth table:
+    # the O6 equation (independent of A6) only describes the high half.
+    # Name the physical low half of <x>6LUT.INIT after the O5 equation.
+    for (tile, prefix), cfgs in bel_cfgs.items():
+        if not prefix.endswith('6LUT') or 'EQN' not in cfgs:
+            continue
+        o5 = bel_cfgs.get((tile, prefix[:-4] + '5LUT'), {}).get('EQN')
+        if o5 is None:
+            continue
+        o5bits = lut_eqn_bits(o5)
+        if o5bits is None:
+            continue
+        fs = feats[tile]
+        for i in range(32):
+            fs.discard(f'{prefix}.INIT[{i}]')
+        fs.update(f'{prefix}.INIT[{i}]' for i in o5bits if i < 32)
     # Older dumps report a chain carry input (PRECYINIT CIN) even when
     # Vivado routed CI through AX; the real PRECYINIT site pip wins.
     for tile, fs in feats.items():

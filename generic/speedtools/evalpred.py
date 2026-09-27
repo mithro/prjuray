@@ -1,4 +1,4 @@
-"""evalpred.py <dbdir> <die> <design roots...>: prediction accuracy of a
+"""evalpred.py [--missed TILETYPE] <dbdir> <die> <design roots...>: prediction accuracy of a
 database on designs: per tile instance, the bits predicted from the tile's
 features (segbits: feature bits; "A&B" features need both; defaults set
 unless cleared by a present feature's "!" bit) compared with the actual bits.
@@ -10,7 +10,13 @@ import dies as dieslib
 import designdata as DD
 import mkdb
 
-dbdir, dn, roots = sys.argv[1], sys.argv[2], sys.argv[3:]
+args = sys.argv[1:]
+show = None
+if args[0] == '--missed':
+    show, args = args[1], args[2:]
+dbdir, dn, roots = args[0], args[1], args[2:]
+missed_bits = collections.Counter()
+actual_bits = collections.Counter()
 die = dieslib.load()[dn]
 tg = json.load(open(os.path.join(dieslib.DB, die.arch, dn, 'tilegrid.json')))
 col = mkdb.Collector(die, tg)
@@ -56,6 +62,9 @@ for d in DD.design_dirs(roots, v2only=True):
         c['correct'] += len(act & pred)
         c['missed'] += len(act - pred)
         c['false'] += len(pred - act)
+        if tt == show:
+            missed_bits.update(act - pred)
+            actual_bits.update(act)
 for tt, c in per.items():
     tot.update(c)
 print(f'TOTAL actual {tot["actual"]} correct {tot["correct"]} missed '
@@ -63,3 +72,7 @@ print(f'TOTAL actual {tot["actual"]} correct {tot["correct"]} missed '
 for tt, c in sorted(per.items(), key=lambda x: -x[1]['missed'])[:25]:
     print(f'  {tt:24s} actual {c["actual"]:8d} missed {c["missed"]:7d} '
           f'false {c["false"]:7d}')
+if show:
+    print(f'most missed bits of {show} (missed / set):')
+    for b, n in missed_bits.most_common(40):
+        print(f'  {b} {n} / {actual_bits[b]}')

@@ -123,7 +123,8 @@ def from_probe(dbdir, grid, span, types, mincount=3, minshare=0.02):
     features) features of the type.  Only features seen at least mincount
     times, and not spread over more than half a clock region (e.g. bank
     wide settings replicated in every row), count.  Returns {type: (first
-    bit, end bit)} relative to the tile's grid row."""
+    bit, end bit, {row: features})} relative to the tile's grid row (the
+    rows' feature counts decide which of overlapping tiles owns a row)."""
     import os
     bpr = grid.bpr
     maxspread = grid.rows_per_cr // 2
@@ -150,15 +151,17 @@ def from_probe(dbdir, grid, span, types, mincount=3, minshare=0.02):
             nf += 1
             rows.update(r)
         need = max(3, minshare * nf)
-        keep = [r for r, n in rows.items() if n >= need]
+        keep = {r: n for r, n in rows.items() if n >= need}
         if keep:
-            out[tt] = (min(keep) * bpr, (max(keep) + 1) * bpr)
+            out[tt] = (min(keep) * bpr, (max(keep) + 1) * bpr,
+                       {str(r): n for r, n in sorted(keep.items())})
     return out
 
 
 def merge(paths):
     """Per tile type, the median first and end bit over the dies' windows
-    (robust against a die with few samples of the type)."""
+    (robust against a die with few samples of the type) and the summed row
+    feature counts."""
     per = collections.defaultdict(list)
     for p in paths:
         with open(p) as f:
@@ -168,7 +171,12 @@ def merge(paths):
     for tt, ws in per.items():
         los = sorted(w[0] for w in ws)
         his = sorted(w[1] for w in ws)
-        out[tt] = (los[len(los) // 2], his[(len(his) - 1) // 2])
+        hist = collections.Counter()
+        for w in ws:
+            if len(w) > 2:
+                hist.update({int(r): n for r, n in w[2].items()})
+        out[tt] = (los[len(los) // 2], his[(len(his) - 1) // 2],
+                   {str(r): n for r, n in sorted(hist.items())})
     return out
 
 
@@ -204,8 +212,8 @@ def main():
         return
     with open(args.out, 'w') as f:
         json.dump(out, f, indent=1, sort_keys=True)
-    for tt, (lo, hi) in sorted(out.items()):
-        print(f'{tt}: {lo}..{hi}')
+    for tt, w in sorted(out.items()):
+        print(f'{tt}: {w[0]}..{w[1]}')
 
 
 if __name__ == '__main__':

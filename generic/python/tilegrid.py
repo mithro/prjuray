@@ -56,6 +56,13 @@ class Grid:
         # tile type -> (first bit, end bit) relative to the tile's grid row
         # (row_bit), overriding the structural window (see windows.py)
         self.type_windows = {}
+        # Tile types whose overlapping learnt windows (within one grid
+        # column) are made disjoint (resolve_overlaps); None: none.
+        # Off by default: on xa7a15t / xa7s15 / xa7z010 even the CMT
+        # stack alone raised the distinct undocumented bits (the rows a
+        # tile loses to its neighbour leave bits of its features that
+        # nothing documents), although the per owner counts drop.
+        self.stack_re = stack_re(STACK_TYPES)
         self.probe = False
         for line in open(die.tiles_tsv):
             p = line.split()
@@ -191,13 +198,29 @@ class Grid:
         end = (r + h) * self.bpr + (self.centre if r + h > half else 0)
         return cr, off, end - off
 
+    def filler_neighbour(self, name):
+        """True when the grid rows right above and below the tile (INT rows of
+        its clock region row) hold site-less tiles other than NULL."""
+        t = self.tiles[name]
+        if t['gy'] in self.centre_rows or CENTRE_TYPES.match(t['type']):
+            return False
+        for y in (t['gy'] - 1, t['gy'] + 1):
+            if y not in self.rowidx or self.crrow[y] != self.crrow[t['gy']]:
+                return False
+            o = self.tiles.get(self.at.get((t['gx'], y)))
+            if o is None or o['type'] == 'NULL' or o['sites'] != '-':
+                return False
+        return True
+
 
 def probe_types(grid):
     """Tile types (with sites) whose structural window is doubtful: taller
     than one INT row, in the centre (HCLK / RCLK) row, or without a window
     although the tile has a grid row with bits; only hard blocks (at most
     PROBE_PER_ROW tiles per clock region row on average), whose windows are
-    cheap to learn and which the structural rule does not describe."""
+    cheap to learn and which the structural rule does not describe.  Also
+    tiles between site-less filler tiles in the same grid column (Series7
+    PCIE_BOT among PCIE_NULL: the block's bits span the clock region)."""
     out = collections.Counter()
     for name, t in grid.tiles.items():
         if t['type'] == 'NULL' or t['sites'] == '-':
@@ -206,7 +229,8 @@ def probe_types(grid):
         if w is None:
             if grid.row_bit(t['gy']) is not None:
                 out[t['type']] += 1
-        elif w[2] > grid.bpr or CENTRE_TYPES.match(t['type']):
+        elif w[2] > grid.bpr or CENTRE_TYPES.match(t['type']) or \
+                grid.filler_neighbour(name):
             out[t['type']] += 1
     nrows = len(set(grid.crrow.values()))
     return sorted(t for t, n in out.items() if n <= PROBE_PER_ROW * nrows)
@@ -538,6 +562,154 @@ def virtual_bram_shift(clist, colmap, cr, gxs, extra):
     return None
 
 
+STACK_TYPES = ''  # e.g. r'^(CMT_|HCLK_CMT)'
+
+
+def stack_re(pattern):
+    return re.compile(pattern) if pattern else None
+CORE_SHARE = 0.2  # rows with this share of a type's busiest row are core
+
+
+def resolve_overlaps(grid, out, verbose=False):
+    """Tiles with learnt windows (a hard block stack, e.g. the 7-series CMT
+    column: CMT_TOP_*, HCLK_CMT, CMT_FIFO) may overlap in their frame
+    column.  Among the tiles overlapping each other, each tile's core is the
+    hull of the rows where its type has at least CORE_SHARE of the features
+    of its busiest row (learnt row feature counts, relative to the tile's
+    grid row), and its structural window.  Centre row tiles (HCLK / RCLK)
+    keep their centre bits; the other tiles take their rows in the order of
+    their types' feature counts: the contiguous run of core rows not taken
+    yet and not in the structural window of another tile of the same grid
+    column (tile heights stand), holding most of its structural rows, or no
+    region at all (e.g. the FIFO tiles next to a CMT stack, whose rows the
+    MMCM / PLL tiles own).  Rows of the original windows nobody took then
+    go to the adjacent tile that had them."""
+    bpr = grid.bpr
+    half = grid.rows_per_cr // 2
+    cbits = half * bpr  # first centre bit
+
+    def row_of(b):
+        """INT row of a bit (-1: the centre bits)"""
+        if b < cbits:
+            return b // bpr
+        if b < cbits + grid.centre:
+            return -1
+        return (b - grid.centre) // bpr
+
+    def bit_of(row):
+        return row * bpr + (grid.centre if row >= half else 0)
+
+    groups = collections.defaultdict(list)
+    for name, e in out.items():
+        tw = grid.type_windows.get(e['type'])
+        if tw is None or len(tw) < 3 or not tw[2]:
+            continue
+        if grid.stack_re is None or not grid.stack_re.match(e['type']):
+            continue
+        base = grid.row_bit(e['gy'])
+        for r in e['bits']:
+            if r['block'] == 0:
+                groups[(r['base'], r['half'], r['row'], e['gx'])].append(
+                    (name, r, row_of(base) if base is not None else None,
+                     tw[2]))
+    dropped = changed = 0
+    for key, tiles in groups.items():
+        # only tiles overlapping another one of the group
+        tiles = [t for t in tiles if any(
+            u is not t and t[1]['offset'] < u[1]['offset'] + u[1]['nbits']
+            and u[1]['offset'] < t[1]['offset'] + t[1]['nbits']
+            for u in tiles)]
+        if len(tiles) < 2:
+            continue
+        taken = set()
+        order = []
+        for t in tiles:
+            name, r = t[0], t[1]
+            if grid.tiles[name]['gy'] in grid.centre_rows and \
+                    CENTRE_TYPES.match(grid.tiles[name]['type']):
+                w = grid.structural_window(name)
+                if (r['offset'], r['nbits']) != (w[1], w[2]):
+                    r['offset'], r['nbits'] = w[1], w[2]
+                    changed += 1
+            elif t[2] is not None and t[2] >= 0:
+                order.append(t)
+        order.sort(key=lambda x: -sum(x[3].values()))
+        span = {}
+
+        def lo_row0(r):
+            return row_of(r['offset'])
+
+        def hi_row0(r):
+            h = row_of(r['offset'] + r['nbits'] - 1)
+            return h if h >= 0 else half - 1
+
+        # Rows of the structural windows (tile heights) of the tiles: never
+        # taken by another tile of the same grid column.
+        srows = {}
+        for name, r, row0, hist in order:
+            w = grid.structural_window(name)
+            srows[name] = set()
+            if w is not None:
+                srows[name] = {row_of(b) for b in range(w[1], w[1] + w[2])} \
+                    - {-1}
+        for name, r, row0, hist in order:
+            gx = grid.tiles[name]['gx']
+            fenced = set()
+            for other, rows in srows.items():
+                if other != name and grid.tiles[other]['gx'] == gx:
+                    fenced |= rows
+            top = max(hist.values())
+            core = [int(k) for k, n in hist.items() if n >= CORE_SHARE * top]
+            lo_row = max(row_of(r['offset']), row0 + min(core))
+            hi_row = min(row_of(r['offset'] + r['nbits'] - 1) if
+                         row_of(r['offset'] + r['nbits'] - 1) >= 0 else half - 1,
+                         row0 + max(core))
+            lo_row = min(lo_row, min(srows[name], default=lo_row))
+            hi_row = max(hi_row, max(srows[name], default=hi_row))
+            runs = []
+            for row in range(lo_row, hi_row + 1):
+                if row in taken or row in fenced:
+                    continue
+                if runs and row == runs[-1][-1] + 1:
+                    runs[-1].append(row)
+                else:
+                    runs.append([row])
+            if not runs:
+                out[name]['bits'].remove(r)
+                dropped += 1
+                continue
+            # the run holding most of its structural rows, else the longest
+            best = max(runs, key=lambda x: (len(srows[name] & set(x)),
+                                            len(x)))
+            taken.update(best)
+            span[name] = [best[0], best[-1], r, fenced,
+                          set(range(lo_row0(r), hi_row0(r) + 1))]
+        # Rows of the original (overlapping) windows nobody took go to the
+        # adjacent tile that had them, so no bit loses its owners.
+        grown = True
+        while grown:
+            grown = False
+            for name, sp in span.items():
+                lo_r, hi_r, r, fenced, orig = sp
+                for row, side in ((lo_r - 1, 0), (hi_r + 1, 1)):
+                    if row in orig and row not in taken and \
+                            row not in fenced:
+                        taken.add(row)
+                        sp[side] = row
+                        grown = True
+        for name, (lo_r, hi_r, r, fenced, orig) in span.items():
+            lo = bit_of(lo_r)
+            hi = bit_of(hi_r) + bpr
+            # a run across the centre includes the centre bits
+            lo = max(r['offset'], lo)
+            hi = min(r['offset'] + r['nbits'], hi)
+            if (lo, hi - lo) != (r['offset'], r['nbits']):
+                r['offset'], r['nbits'] = lo, hi - lo
+                changed += 1
+    if verbose:
+        print(f'overlaps: {changed} regions narrowed, {dropped} dropped')
+
+
 def edge_variants(grid, out, verbose=False):
     """Tile types with sites found only in the bottom and the top INT row of
     clock region rows (e.g. the 7-series single I/O tiles LIOB33_SING,
@@ -598,6 +770,7 @@ def build(grid, dframes, cols, crmap, colmap, colmap1, verbose=False,
                          offset=lo,
                          nbits=n))
         out[name] = entry
+    resolve_overlaps(grid, out, verbose)
     edge_variants(grid, out, verbose)
     # Block RAM content frames (block type 1): the k-th BRAM column of a
     # clock region row owns the k-th block type 1 frame column of that row.
@@ -673,6 +846,10 @@ def main():
                     'colalign.py (default: activity only)')
     ap.add_argument('--windows', help='tile type windows (windows.py '
                     '--merge output)')
+    ap.add_argument('--stacks', default=STACK_TYPES,
+                    help='regular expression of the tile types whose '
+                    'overlapping learnt windows are made disjoint (default: '
+                    'none; e.g. "^(CMT_|HCLK_CMT)")')
     ap.add_argument('--frames', help='frames used by tile types sharing '
                     'frame columns (colalign.py frames.json)')
     ap.add_argument('--probe', help='comma separated tile types (or "auto": '
@@ -684,6 +861,7 @@ def main():
     args = ap.parse_args()
     die = dieslib.load()[args.die]
     grid = Grid(die)
+    grid.stack_re = stack_re(args.stacks)
     if args.windows:
         with open(args.windows) as f:
             grid.type_windows = {t: tuple(w) for t, w in json.load(f).items()}
