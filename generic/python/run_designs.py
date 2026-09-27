@@ -48,20 +48,24 @@ def save_bits(bitfile, arch, out):
     np.savez_compressed(out, far=far, word=word, bit=bit)
 
 
-def budget_of(die):
-    """Repair loop time budget, scaled with the die size."""
+def budget_of(die, gen_args=()):
+    """Repair loop time budget, scaled with the die size (with --region F,
+    with the size of the part of the die the design uses)."""
     if not hasattr(die, '_ntiles'):
         die._ntiles = sum(1 for _ in open(die.tiles_tsv))
     n = die._ntiles
+    gen_args = list(gen_args)
+    if '--region' in gen_args:
+        n *= float(gen_args[gen_args.index('--region') + 1])
     return 900 if n < 40000 else (1800 if n < 100000 else 3000)
 
 
-def timeout_of(die):
+def timeout_of(die, gen_args=()):
     """Hard wall clock limit of a design: the repair budget is only checked
     between attempts, and a single place/route can run for hours on an
     unroutable design.  Twice the budget plus 10 minutes kept 99.5% of the
     successful designs of the r1-r7 batches."""
-    return 2 * budget_of(die) + 600
+    return 2 * budget_of(die, gen_args) + 600
 
 
 def generate(die, seed, wdir, gen_args):
@@ -200,10 +204,10 @@ def install_cleanup():
         signal.signal(s, _on_signal)
 
 
-def run_fresh(die, wdir, timeout, threads):
+def run_fresh(die, wdir, timeout, threads, budget):
     """One Vivado process for the design.  Returns (status, cpu seconds,
     peak resident bytes)."""
-    vcmd = (f'source {VIVADO_SETTINGS} && NL_BUDGET={budget_of(die)} exec '
+    vcmd = (f'source {VIVADO_SETTINGS} && NL_BUDGET={budget} exec '
             f'vivado -mode batch -nojournal -log vivado.log -source '
             f'design.tcl > run.log 2>&1')
     p = _spawn(['bash', '-c', vcmd], cwd=wdir, env=vivado_env(threads))
@@ -277,7 +281,7 @@ class Worker:
     def alive(self):
         return self.p.poll() is None
 
-    def run(self, wdir, timeout):
+    def run(self, wdir, timeout, budget):
         """Returns (status, cpu seconds, peak resident bytes sampled every
         5 s)."""
         cpu0 = tree_cpu(self.p.pid)
@@ -291,7 +295,7 @@ class Worker:
                 if time.time() - t0 > timeout:
                     break
         try:
-            self.p.stdin.write(f'{wdir} {budget_of(self.die)}\n')
+            self.p.stdin.write(f'{wdir} {budget}\n')
             self.p.stdin.flush()
         except OSError:
             pass
@@ -404,12 +408,14 @@ def run_one(die, seed, wdir, gen_args, timeout, threads, pool=None):
              'directive': os.environ.get('NL_PLACE_DIRECTIVE', '')}
     status, cpu, rss = 'generror', 0.0, 0
     if not timeout:
-        timeout = timeout_of(die)
+        timeout = timeout_of(die, gen_args)
     if generate(die, seed, wdir, gen_args):
         if pool:
-            vstatus, cpu, rss = pool.get(die).run(wdir, timeout)
+            vstatus, cpu, rss = pool.get(die).run(wdir, timeout,
+                                                   budget_of(die, gen_args))
         else:
-            vstatus, cpu, rss = run_fresh(die, wdir, timeout, threads)
+            vstatus, cpu, rss = run_fresh(die, wdir, timeout, threads,
+                                          budget_of(die, gen_args))
         status = vstatus if vstatus in ('timeout', 'crash') else \
             postprocess(die, wdir)
     t1 = time.time()
