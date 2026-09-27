@@ -83,12 +83,14 @@ proc _df_bidir_dirs {net} {
 # returns that routing once per net (up to hundreds of millions of PIPs:
 # "max size for a Tcl value exceeded").
 proc _df_route_nets {} {
-    set names [get_property NAME [get_nets -hierarchical -quiet -filter {TYPE != GROUND && TYPE != POWER}]]
+    set names [_df_props NAME [get_nets -hierarchical -quiet -filter {TYPE != GROUND && TYPE != POWER}]]
     foreach t {GROUND POWER} {
         set ns [get_nets -hierarchical -quiet -filter "TYPE == $t"]
         if {[llength $ns]} { lappend names [get_property NAME [lindex $ns 0]] }
     }
-    # A collection again (commands taking -of_objects reject plain names).
+    # A collection again (commands taking -of_objects reject plain names;
+    # an empty design has no nets).
+    if {[llength $names] == 0} { return [list] }
     return [get_nets -quiet $names]
 }
 
