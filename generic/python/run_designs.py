@@ -345,26 +345,54 @@ class WorkerPool:
         self.threads = threads
         self.logdir = logdir
         self.local = threading.local()
-        self.all = []
+        self.open = []
         self.lock = threading.Lock()
+
+    def _close(self, w):
+        with self.lock:
+            if w in self.open:
+                self.open.remove(w)
+        w.close()
+        if getattr(self.local, 'w', None) is w:
+            self.local.w = None
 
     def get(self, die):
         w = getattr(self.local, 'w', None)
         if w and (w.die is not die or w.ndone >= self.reuse or
                   not w.alive()):
-            w.close()
+            self._close(w)
             w = None
         if w is None:
             w = Worker(die, self.threads, self.logdir)
             with self.lock:
-                self.all.append(w)
+                self.open.append(w)
             self.local.w = w
         return w
 
+    def done(self, pending):
+        """After a design of this thread: close its worker when it is used
+        up, or when fewer designs of its die are pending (pending(die))
+        than workers of that die are open (idle workers hold GiBs)."""
+        w = getattr(self.local, 'w', None)
+        if w is None:
+            return
+        if w.ndone >= self.reuse or not w.alive():
+            self._close(w)
+            return
+        with self.lock:
+            same = sum(1 for x in self.open if x.die is w.die)
+            close = pending(w.die) < same
+            if close:
+                self.open.remove(w)
+        if close:
+            w.close()
+            self.local.w = None
+
     def close(self):
-        for w in self.all:
-            if w.alive():
-                w.close()
+        with self.lock:
+            ws, self.open = self.open, []
+        for w in ws:
+            w.close()
 
 
 def run_one(die, seed, wdir, gen_args, timeout, threads, pool=None):
@@ -434,6 +462,10 @@ class JobQueue:
         self.local.die = job[0]
         return job
 
+    def pending(self, die):
+        with self.lock:
+            return sum(1 for j in self.jobs if j[0] is die)
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -490,6 +522,9 @@ def main():
                                         pool)[1]
         except Exception as e:  # keep going on post-processing errors
             return die.name, s, f'exception {e}'
+        finally:
+            if pool:
+                pool.done(queue.pending)
 
     t0 = time.time()
     done = 0
