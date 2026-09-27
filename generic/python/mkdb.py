@@ -454,6 +454,9 @@ def main():
     ap.add_argument('--types', default=None, help='restrict to tile types')
     ap.add_argument('--jobs', type=int, default=32)
     ap.add_argument('--max-samples', type=int, default=50000)
+    ap.add_argument('--exclude', action='append', default=[],
+                    help='file of design directories to leave out, one per '
+                    'line ("SUSPECT <dir>" lines of consistency.py work)')
     ap.add_argument('--cache', default=None,
                     help='per design sample cache (default: '
                     '<db>/<arch>/cache)')
@@ -466,12 +469,21 @@ def main():
     cache = args.cache or os.path.join(outdir, 'cache')
     os.makedirs(outdir, exist_ok=True)
     only = set(args.types.split(',')) if args.types else None
+    excluded = set()
+    for path in args.exclude:
+        for line in open(path):
+            p = line.split()
+            if p:
+                excluded.add(os.path.normpath(p[-1]))
     work = []
     for dn in args.dies.split(','):
         for d in DD.design_dirs([
                 os.path.join(dieslib.BUILD, 'designs', dn, t)
                 for t in args.tag.split(',')
         ], v2only=True):
+            if os.path.normpath(d) in excluded:
+                print(f'# excluded {d}', flush=True)
+                continue
             rel = '/'.join(os.path.normpath(d).split(os.sep)[-3:])
             work.append((args.arch, dn, d,
                          os.path.join(cache, rel + '.smp')))
