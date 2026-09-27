@@ -1782,10 +1782,15 @@ def generate(die, prims, seed, out, density, hard=True, pips=None,
         if focus:
             # Experiments: only the site types matching the focus pattern.
             chosen = [st for st in avail if re.search(focus, st)]
-        # Core blocks (block RAM, DSP) in about half of the designs.
+        # Core blocks (block RAM, DSP) in about half of the designs, clock
+        # generators (few sites, many configuration bits) in 40%.
         for st in avail if not focus else ():
+            if st in chosen:
+                continue
             if re.match(r'^(RAMB|RAMBFIFO|DSP|URAM)', st) and \
-                    st not in chosen and rng.random() < 0.5:
+                    rng.random() < 0.5:
+                chosen.append(st)
+            elif re.match(r'^(MMCM|PLL$|PLLE)', st) and rng.random() < 0.4:
                 chosen.append(st)
         # 18 Kb and 36 Kb block RAM sites share tiles and the first type
         # processed takes them: alternate which one goes first (RAMB18
