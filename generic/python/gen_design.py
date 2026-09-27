@@ -119,8 +119,21 @@ def _fix_oserdese2(p, rng):
         p['TBYTE_CTL'] = p['TBYTE_SRC'] = 'FALSE'
 
 
+def _fix_dsp48e1(p, rng):
+    """Legal register / cascade register pairs (UG479): AREG 0 -> ACASCREG
+    0, 1 -> 1, 2 -> 1 or 2 (same for B); illegal pairs end up at a
+    Vivado chosen value, starving the AREG=2/ACASCREG=1 bit."""
+    for port in 'AB':
+        reg = p.get(f'{port}REG')
+        if reg is None:
+            continue
+        casc = {'0': '0', '1': '1'}.get(reg) or rng.choice(['1', '2'])
+        p[f'{port}CASCREG'] = casc
+
+
 # Per primitive adjustment of random parameters to legal combinations.
 PARAM_FIXUPS = {
+    'DSP48E1': _fix_dsp48e1,
     'ISERDESE2': _fix_iserdese2,
     'OSERDESE2': _fix_oserdese2,
 }

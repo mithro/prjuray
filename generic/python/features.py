@@ -59,6 +59,9 @@ _TO_OCLKM = re.compile(r'^\S+->IOI_OCLKM_(\d)$')
 _STD_CONDITIONED = {
     'OUTBUF': (('SLEW', 'OSTANDARD'), ('DRIVE', 'OSTANDARD')),
     'INBUF_EN': (('IN_TERM', 'ISTANDARD'), ('IBUF_LOW_PWR', 'ISTANDARD')),
+    # 7-series DSP: one bit per port encodes AREG=2 with ACASCREG=1
+    # (prjxray ZAREG_2_ACASCREG_1 / ZBREG_2_BCASCREG_1).
+    'DSP48E1': (('AREG', 'ACASCREG'), ('BREG', 'BCASCREG')),
 }
 
 PAD_SITE = re.compile(r'^(IOB|HPIOB|HRIO|HDIOB|IOPAD|IPAD|OPAD)')
@@ -265,9 +268,9 @@ def tile_features(path, sitekeys):
             v = (v + adj) % (1 << width)
             feats[tile].update(cfg_features(prefix, name + '_STORED',
                                             f"{width}'h{v:X}"))
-    # I/O buffer settings whose bits depend on the I/O standard (7-series
-    # SLEW / DRIVE / IN_TERM bits differ between standard families): also
-    # name them together with the standard.
+    # Settings whose bits depend on another setting of the same BEL (7-series
+    # SLEW / DRIVE / IN_TERM bits differ between I/O standard families, DSP
+    # register / cascade register pairs): also name them together.
     for (tile, prefix), cfgs in bel_cfgs.items():
         bel = prefix.rsplit('.', 1)[-1]
         for name, cond in _STD_CONDITIONED.get(bel, ()):
