@@ -538,6 +538,30 @@ def virtual_bram_shift(clist, colmap, cr, gxs, extra):
     return None
 
 
+def edge_variants(grid, out, verbose=False):
+    """Tile types with sites found only in the bottom and the top INT row of
+    clock region rows (e.g. the 7-series single I/O tiles LIOB33_SING,
+    LIOI3_SING: half of a two row I/O tile, the bottom one holding the
+    upper half's pad, the top one the lower half's) have a different
+    layout at each edge, which one bit database entry cannot describe: the
+    top instances get their own type, <type>@TOP."""
+    rows = collections.defaultdict(set)
+    sited = set()
+    for name, t in grid.tiles.items():
+        r = grid.rowidx.get(t['gy'])
+        if r is not None:
+            rows[t['type']].add(r)
+        if t['sites'] != '-':
+            sited.add(t['type'])
+    top = grid.rows_per_cr - 1
+    split = {t for t, r in rows.items() if t in sited and r == {0, top}}
+    for name, t in grid.tiles.items():
+        if t['type'] in split and grid.rowidx.get(t['gy']) == top:
+            out[name]['type'] = t['type'] + '@TOP'
+    if verbose and split:
+        print('edge variants', ' '.join(sorted(split)))
+
+
 def build(grid, dframes, cols, crmap, colmap, colmap1, verbose=False,
           tilemap=None, frame_caps=None):
     """Returns the tilegrid dict: tile -> {type, gx, gy, bits: [...]}.
@@ -574,6 +598,7 @@ def build(grid, dframes, cols, crmap, colmap, colmap1, verbose=False,
                          offset=lo,
                          nbits=n))
         out[name] = entry
+    edge_variants(grid, out, verbose)
     # Block RAM content frames (block type 1): the k-th BRAM column of a
     # clock region row owns the k-th block type 1 frame column of that row.
     # Frame columns may also exist for BRAM grid columns of other rows (or
