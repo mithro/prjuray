@@ -602,6 +602,39 @@ proc nl_directive {what} {
     return $opts
 }
 
+# The placer constrains the loads of regional clock buffers (BUFH, BUFR,
+# BUFIO, BUFMR, and MMCM/PLL outputs driving loads directly) to the
+# buffer's clock region; loads also in a pblock elsewhere make it fail
+# ("Clock placer failed", Place 30-367 / 30-175, naming one instance per
+# attempt), after which the repair loop dropped every pblock.  Such loads
+# are taken out of their pblocks up front (NL_NO_UNPBLOCK=1: not).
+proc nl_regional_unpblock {} {
+    if {[info exists ::env(NL_NO_UNPBLOCK)]} return
+    if {![llength [get_pblocks -quiet]]} return
+    set srcs [get_cells -quiet -hierarchical -filter {REF_NAME =~ BUFH* || REF_NAME =~ BUFR* || REF_NAME =~ BUFIO* || REF_NAME =~ BUFMR* || REF_NAME =~ MMCM* || REF_NAME =~ PLL*}]
+    if {![llength $srcs]} return
+    set nets [get_nets -quiet -of_objects [get_pins -quiet -of_objects $srcs -filter {DIRECTION == OUT}]]
+    if {![llength $nets]} return
+    set loads [get_cells -quiet -of_objects [get_pins -quiet -leaf -of_objects $nets -filter {DIRECTION == IN}]]
+    set n 0
+    array unset isload
+    foreach c [get_property NAME $loads] { set isload($c) 1 }
+    foreach pb [get_pblocks -quiet] {
+        set mine [get_cells -quiet -of_objects $pb]
+        if {![llength $mine]} continue
+        set in [list]
+        foreach c [get_property NAME $mine] {
+            if {[info exists isload($c)]} { lappend in $c }
+        }
+        if {[llength $in]} {
+            if {![catch {remove_cells_from_pblock $pb [get_cells $in]}]} {
+                incr n [llength $in]
+            }
+        }
+    }
+    if {$n} { nl_log "regional clock loads out of pblocks: $n" }
+}
+
 set nl_orphans [list]
 proc nl_finish {{relaxclk 0}} {
     nl_flush_nets
@@ -624,6 +657,7 @@ proc nl_finish {{relaxclk 0}} {
     foreach d [get_drc_checks] {
         catch {set_property SEVERITY Warning $d}
     }
+    nl_regional_unpblock
     nl_offenders
     # Implement; after any failure remove the cells the errors name (or
     # disconnect unroutable nets) and try again.
