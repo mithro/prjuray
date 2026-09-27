@@ -93,12 +93,16 @@ for die in "$@"; do
         [ -f "$B/db/$arch/$f" ] && ! cmp -s "$B/db/$arch/$f" "$X/build/db/$arch/$f" &&
             cp -p "$B/db/$arch/$f" "$X/build/db/$arch/$f"
     done
-    rm -f "$X/build/db/$arch"/{segbits,defaults,counts,unexplained}_* "$X/build/db/$arch/summary.json"
+    # (database files are kept: mkdb reuses the tasks whose inputs did
+    # not change; files of tile types it no longer writes are removed
+    # after it)
     XB=$X/build XD=$X/build/db
     t1=$(now)
     URAY_BUILD=$XB URAY_DB=$XD "$G/vrun.sh" "ci-mkdb-$die" "$mem" python3 "$G/python/mkdb.py" --arch "$arch" --dies "$die" \
         --tag "$train" --jobs "$jobs" --cache "$X/cache" > "$X/mkdb.log" 2>&1 ||
         { echo "ci: $die: mkdb failed, see $X/mkdb.log"; rc_all=2; continue; }
+    python3 "$G/python/ci_summary.py" prune "$XD/$arch" ||
+        { echo "ci: $die: prune failed"; rc_all=2; continue; }
     tm=$(el "$t1"); t1=$(now)
     URAY_BUILD=$XB URAY_DB=$XD "$G/vrun.sh" "ci-check-$die" "$mem" python3 "$G/python/check.py" --die "$die" \
         --designs "$XB/designs/$die/$hold" --max "$hmax" --jobs 4 > "$X/check.log" 2>&1
