@@ -638,7 +638,7 @@ def split_parts(nF, nB, S):
     return int(min(64, max(1, cost // SPLIT_COST)))
 
 
-SPLIT_COST = int(os.environ.get('MKDB_SPLIT_COST', 2e11))
+SPLIT_COST = int(float(os.environ.get('MKDB_SPLIT_COST', 2e11)))
 
 
 def _load_split(sdir):
