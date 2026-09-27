@@ -21,6 +21,8 @@ the bitstream.
 | Tile grid | `python/tilegrid.py --evidence ... --colmap ...` | `build/db/<arch>/<die>/tilegrid.json` |
 | Bit database | `python/mkdb.py` | `build/db/<arch>/segbits_<tiletype>.db`, `defaults_<tiletype>.db` |
 | Checking / decoding | `python/check.py` | undocumented bit report, FASM |
+| Tile grid A/B test | `tg_eval.sh <variant> <die> <tilegrid.json>` (single die DBs, `check.py`, `python/check_cmp.py`) | `build/tilegrid_exp/dbeval/{inst,<variant>}_<die>/` |
+| Bit encoding analysis | `python/explain_bit.py`, `python/bit_xtab.py` (features x bit values table) | stdout |
 
 ### Random designs
 
