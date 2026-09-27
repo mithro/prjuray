@@ -67,7 +67,8 @@ that job, never the shell it was started from) and prints the scope's
 `memory.peak` on exit.  Size `--jobs` from measured peaks, not cores:
 `jobs ≈ cap / (peak × 1.2)`.  Measured single job peaks (Vivado 2025.2):
 xa7s15 2.8 GiB (`--reuse 4`), xc7k160t 4.8 GiB (`--reuse 2`), xcku025
-7.4 GiB per design.  An OOM kill (exit 143) is a retryable failure: lower
+7.4 GiB per design (8.3 GiB with `--reuse 2`), xcu25 9.5 GiB per design
+(~90 min each).  An OOM kill (exit 143) is a retryable failure: lower
 `--jobs`.
 
 For long campaigns and several machines, `python/scheduler.py` keeps the
