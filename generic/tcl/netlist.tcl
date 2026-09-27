@@ -605,11 +605,16 @@ proc nl_const_offenders {txt} {
 
 # Optional place_design / route_design directive from the environment
 # (NL_PLACE_DIRECTIVE, NL_ROUTE_DIRECTIVE, e.g. Quick); none by default.
+# NL_PLACE_OPTS / NL_ROUTE_OPTS: further options (e.g. -no_timing_driven).
 proc nl_directive {what} {
+    set opts [list]
     if {[info exists ::env(NL_${what}_DIRECTIVE)] && $::env(NL_${what}_DIRECTIVE) ne ""} {
-        return [list -directive $::env(NL_${what}_DIRECTIVE)]
+        lappend opts -directive $::env(NL_${what}_DIRECTIVE)
     }
-    return [list]
+    if {[info exists ::env(NL_${what}_OPTS)]} {
+        lappend opts {*}$::env(NL_${what}_OPTS)
+    }
+    return $opts
 }
 
 set nl_orphans [list]

@@ -104,7 +104,11 @@ def postprocess(die, wdir):
     open(os.path.join(wdir, 'dump_v2'), 'w').close()
     os.unlink(feat)
     os.unlink(bit)
-    for junk in ('run.log', 'clockInfo.txt', 'vivado.log'):
+    # (NL_KEEP_LOGS=1: keep the Vivado logs of successful designs too,
+    # e.g. to analyse their repair rounds.)
+    keep = os.environ.get('NL_KEEP_LOGS') == '1'
+    for junk in (() if keep else ('run.log', 'vivado.log')) + \
+            ('clockInfo.txt',):
         p = os.path.join(wdir, junk)
         if os.path.exists(p):
             os.unlink(p)
