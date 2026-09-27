@@ -66,10 +66,16 @@ class Die:
         ny = max(y for _, y in crs.values()) + 1
         w = max(1, min(nx, round(nx * frac ** 0.5)))
         h = max(1, min(ny, round(ny * frac / (w / nx))))
-        x0 = rng.randrange(nx - w + 1)
-        y0 = rng.randrange(ny - h + 1)
-        keep = {t for t, (x, y) in crs.items()
-                if x0 <= x < x0 + w and y0 <= y < y0 + h}
+        # A block without fabric (e.g. the Zynq processing system's clock
+        # regions) gives an empty design: pick another one.
+        for _ in range(50):
+            x0 = rng.randrange(nx - w + 1)
+            y0 = rng.randrange(ny - h + 1)
+            keep = {t for t, (x, y) in crs.items()
+                    if x0 <= x < x0 + w and y0 <= y < y0 + h}
+            if any(v[1] in keep and v[0].startswith('SLICE')
+                   for v in self.sites.values()):
+                break
         self.sites = {s: v for s, v in self.sites.items() if v[1] in keep}
         for st in list(self.by_type):
             self.by_type[st] = [s for s in self.by_type[st]
