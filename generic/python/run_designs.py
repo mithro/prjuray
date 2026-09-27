@@ -430,6 +430,24 @@ def run_one(die, seed, wdir, gen_args, timeout, threads, pool=None):
     return seed, status
 
 
+def job_wall(workdir, die):
+    """Expected wall time of a design of a die: the median of the run.stats
+    of its earlier designs (all tags); dies without any sort first."""
+    import glob
+    w = []
+    for p in glob.glob(os.path.join(workdir, die, '*', 's*', 'run.stats')):
+        try:
+            v = json.load(open(p)).get('wall')
+        except (OSError, ValueError):
+            continue
+        if v:
+            w.append(v)
+    if not w:
+        return float('inf')
+    w.sort()
+    return w[len(w) // 2]
+
+
 def job_memory(workdir, die):
     """Memory to reserve per job for a die: the larger of the 90th
     percentile and 1.2 x the median of the peak memory recorded in the
@@ -515,6 +533,10 @@ def main():
                   f'{args.jobs}', flush=True)
     first, last = map(int, args.seeds.split(':'))
     jobs = [(die, s) for s in range(first, last + 1) for die in dlist]
+    # Longest expected designs first (a slow die's last seeds would
+    # otherwise start near the end of the round and set its length).
+    wall = {d.name: job_wall(args.workdir, d.name) for d in dlist}
+    jobs.sort(key=lambda j: -wall[j[0].name])
     pool = None
     if args.reuse > 1:
         logdir = os.path.join(args.workdir, '.workers')
