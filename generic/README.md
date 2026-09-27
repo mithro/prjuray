@@ -180,7 +180,9 @@ python3 generic/python/tilegrid.py --die <die> \
 The bits of a tile within its frame column (its *window*) are structural
 for fabric tiles: its INT row and the empty grid rows above it.  Hard blocks
 (CMT, CFG, clock rows, GT, IO bank tiles, ...) whose windows are doubtful
-(taller than one INT row, in the centre row, or without an INT row) get
+(taller than one INT row, in the centre row, without an INT row, or
+between site-less filler tiles such as the Series7 PCIE_BOT among
+PCIE_NULL, whose bits span the clock region) get
 learnt windows: `tilegrid.py --probe auto` gives these tile types a window
 of +-one clock region around their grid row, a bit database of these types
 built with that tile grid (`mkdb.py --types`, `URAY_DB` pointing at a probe

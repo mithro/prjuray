@@ -198,13 +198,29 @@ class Grid:
         end = (r + h) * self.bpr + (self.centre if r + h > half else 0)
         return cr, off, end - off
 
+    def filler_neighbour(self, name):
+        """True when the grid rows right above and below the tile (INT rows of
+        its clock region row) hold site-less tiles other than NULL."""
+        t = self.tiles[name]
+        if t['gy'] in self.centre_rows or CENTRE_TYPES.match(t['type']):
+            return False
+        for y in (t['gy'] - 1, t['gy'] + 1):
+            if y not in self.rowidx or self.crrow[y] != self.crrow[t['gy']]:
+                return False
+            o = self.tiles.get(self.at.get((t['gx'], y)))
+            if o is None or o['type'] == 'NULL' or o['sites'] != '-':
+                return False
+        return True
+
 
 def probe_types(grid):
     """Tile types (with sites) whose structural window is doubtful: taller
     than one INT row, in the centre (HCLK / RCLK) row, or without a window
     although the tile has a grid row with bits; only hard blocks (at most
     PROBE_PER_ROW tiles per clock region row on average), whose windows are
-    cheap to learn and which the structural rule does not describe."""
+    cheap to learn and which the structural rule does not describe.  Also
+    tiles between site-less filler tiles in the same grid column (Series7
+    PCIE_BOT among PCIE_NULL: the block's bits span the clock region)."""
     out = collections.Counter()
     for name, t in grid.tiles.items():
         if t['type'] == 'NULL' or t['sites'] == '-':
@@ -213,7 +229,8 @@ def probe_types(grid):
         if w is None:
             if grid.row_bit(t['gy']) is not None:
                 out[t['type']] += 1
-        elif w[2] > grid.bpr or CENTRE_TYPES.match(t['type']):
+        elif w[2] > grid.bpr or CENTRE_TYPES.match(t['type']) or \
+                grid.filler_neighbour(name):
             out[t['type']] += 1
     nrows = len(set(grid.crrow.values()))
     return sorted(t for t, n in out.items() if n <= PROBE_PER_ROW * nrows)
