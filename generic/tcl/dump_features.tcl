@@ -416,19 +416,23 @@ proc dump_features {out} {
     }
     puts $fp "# t_const [expr {[clock milliseconds] - $t0}]"
     set placed [get_cells -quiet -hierarchical -filter {IS_PRIMITIVE && LOC != ""}]
-    set byref [dict create]
-    foreach c $placed r [_df_props REF_NAME $placed] { dict lappend byref $r $c }
+    # Cell types in order of first appearance; the cells of each type stay a
+    # collection (get_property on a list of cell names looks every name up).
+    set refs [dict create]
+    foreach r [_df_props REF_NAME $placed] { dict set refs $r 1 }
     set sitepin [dict create]
     set tries [dict create]
     set seen [dict create]
-    dict for {ref cells} $byref {
+    foreach ref [dict keys $refs] {
+        set cells [filter -quiet $placed "REF_NAME == \"$ref\""]
         set props [list_property [lindex $cells 0] IS_*_INVERTED]
         if {![llength $props]} continue
         set sites [_df_props SITE $cells]
         set bels [_df_props BEL $cells]
+        set names [_df_props NAME $cells]
         foreach p $props {
             set pin [string range $p 3 end-9]
-            foreach c $cells s $sites b $bels v [_df_props $p $cells] {
+            foreach c $names s $sites b $bels v [_df_props $p $cells] {
                 if {$s eq "" || $b eq "" || $v eq ""} continue
                 # (an unconnected cell pin maps to no BEL pin: ask again
                 # with the next cell, up to 8 times)
