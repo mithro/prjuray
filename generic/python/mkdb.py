@@ -27,6 +27,7 @@ import json
 import os
 import pickle
 import resource
+import shutil
 import time
 import zlib
 
@@ -134,6 +135,14 @@ def _packed(rows, S, n):
     return P
 
 
+class _Interner(dict):
+    """name -> id, new names numbered in order of first lookup."""
+
+    def __missing__(self, key):
+        v = self[key] = len(self)
+        return v
+
+
 class PackedRows:
     """Bit-packed row x sample matrix built one sample at a time, rows
     created on first use (names interned).  Records, per row, the first
@@ -143,15 +152,15 @@ class PackedRows:
         self.S = S
         self.W = (S + 63) // 64
         self.P = np.zeros((1024, self.W), dtype=np.uint64)
-        self.ids = {}
+        self.ids = _Interner()
         self.first = np.full(1024, np.iinfo(np.int64).max, dtype=np.int64)
         self.firstpos = np.zeros(1024, dtype=np.int64)
 
     def add(self, s, names):
         if not names:
             return
-        ids = np.fromiter((self.ids.setdefault(n, len(self.ids))
-                           for n in names), dtype=np.int64, count=len(names))
+        ids = np.fromiter(map(self.ids.__getitem__, names), dtype=np.int64,
+                          count=len(names))
         n = len(self.ids)
         if n > len(self.P):
             cap = max(n, 2 * len(self.P))
@@ -205,23 +214,54 @@ def correlate_ids(frows, brows, fnames, bnames):
                             bnames)
 
 
-def correlate_packed(PF, PB, emptyv, fnames, bnames):
+class Correlator:
     """correlate() on bit-packed feature / bit matrices (rows fnames /
     bnames, bit s of the rows = sample s; emptyv[s]: sample s has no
-    features)."""
-    S = len(emptyv)
-    nF, nB = len(fnames), len(bnames)
-    nf = np.bitwise_count(PF).sum(axis=1).astype(np.int64)
-    nb = np.bitwise_count(PB).sum(axis=1).astype(np.int64)
-    nempty = int(emptyv.sum())
-    EM = _packed([[0] if e else [] for e in emptyv], S, 1)[0]
-    full = _packed([[0]] * S, S, 1)[0]
+    features), in parts: bit ranges can be processed separately (bits(),
+    e.g. in several processes sharing memory-mapped matrices), then the
+    pair covers and the result assembly (finish())."""
 
+    PAIR_BUDGET = 3000
+    # A feature seen n times implies a bit that is set in a fraction p of
+    # all samples by chance with probability p**n: only accept implications
+    # less likely than this to be coincidences (rare features otherwise
+    # pick up frequently set bits as noise).
+    CHANCE = 1e-3
+
+    def __init__(self, PF, PB, emptyv, fnames, bnames):
+        self.PF, self.PB = PF, PB
+        self.fnames, self.bnames = fnames, bnames
+        S = self.S = len(emptyv)
+        self.nF, self.nB = len(fnames), len(bnames)
+        self.nf = np.bitwise_count(PF).sum(axis=1).astype(np.int64)
+        self.nb = np.bitwise_count(PB).sum(axis=1).astype(np.int64)
+        self.nempty = int(emptyv.sum())
+        self.EM = _packed([[0] if e else [] for e in emptyv], S, 1)[0]
+        self.full = _packed([[0]] * S, S, 1)[0]
+        # Quick prefilter on a few sample words before the full implication
+        # test (matters for tile types with tens of thousands of features).
+        W = PF.shape[1]
+        self.qidx = np.random.RandomState(0).choice(W, min(W, 8),
+                                                    replace=False)
+        self.PFq = PF[:, self.qidx]
+        self.lognf = self.nf.astype(np.float64)
+        # Features whose sample pattern equals a bit pattern: rows by hash
+        # (in feature order), compared exactly on lookup.
+        self.exact = collections.defaultdict(list)
+        for f in np.nonzero(self.nf >= 2)[0].tolist():
+            self.exact[hash(PF[f].tobytes())].append(f)
+
+    @staticmethod
     def popcount(a):
         return int(np.bitwise_count(a).sum())
 
-    def cover(target, cand):
+    def exact_features(self, key):
+        return [f for f in self.exact.get(hash(key.tobytes()), ())
+                if np.array_equal(self.PF[f], key)]
+
+    def cover(self, target, cand):
         """Greedy cover of target (packed) with candidate feature rows."""
+        PF, popcount = self.PF, self.popcount
         remaining = target.copy()
         chosen = []
         while popcount(remaining) and len(cand) and len(chosen) < 256:
@@ -234,10 +274,40 @@ def correlate_packed(PF, PB, emptyv, fnames, bnames):
             remaining &= ~PF[cand[j]]
         return chosen, popcount(remaining)
 
-    def pair_cover(target, is_default, pb, K=40):
+    def count_in(self, target):
+        """Samples of target each feature is present in (only the words of
+        target with samples, in row blocks: the full PF & target temporary
+        is up to hundreds of MiB for block RAM tiles)."""
+        PF, nF = self.PF, self.nF
+        nzw = np.nonzero(target)[0]
+        cnt = np.zeros(nF, dtype=np.uint64)
+        if len(nzw) == 0:
+            return cnt
+        t = target[nzw]
+        step = max(1, (1 << 21) // len(nzw))
+        for r in range(0, nF, step):
+            cnt[r:r + step] = np.bitwise_count(
+                PF[r:r + step][:, nzw] & t).sum(axis=1)
+        return cnt
+
+    def pair_cover(self, target, is_default, pb, K=40):
         """Greedy cover of target with single features and pairwise
         conjunctions of the K features most often present in target."""
-        cnt = np.bitwise_count(PF & target).sum(axis=1)
+        PF, nF, fnames, popcount = self.PF, self.nF, self.fnames, \
+            self.popcount
+        # cnt is unsigned: -cnt sorts the absent features (cnt 0) first, so
+        # with K or more absent features top is empty.  Checked on a few
+        # rows first (most features are absent from most targets).
+        nzw = np.nonzero(target)[0]
+        zeros = 0
+        for r in range(0, nF, 256):
+            blk = PF[r:r + 256][:, nzw] & target[nzw]
+            zeros += int((~np.any(blk, axis=1)).sum())
+            if zeros >= K:
+                return [], popcount(target)
+            if r >= 4096:
+                break
+        cnt = self.count_in(target)
         top = [int(i) for i in np.argsort(-cnt)[:K] if cnt[i] > 0]
         if not top:
             return [], popcount(target)
@@ -262,30 +332,18 @@ def correlate_packed(PF, PB, emptyv, fnames, bnames):
                 break
         return chosen, popcount(remaining)
 
-    # Quick prefilter on a few sample words before the full implication
-    # test (matters for tile types with tens of thousands of features).
-    W = PF.shape[1]
-    qidx = np.random.RandomState(0).choice(W, min(W, 8), replace=False)
-    PFq = PF[:, qidx]
-
-    # A feature seen n times implies a bit that is set in a fraction p of
-    # all samples by chance with probability p**n: only accept implications
-    # less likely than this to be coincidences (rare features otherwise
-    # pick up frequently set bits as noise).
-    CHANCE = 1e-3
-    lognf = nf.astype(np.float64)
-
-    def implying(pb, clear, nmax=None):
+    def implying(self, pb, clear, nmax=None):
         """Features f with f => bit set (clear=False) or f => bit clear."""
+        nf, PF, PFq = self.nf, self.PF, self.PFq
         ok = nf > 0
         if nmax is not None:
             ok &= nf <= nmax
-        p = popcount(pb) / S
+        p = self.popcount(pb) / self.S
         if clear:
             p = 1.0 - p
         if 0.0 < p < 1.0:
-            ok &= lognf * np.log(p) < np.log(CHANCE)
-        q = pb[qidx]
+            ok &= self.lognf * np.log(p) < np.log(self.CHANCE)
+        q = pb[self.qidx]
         viol = (PFq & q) if clear else (PFq & ~q)
         ok &= ~np.any(viol, axis=1)
         idx = np.nonzero(ok)[0]
@@ -294,60 +352,89 @@ def correlate_packed(PF, PB, emptyv, fnames, bnames):
         full_viol = (PF[idx] & pb) if clear else (PF[idx] & ~pb)
         return idx[~np.any(full_viol, axis=1)]
 
-    pair_budget = [3000]
-    feat_bits = collections.defaultdict(list)
-    defaults = {}
-    unexplained = {}
-    empty_set = np.bitwise_count(PB & EM).sum(axis=1)
-    # Fast path: features whose sample pattern equals the bit pattern.
-    exact = collections.defaultdict(list)
-    for f in range(nF):
-        if nf[f] >= 2:
-            exact[PF[f].tobytes()].append(f)
-    for b in range(nB):
-        pb = PB[b]
-        # Default: set in (almost) every unused instance; the few exceptions
-        # are tiles used in ways the feature dump does not see.
-        is_default = nempty > 0 and empty_set[b] >= 0.97 * nempty
-        key = (full & ~pb).tobytes() if is_default else pb.tobytes()
-        if key in exact:
+    def bits(self, b0=0, b1=None):
+        """Single feature explanation of bits b0..b1-1: [(b, is_default,
+        feature names, left, pair)], pair: a pair cover may be tried (bits
+        in order get the pair budget)."""
+        PB, nb, full = self.PB, self.nb, self.full
+        empty_set = np.bitwise_count(PB[b0:b1] & self.EM).sum(axis=1)
+        out = []
+        for b in range(b0, self.nB if b1 is None else b1):
+            pb = PB[b]
+            # Default: set in (almost) every unused instance; the few
+            # exceptions are tiles used in ways the feature dump does not
+            # see.
+            is_default = self.nempty > 0 and \
+                empty_set[b - b0] >= 0.97 * self.nempty
+            key = (full & ~pb) if is_default else pb
+            ex = self.exact_features(key)
+            if ex:
+                out.append((b, is_default, [self.fnames[f] for f in ex], 0,
+                            False))
+                continue
             if is_default:
-                defaults[bnames[b]] = int(nb[b])
-            for f in exact[key]:
-                feat_bits[fnames[f]].append(('!' if is_default else '') +
-                                            bnames[b])
-            continue
-        if is_default:
-            target = full & ~pb
-            # features implying the bit is clear
-            cand = implying(pb, clear=True)
-            chosen, left = cover(target, cand)
-            defaults[bnames[b]] = int(nb[b])
-            for f in chosen:
-                feat_bits[fnames[f]].append('!' + bnames[b])
-        else:
-            cand = implying(pb, clear=False, nmax=nb[b])
-            chosen, left = cover(pb, cand)
-            for f in chosen:
-                feat_bits[fnames[f]].append(bnames[b])
-        if left and nb[b] >= 10 and pair_budget[0] > 0:
-            # Try conjunctions of two features for bits no single feature
-            # explains (e.g. a bit that is the XOR of two settings).
-            pair_budget[0] -= 1
-            target = (full & ~pb) if is_default else pb
-            chosen, left = pair_cover(target, is_default, pb)
-            for name in chosen:
-                feat_bits[name].append(('!' if is_default else '') +
-                                       bnames[b])
-        if left:
-            unexplained[bnames[b]] = (left, int(nb[b]), is_default)
-    return dict(samples=S,
-                empty=nempty,
-                feat_bits=feat_bits,
-                defaults=defaults,
-                unexplained=unexplained,
-                nfeat=nF,
-                counts={fnames[i]: int(nf[i]) for i in range(nF)})
+                # features implying the bit is clear
+                cand = self.implying(pb, clear=True)
+                chosen, left = self.cover(full & ~pb, cand)
+            else:
+                cand = self.implying(pb, clear=False, nmax=nb[b])
+                chosen, left = self.cover(pb, cand)
+            out.append((b, is_default, [self.fnames[f] for f in chosen],
+                        left, bool(left and nb[b] >= 10)))
+        return out
+
+    def pairs(self, bs):
+        """Pair covers of bits bs: {b: (names, left)}."""
+        res = {}
+        for b in bs:
+            pb = self.PB[b]
+            is_default = self.nempty > 0 and self.popcount(
+                pb & self.EM) >= 0.97 * self.nempty
+            target = (self.full & ~pb) if is_default else pb
+            res[b] = self.pair_cover(target, is_default, pb)
+        return res
+
+    def pair_bits(self, parts):
+        """The bits that get a pair cover (the first PAIR_BUDGET candidate
+        bits in bit order), given the bits() results."""
+        cands = sorted(r[0] for part in parts for r in part if r[4])
+        return cands[:self.PAIR_BUDGET]
+
+    def finish(self, parts, pairs):
+        """The correlate() result from the bits() parts and the pair covers
+        ({b: (names, left)}) of the pair_bits()."""
+        feat_bits = collections.defaultdict(list)
+        defaults = {}
+        unexplained = {}
+        for part in parts:
+            for b, is_default, names, left, _ in part:
+                bn = self.bnames[b]
+                pre = '!' if is_default else ''
+                if is_default:
+                    defaults[bn] = int(self.nb[b])
+                for n in names:
+                    feat_bits[n].append(pre + bn)
+                if b in pairs:
+                    pnames, left = pairs[b]
+                    for n in pnames:
+                        feat_bits[n].append(pre + bn)
+                if left:
+                    unexplained[bn] = (left, int(self.nb[b]), is_default)
+        return dict(samples=self.S,
+                    empty=self.nempty,
+                    feat_bits=feat_bits,
+                    defaults=defaults,
+                    unexplained=unexplained,
+                    nfeat=self.nF,
+                    counts={self.fnames[i]: int(self.nf[i])
+                            for i in range(self.nF)})
+
+
+def correlate_packed(PF, PB, emptyv, fnames, bnames):
+    """correlate() on bit-packed matrices (see Correlator), in one go."""
+    c = Correlator(PF, PB, emptyv, fnames, bnames)
+    parts = [c.bits()]
+    return c.finish(parts, c.pairs(c.pair_bits(parts)))
 
 
 def write_db(outdir, ttype, k, res):
@@ -470,7 +557,7 @@ def _cache_one(item):
 def _type_task(task):
     """Worker: gathers the selected samples of one (tile type, region) from
     the design caches, correlates them and writes the database files."""
-    outdir, (tt, k), designs, sel_used, sel_empty = task
+    outdir, (tt, k), designs, sel_used, sel_empty, split_dir = task
     t0 = time.time()
     nu_sel = len(sel_used)
     pos = {('u', g): i for i, g in enumerate(sel_used)}
@@ -510,7 +597,72 @@ def _type_task(task):
     del FR
     PB, bnames = BR.rows(BR.first_order())
     del BR
+    nparts = split_parts(len(fnames), len(bnames), len(emptyv))
+    if nparts > 1:
+        # Large task: the matrices go to disk and the bit ranges are
+        # correlated by separate tasks (_bits_task) sharing them through
+        # memory maps, then _finish_task does the pair covers and writes.
+        sdir = os.path.join(split_dir, f'{tt}.{k}')
+        os.makedirs(sdir, exist_ok=True)
+        np.save(os.path.join(sdir, 'PF.npy'), PF)
+        np.save(os.path.join(sdir, 'PB.npy'), PB)
+        np.save(os.path.join(sdir, 'empty.npy'), emptyv)
+        with open(os.path.join(sdir, 'names.pkl'), 'wb') as f:
+            pickle.dump((fnames, bnames), f,
+                        protocol=pickle.HIGHEST_PROTOCOL)
+        nB = len(bnames)
+        step = -(-nB // nparts)
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+        return (tt, k), ('split', sdir, [(b, min(nB, b + step))
+                                         for b in range(0, nB, step)]), \
+            None, peak, time.time() - t0
     res = correlate_packed(PF, PB, emptyv, fnames, bnames)
+    return _written(outdir, tt, k, res, t0)
+
+
+def split_parts(nF, nB, S):
+    """Number of bit ranges to correlate a (tile type, region) in: about
+    one per 2e11 feature x bit x sample-word units (block RAM tiles of
+    many dies: tens), 1 for the usual tiles."""
+    cost = nF * nB * ((S + 63) // 64)
+    return int(min(64, max(1, cost // SPLIT_COST)))
+
+
+SPLIT_COST = int(os.environ.get('MKDB_SPLIT_COST', 2e11))
+
+
+def _load_split(sdir):
+    """Correlator of a split task (matrices memory mapped, shared)."""
+    PF = np.load(os.path.join(sdir, 'PF.npy'), mmap_mode='r')
+    PB = np.load(os.path.join(sdir, 'PB.npy'), mmap_mode='r')
+    emptyv = np.load(os.path.join(sdir, 'empty.npy'))
+    with open(os.path.join(sdir, 'names.pkl'), 'rb') as f:
+        fnames, bnames = pickle.load(f)
+    return Correlator(PF, PB, emptyv, fnames, bnames)
+
+
+def _bits_task(item):
+    """Worker: one bit range of a split task."""
+    sdir, b0, b1 = item
+    t0 = time.time()
+    part = _load_split(sdir).bits(b0, b1)
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+    return part, peak, time.time() - t0
+
+
+def _finish_task(item):
+    """Worker: pair covers and database files of a split task."""
+    outdir, (tt, k), sdir, parts = item
+    t0 = time.time()
+    c = _load_split(sdir)
+    res = c.finish(parts, c.pairs(c.pair_bits(parts)))
+    del c
+    shutil.rmtree(sdir, ignore_errors=True)
+    return _written(outdir, tt, k, res, t0)
+
+
+def _written(outdir, tt, k, res, t0):
+    """Writes the database files of a result; the task's report."""
     write_db(outdir, tt, k, res)
     nexp = len(res['unexplained'])
     summary = dict(samples=res['samples'], empty=res['empty'],
@@ -591,21 +743,56 @@ def main():
             if nu > args.max_samples else list(range(nu))
         se = rng.sample(range(ne), args.max_samples // 5) \
             if ne > args.max_samples // 5 else list(range(ne))
-        tasks.append((outdir, key, designs, su, se))
+        tasks.append((outdir, key, designs, su, se,
+                      os.path.join(cache, 'split')))
     # Phase 2: one task per (tile type, region), largest first.
     tasks.sort(key=lambda t: -(len(t[3]) + len(t[4])))
     results = {}
     t0 = time.time()
     # One task per process: a task's peak memory is returned to the system
     # when it ends (and measured).
+    # Large (tile type, region) tasks come back split into bit range
+    # tasks, whose results then go to a finishing task.
     with ProcessPoolExecutor(min(len(tasks), args.jobs) or 1,
                              max_tasks_per_child=1) as ex:
-        futs = {ex.submit(_type_task, t): t for t in tasks}
-        for n, f in enumerate(as_completed(futs), 1):
-            key, summary, line, peak, dt = f.result()
-            results[key] = (summary, line)
+        futs = {ex.submit(_type_task, t): ('type', t[1]) for t in tasks}
+        parts = {}
+        ndone = 0
+        while futs:
+            done = next(as_completed(futs))
+            kind, key = futs.pop(done)
             el = time.time() - t0
-            print(f'# task {n}/{len(tasks)} {key[0]}.{key[1]} samples '
+            if kind == 'type':
+                key, summary, line, peak, dt = done.result()
+                if isinstance(summary, tuple):
+                    _, sdir, ranges = summary
+                    parts[key] = [sdir, len(ranges), {}]
+                    for i, (b0, b1) in enumerate(ranges):
+                        futs[ex.submit(_bits_task, (sdir, b0, b1))] = \
+                            ('bits', (key, i))
+                    print(f'# task {key[0]}.{key[1]} split into '
+                          f'{len(ranges)} bit ranges ({dt:.0f} s, peak '
+                          f'{peak / 2**30:.2f} GiB); elapsed {el:.0f} s',
+                          flush=True)
+                    continue
+            elif kind == 'bits':
+                (key, i) = key
+                part, peak, dt = done.result()
+                p = parts[key]
+                p[2][i] = part
+                print(f'# task {key[0]}.{key[1]} bits {len(p[2])}/{p[1]} '
+                      f'{dt:.0f} s peak {peak / 2**30:.2f} GiB; elapsed '
+                      f'{el:.0f} s', flush=True)
+                if len(p[2]) == p[1]:
+                    futs[ex.submit(_finish_task, (
+                        outdir, key, p[0],
+                        [p[2][j] for j in range(p[1])]))] = ('finish', key)
+                continue
+            else:
+                key, summary, line, peak, dt = done.result()
+            results[key] = (summary, line)
+            ndone += 1
+            print(f'# task {ndone}/{len(tasks)} {key[0]}.{key[1]} samples '
                   f'{summary["samples"]} {dt:.0f} s peak '
                   f'{peak / 2**30:.2f} GiB; elapsed {el:.0f} s', flush=True)
     summary = {}
