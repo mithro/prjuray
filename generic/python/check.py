@@ -22,6 +22,7 @@ import numpy as np
 
 import bitstream
 import mkdb
+import regionmap as RM
 import designdata as DD
 import dies as dieslib
 
@@ -30,6 +31,7 @@ class Database:
     def __init__(self, dbdir):
         self.dbdir = dbdir
         self.types = {}
+        self.type_codes = {}
 
     def get(self, ttype, k):
         key = (ttype, k)
@@ -57,6 +59,14 @@ class Database:
         self.types[key] = (feats, defaults, by_bit)
         return self.types[key]
 
+    def codes(self, ttype, k):
+        """TypeCodes of a (tile type, region index), cached."""
+        key = (ttype, k)
+        if key not in self.type_codes:
+            feats, defaults, _ = self.get(ttype, k)
+            self.type_codes[key] = TypeCodes(feats, defaults)
+        return self.type_codes[key]
+
     def decode(self, ttype, k, bits):
         """Returns (matched feature names, set of documented bits)."""
         feats, defaults, by_bit = self.get(ttype, k)
@@ -76,9 +86,141 @@ class Database:
         return matched, doc
 
 
+class TypeCodes:
+    """Database of one (tile type, region index) with relative bits as
+    integer codes (regionmap.name_code), for vectorised decoding."""
+
+    def __init__(self, feats, defaults):
+        self.names = [f[0] for f in feats]
+        pos = [[RM.name_code(b) for b in f[1]] for f in feats]
+        neg = [[RM.name_code(b) for b in f[2]] for f in feats]
+        self.npos = np.array([len(p) for p in pos], dtype=np.int64)
+        self.nneg = np.array([len(p) for p in neg], dtype=np.int64)
+        self.pos_ptr = np.concatenate(([0], np.cumsum(self.npos)))
+        self.neg_ptr = np.concatenate(([0], np.cumsum(self.nneg)))
+        self.pos = np.array([c for p in pos for c in p], dtype=np.int64)
+        self.neg = np.array([c for p in neg for c in p], dtype=np.int64)
+        self.defaults = np.unique(np.array(
+            [RM.name_code(b) for b in defaults], dtype=np.int64))
+        # Every feature with set bits is found through one anchor bit (its
+        # least shared set bit): the candidates are the (region, feature)
+        # pairs with the anchor set, whose other bits are then verified.
+        fan = collections.Counter(c for p in pos for c in p)
+        fid, anc = [], []
+        for i, p in enumerate(pos):
+            if p:
+                fid.append(i)
+                anc.append(min(p, key=lambda c: (fan[c], c)))
+        order = np.argsort(np.array(anc, dtype=np.int64), kind='stable')
+        self.anchor = np.array(anc, dtype=np.int64)[order]
+        self.anchor_f = np.array(fid, dtype=np.int64)[order]
+
+
+def _expand(ptr, counts, sel):
+    """For the features sel: (index into sel, index into the flat bit
+    array) of all their bits."""
+    cnt = counts[sel]
+    tot = int(cnt.sum())
+    rep = np.repeat(np.arange(len(sel), dtype=np.int64), cnt)
+    start = np.repeat(np.cumsum(cnt) - cnt, cnt)
+    flat = np.repeat(ptr[sel], cnt) + (np.arange(tot, dtype=np.int64) -
+                                       start)
+    return rep, flat
+
+
+def _member(sorted_keys, q):
+    """Boolean mask: q in sorted_keys (sorted numpy array)."""
+    if not len(sorted_keys) or not len(q):
+        return np.zeros(len(q), dtype=bool)
+    i = np.searchsorted(sorted_keys, q)
+    i[i == len(sorted_keys)] = 0
+    return sorted_keys[i] == q
+
+
+_KEY_M = np.int64(1) << np.int64(32)
+
+
+def decode_type(tc, reg, code):
+    """Vectorised Database.decode of all regions of one (tile type, region
+    index).  reg, code: the (region, relative bit code) pairs of the set
+    bits.  Returns (documented mask of the pairs, (regions, feature
+    indices) of the matched features)."""
+    keys = reg * _KEY_M + code
+    skeys = np.sort(keys)
+    doc = _member(tc.defaults, code)
+    lo = np.searchsorted(tc.anchor, code, 'left')
+    hi = np.searchsorted(tc.anchor, code, 'right')
+    cnt = hi - lo
+    tot = int(cnt.sum())
+    if not tot:
+        return doc, (np.zeros(0, np.int64), np.zeros(0, np.int64))
+    start = np.repeat(np.cumsum(cnt) - cnt, cnt)
+    cf = tc.anchor_f[np.repeat(lo, cnt) +
+                     (np.arange(tot, dtype=np.int64) - start)]
+    cr = np.repeat(reg, cnt)
+    ok = np.ones(tot, dtype=bool)
+    # All set bits of the feature set,
+    rep, flat = _expand(tc.pos_ptr, tc.npos, cf)
+    miss = ~_member(skeys, cr[rep] * _KEY_M + tc.pos[flat])
+    ok[rep[miss]] = False
+    # and none of its "!" bits.
+    sel = np.flatnonzero(ok)
+    rep, flat = _expand(tc.neg_ptr, tc.nneg, cf[sel])
+    hit = _member(skeys, cr[sel][rep] * _KEY_M + tc.neg[flat])
+    ok[sel[rep[hit]]] = False
+    mr, mf = cr[ok], cf[ok]
+    # The bits of matched features are documented.
+    rep, flat = _expand(tc.pos_ptr, tc.npos, mf)
+    doc |= _member(np.unique(mr[rep] * _KEY_M + tc.pos[flat]), keys)
+    return doc, (mr, mf)
+
+
+def col_region_keys(col):
+    """(array: region -> key index, [(tile type, region index within
+    tile)]) of a Collector, cached on it."""
+    if getattr(col, '_region_keys', None) is None:
+        keys = {}
+        kidx = np.zeros(len(col.regions), dtype=np.int64)
+        for tile, rlist in col.tile_regions.items():
+            for k, i in enumerate(rlist):
+                kidx[i] = keys.setdefault((col.regions[i][1], k), len(keys))
+        col._region_keys = (kidx, list(keys))
+    return col._region_keys
+
+
 def check_ids(col, db, ids, fasm=None):
     """Returns (unowned bit count, {tile type: Counter(bit -> count)}).
-    If fasm is a list, decoded "<tile>.<feature>" lines are appended."""
+    If fasm is a list, decoded "<tile>.<feature>" lines are appended.
+    Vectorised; same results (and Counter order) as check_ids_ref."""
+    rm = col.rmap
+    pos, reg, code = rm.pairs(ids)
+    kidx_of, keys = col_region_keys(col)
+    kidx = kidx_of[reg]
+    doc = np.zeros(len(reg), dtype=bool)
+    order = np.argsort(kidx, kind='stable')
+    bounds = np.flatnonzero(np.diff(kidx[order])) + 1
+    for grp in np.split(order, bounds):
+        if not len(grp):
+            continue
+        tt, k = keys[kidx[grp[0]]]
+        tc = db.codes(tt, k)
+        d, (mr, mf) = decode_type(tc, reg[grp], code[grp])
+        doc[grp] = d
+        if fasm is not None:
+            for r, f in zip(mr.tolist(), mf.tolist()):
+                fasm.append(f'{col.regions[r][0]}.'
+                            f'{tc.names[f].split(".", 1)[1]}')
+    # A bit is documented when some owner documents it.
+    bad = ~_member(np.unique(pos[doc]), pos)
+    unknown = collections.defaultdict(collections.Counter)
+    for r, b in zip(reg[bad].tolist(), rm.names(code[bad])):
+        unknown[col.regions[r][1]][b] += 1
+    check_ids.undocumented_bits = len(np.unique(pos[bad]))
+    return col.unowned(ids, rm.owned(ids, pos)), unknown
+
+
+def check_ids_ref(col, db, ids, fasm=None):
+    """Reference (per bit Python) implementation of check_ids."""
     rb = col.region_bits(ids)
     unknown = collections.defaultdict(collections.Counter)
     # region idx -> (tile type, region index within tile)
@@ -109,7 +251,7 @@ def check_ids(col, db, ids, fasm=None):
         if gid not in documented:
             unknown[tt][b] += 1
             bad.add(gid)
-    check_ids.undocumented_bits = len(bad)
+    check_ids_ref.undocumented_bits = len(bad)
     return col.unowned(ids), unknown
 
 
@@ -158,13 +300,17 @@ _CHECK = None
 
 
 def _check_one(item):
-    """Checks one input (collector and database from the parent)."""
-    idx, ids, want_fasm = item
-    col, db = _CHECK
+    """Checks one input (collector and database from the parent).  A
+    design input is (design directory, None): its bits are loaded here, so
+    that the parent holds no bit arrays."""
+    idx, (name, ids), want_fasm = item
+    col, db, impl = _CHECK
+    if ids is None:
+        ids = DD.load_bits(col.df, name)
     fasm = [] if want_fasm else None
-    unowned, unknown = check_ids(col, db, ids, fasm)
-    return unowned, dict(unknown), fasm, check_ids.undocumented_bits, \
-        col.hidden
+    unowned, unknown = impl(col, db, ids, fasm)
+    return len(ids), unowned, dict(unknown), fasm, \
+        impl.undocumented_bits, col.hidden
 
 
 def main():
@@ -180,6 +326,9 @@ def main():
                     help='also check configuration register writes')
     ap.add_argument('--fasm', default=None,
                     help='write decoded features of the (first) input here')
+    ap.add_argument('--ref', action='store_true',
+                    help='per bit Python reference implementation (slow; '
+                    'for equivalence tests)')
     args = ap.parse_args()
     die = dieslib.load()[args.die]
     dbdir = os.path.join(dieslib.DB, die.arch)
@@ -199,7 +348,7 @@ def main():
         inputs.append((b, np.sort(col.df.bit_ids(far, word, bit))))
     if args.designs:
         for d in DD.design_dirs(args.designs)[:args.max]:
-            inputs.append((d, DD.load_bits(col.df, d)))
+            inputs.append((d, None))
     if args.registers:
         for b in args.bit:
             und = check_registers(b, dbdir)
@@ -207,26 +356,31 @@ def main():
             if und:
                 total['REGISTERS'].update(und)
     global _CHECK
-    _CHECK = (col, db)
-    todo = [(idx, ids, bool(args.fasm and idx == 0))
-            for idx, (_, ids) in enumerate(inputs)]
+    _CHECK = (col, db, check_ids_ref if args.ref else check_ids)
+    todo = [(idx, inp, bool(args.fasm and idx == 0))
+            for idx, inp in enumerate(inputs)]
     if args.jobs > 1 and len(todo) > 1:
-        # Forked workers share the collector; each loads the database
-        # types it needs.
+        # Forked workers share the collector and the database, loaded
+        # here once (copy on write).
+        if not args.ref:
+            col.rmap
+            kidx, keys = col_region_keys(col)
+            for tt, k in keys:
+                db.codes(tt, k)
         from concurrent.futures import ProcessPoolExecutor
         ex = ProcessPoolExecutor(min(args.jobs, len(todo)))
         results = ex.map(_check_one, todo)
     else:
         ex = None
         results = map(_check_one, todo)
-    for (name, ids), (unowned, unknown, fasm, nbits, hidden) in zip(
+    for (name, _), (nset, unowned, unknown, fasm, nbits, hidden) in zip(
             inputs, results):
         if fasm is not None:
             with open(args.fasm, 'w') as f:
                 f.write('\n'.join(sorted(set(fasm))) + '\n')
         n = sum(sum(c.values()) for c in unknown.values())
         # n counts a bit once per owning tile; distinct bits too
-        print(f'{name}: set {len(ids)} unowned {unowned} undocumented {n} '
+        print(f'{name}: set {nset} unowned {unowned} undocumented {n} '
               f'bits {nbits} baseline_in_tileless_rows {hidden}')
         total_unowned += unowned
         for tt, c in unknown.items():
