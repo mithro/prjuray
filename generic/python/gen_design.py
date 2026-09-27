@@ -442,8 +442,10 @@ def recipe_slice(d, site, slicem):
         choices = ['LDCE', 'LDPE']
     cinv = "1'b1" if ctl['cinv'] else "1'b0"
     # Set/reset inversion: shared by the control set like the clock one
-    # (FFs of a site share the SR pin and its inverter).
-    srinv = "1'b1" if rng.random() < 0.3 else "1'b0"
+    # (FFs of a site share the SR pin and its inverter).  UltraScale only:
+    # 7-series slices have no SR inverter (Vivado then cannot commit the
+    # placement: "failed to commit all instances").
+    srinv = "1'b1" if us and rng.random() < 0.3 else "1'b0"
     clk, ce, sr = [], [], []
     for i in range(nff):
         ref = rng.choice(choices)
