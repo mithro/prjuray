@@ -21,6 +21,8 @@ the bitstream.
 | Tile grid | `python/tilegrid.py --evidence ... --colmap ...` | `build/db/<arch>/<die>/tilegrid.json` |
 | Bit database | `python/mkdb.py` | `build/db/<arch>/segbits_<tiletype>.db`, `defaults_<tiletype>.db` |
 | Checking / decoding | `python/check.py` | undocumented bit report, FASM |
+| Tile grid A/B test | `tg_eval.sh <variant> <die> <tilegrid.json>` (single die DBs, `check.py`, `python/check_cmp.py`) | `build/tilegrid_exp/dbeval/{inst,<variant>}_<die>/` |
+| Bit encoding analysis | `python/explain_bit.py`, `python/bit_xtab.py` (features x bit values table) | stdout |
 
 ### Random designs
 
@@ -180,7 +182,9 @@ python3 generic/python/tilegrid.py --die <die> \
 The bits of a tile within its frame column (its *window*) are structural
 for fabric tiles: its INT row and the empty grid rows above it.  Hard blocks
 (CMT, CFG, clock rows, GT, IO bank tiles, ...) whose windows are doubtful
-(taller than one INT row, in the centre row, or without an INT row) get
+(taller than one INT row, in the centre row, without an INT row, or
+between site-less filler tiles such as the Series7 PCIE_BOT among
+PCIE_NULL, whose bits span the clock region) get
 learnt windows: `tilegrid.py --probe auto` gives these tile types a window
 of +-one clock region around their grid row, a bit database of these types
 built with that tile grid (`mkdb.py --types`, `URAY_DB` pointing at a probe
@@ -190,7 +194,12 @@ turns that into per tile type windows relative to the tile's grid row;
 --windows` widens the structural windows with them (regions may overlap;
 a bit is documented when any owner documents it).  `pipeline.py
 --probe-windows` does all of this.  `check.py` reports distinct undocumented
-bits (`bits N`) next to the per owner count.
+bits (`bits N`) next to the per owner count.  `tilegrid.py --stacks RE`
+makes the overlapping learnt windows of the matching types within one grid
+column disjoint (each tile keeps its busiest contiguous rows); it is off by
+default because the rows a tile loses leave bits its features set that no
+owner documents (Series7 CMT stack: fewer undocumented bits per owner, more
+distinct ones).
 
 A learnt window never covers the structural window of another tile with
 sites (of a type without a learnt window) in the same grid column.  Tile
