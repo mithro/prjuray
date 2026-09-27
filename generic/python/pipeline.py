@@ -42,13 +42,15 @@ def tilegrid(args):
     die, arch = args
     out = os.path.join(dieslib.DB, arch, die)
     win = os.path.join(dieslib.DB, arch, 'windows.json')
+    frm = os.path.join(dieslib.DB, arch, 'frames.json')
     return die, run([
         sys.executable,
         os.path.join(HERE, 'tilegrid.py'), '--die', die, '--evidence',
         os.path.join(out, 'evidence.json'), '--colmap',
         os.path.join(out, 'colmap.json'), '--out',
         os.path.join(out, 'tilegrid.json')
-    ] + (['--windows', win] if os.path.exists(win) else []),
+    ] + (['--windows', win] if os.path.exists(win) else []) + (
+        ['--frames', frm] if os.path.exists(frm) else []),
         os.path.join(out, 'tilegrid.log'))
 
 

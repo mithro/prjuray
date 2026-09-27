@@ -227,7 +227,7 @@ def main():
         n = sum(sum(c.values()) for c in unknown.values())
         # n counts a bit once per owning tile; distinct bits too
         print(f'{name}: set {len(ids)} unowned {unowned} undocumented {n} '
-              f'bits {nbits} unowned_in_tileless_rows {hidden}')
+              f'bits {nbits} baseline_in_tileless_rows {hidden}')
         total_unowned += unowned
         for tt, c in unknown.items():
             total[tt].update(c)
