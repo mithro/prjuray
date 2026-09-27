@@ -829,6 +829,13 @@ proc nl_iob {name site mode ref stds props} {
         set ref [dict get {in IBUF out OBUF tri OBUFT} $mode]
     }
     set bank [get_iobanks -quiet -of_objects $s]
+    # A quarter of the banks take only differential inputs (bank settings
+    # such as the 7-series HCLK_IOI ONLY_DIFF_IN_USE depend on it).
+    global nl_bank_diffonly
+    if {![info exists nl_bank_diffonly]} { set nl_bank_diffonly [dict create] }
+    if {![dict exists $nl_bank_diffonly $bank]} {
+        dict set nl_bank_diffonly $bank [expr {rand() < 0.25}]
+    }
     if {[string match diff* $mode] && ![regexp {_L\d+P} [get_property PIN_FUNC $pin]]} {
         # Not the P side of a pair: use the single ended equivalent.
         set mode [dict get {diffin in diffout out difftri tri} $mode]
@@ -839,6 +846,10 @@ proc nl_iob {name site mode ref stds props} {
         }
         if {[llength $ses] == 0} { set ses {LVCMOS18:1.8 LVCMOS33:3.3 LVCMOS12:1.2} }
         set stds $ses
+    }
+    if {[dict get $nl_bank_diffonly $bank] && $mode in {in inout}} {
+        nl_log "ioberr $name diffonly"
+        return 0
     }
     global nl_bank_std
     if {![info exists nl_bank_std]} { set nl_bank_std [dict create] }

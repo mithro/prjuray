@@ -462,6 +462,7 @@ proc dump_features {out} {
     # every pad site of the bank.
     set bankstd [dict create]
     set bankin [dict create]
+    set bankinstd [dict create]
     foreach port [get_ports -quiet] {
         set pin [get_package_pins -quiet -of_objects $port]
         set std [get_property IOSTANDARD $port]
@@ -472,6 +473,7 @@ proc dump_features {out} {
         if {[get_property DIRECTION $port] ne "OUT"} {
             set diff [regexp {^(DIFF_|LVDS|TMDS|MINI_LVDS|BLVDS|RSDS|PPDS|SUB_LVDS|SLVS|LVPECL|MIPI)} $std]
             dict set bankin $b [expr {$diff ? "DIFF" : "SE"}] 1
+            dict set bankinstd $b $std 1
         }
     }
     # 7-series bank settings (internal VREF, ...) live in the HCLK_IOI tile
@@ -499,6 +501,7 @@ proc dump_features {out} {
             puts $fp "bank $s INTERNAL_VREF $vref"
             if {[dict exists $bankin $bank]} {
                 puts $fp "bank $s INPUTS [join [lsort [dict keys [dict get $bankin $bank]]] _]"
+                foreach std [dict keys [dict get $bankinstd $bank]] { puts $fp "bank $s INSTD $std" }
             }
         }
     }
