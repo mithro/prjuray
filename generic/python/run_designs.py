@@ -56,6 +56,14 @@ def budget_of(die):
     return 900 if n < 40000 else (1800 if n < 100000 else 3000)
 
 
+def timeout_of(die):
+    """Hard wall clock limit of a design: the repair budget is only checked
+    between attempts, and a single place/route can run for hours on an
+    unroutable design.  Twice the budget plus 10 minutes kept 99.5% of the
+    successful designs of the r1-r7 batches."""
+    return 2 * budget_of(die) + 600
+
+
 def generate(die, seed, wdir, gen_args):
     """Writes design.tcl (and design.meta); returns False on failure."""
     os.makedirs(wdir, exist_ok=True)
@@ -100,9 +108,12 @@ def postprocess(die, wdir):
     return 'ok'
 
 
-def tree_cpu(pid):
-    """CPU seconds used so far by a process and its live descendants (plus
-    the children they waited for)."""
+PAGE = os.sysconf('SC_PAGE_SIZE')
+
+
+def tree_stats(pid):
+    """(CPU seconds used so far, resident bytes now) of a process and its
+    live descendants (CPU includes the children they waited for)."""
     procs = {}
     for p in os.listdir('/proc'):
         if not p.isdigit():
@@ -113,17 +124,31 @@ def tree_cpu(pid):
         except OSError:
             continue
         rest = s[s.rfind(')') + 2:].split()
-        procs[int(p)] = (int(rest[1]), sum(int(x) for x in rest[11:15]))
+        procs[int(p)] = (int(rest[1]), sum(int(x) for x in rest[11:15]),
+                         int(rest[21]))
     kids = collections.defaultdict(list)
-    for p, (pp, _) in procs.items():
+    for p, (pp, _, _) in procs.items():
         kids[pp].append(p)
-    tot, todo = 0, [pid]
+    cpu, rss, todo = 0, 0, [pid]
     while todo:
         p = todo.pop()
         if p in procs:
-            tot += procs[p][1]
+            cpu += procs[p][1]
+            rss += procs[p][2]
         todo += kids.get(p, [])
-    return tot / CLK_TCK
+    return cpu / CLK_TCK, rss * PAGE
+
+
+def tree_cpu(pid):
+    return tree_stats(pid)[0]
+
+
+def set_directive(d):
+    """place_design/route_design -directive for the designs run by this
+    process (netlist.tcl reads NL_PLACE_DIRECTIVE/NL_ROUTE_DIRECTIVE)."""
+    if d:
+        os.environ['NL_PLACE_DIRECTIVE'] = d
+        os.environ['NL_ROUTE_DIRECTIVE'] = d
 
 
 def vivado_env(threads):
@@ -176,12 +201,15 @@ def install_cleanup():
 
 
 def run_fresh(die, wdir, timeout, threads):
-    """One Vivado process for the design.  Returns (status, cpu seconds)."""
+    """One Vivado process for the design.  Returns (status, cpu seconds,
+    peak resident bytes)."""
     vcmd = (f'source {VIVADO_SETTINGS} && NL_BUDGET={budget_of(die)} exec '
             f'vivado -mode batch -nojournal -log vivado.log -source '
             f'design.tcl > run.log 2>&1')
     p = _spawn(['bash', '-c', vcmd], cwd=wdir, env=vivado_env(threads))
     t0 = time.time()
+    peak = 0
+    n = 0
     while True:
         pid, status, ru = os.wait4(p.pid, os.WNOHANG)
         if pid:
@@ -191,13 +219,18 @@ def run_fresh(die, wdir, timeout, threads):
             except OSError:
                 pass
             _reaped(p.pid)
-            return 'done', ru.ru_utime + ru.ru_stime
+            # ru_maxrss (KiB): the largest process of the tree.
+            return 'done', ru.ru_utime + ru.ru_stime, max(
+                peak, ru.ru_maxrss * 1024)
         if time.time() - t0 > timeout:
             cpu = tree_cpu(p.pid)
             os.killpg(p.pid, signal.SIGKILL)
             os.wait4(p.pid, 0)
             _reaped(p.pid)
-            return 'timeout', cpu
+            return 'timeout', cpu, peak
+        n += 1
+        if n % 10 == 0:
+            peak = max(peak, tree_stats(p.pid)[1])
         time.sleep(1)
 
 
@@ -245,8 +278,10 @@ class Worker:
         return self.p.poll() is None
 
     def run(self, wdir, timeout):
-        """Returns (status, cpu seconds)."""
+        """Returns (status, cpu seconds, peak resident bytes sampled every
+        5 s)."""
         cpu0 = tree_cpu(self.p.pid)
+        peak = 0
         t0 = time.time()
         with self.cond:
             self.out = open(os.path.join(wdir, 'run.log'), 'w')
@@ -264,6 +299,7 @@ class Worker:
         with self.cond:
             while self.done is None:
                 self.cond.wait(5)
+                peak = max(peak, tree_stats(self.p.pid)[1])
                 if time.time() - t0 > timeout:
                     status = 'timeout'
                     break
@@ -276,7 +312,7 @@ class Worker:
             self.out.close()
             self.out = None
         self.ndone += 1
-        return status, cpu
+        return status, cpu, peak
 
     def kill(self):
         try:
@@ -336,17 +372,21 @@ def run_one(die, seed, wdir, gen_args, timeout, threads, pool=None):
         return seed, 'cached'
     t0 = time.time()
     stats = {'start': t0, 'host': socket.gethostname(), 'threads': threads,
-             'reuse': pool.reuse if pool else 1}
-    status, cpu = 'generror', 0.0
+             'reuse': pool.reuse if pool else 1,
+             'directive': os.environ.get('NL_PLACE_DIRECTIVE', '')}
+    status, cpu, rss = 'generror', 0.0, 0
+    if not timeout:
+        timeout = timeout_of(die)
     if generate(die, seed, wdir, gen_args):
         if pool:
-            vstatus, cpu = pool.get(die).run(wdir, timeout)
+            vstatus, cpu, rss = pool.get(die).run(wdir, timeout)
         else:
-            vstatus, cpu = run_fresh(die, wdir, timeout, threads)
+            vstatus, cpu, rss = run_fresh(die, wdir, timeout, threads)
         status = vstatus if vstatus in ('timeout', 'crash') else \
             postprocess(die, wdir)
     t1 = time.time()
-    stats.update(end=t1, wall=t1 - t0, cpu=cpu, status=status)
+    stats.update(end=t1, wall=t1 - t0, cpu=cpu, status=status,
+                 maxrss=rss)
     with open(os.path.join(wdir, 'run.stats'), 'w') as f:
         json.dump(stats, f)
     return seed, status
@@ -382,7 +422,10 @@ def main():
     ap.add_argument('--tag', default='fabric')
     ap.add_argument('--seeds', required=True, help='first:last')
     ap.add_argument('--jobs', type=int, default=16)
-    ap.add_argument('--timeout', type=int, default=7200)
+    ap.add_argument('--timeout', type=int, default=None,
+                    help='seconds per design (default: 2 x repair budget + 600)')
+    ap.add_argument('--directive', default=None,
+                    help='place_design/route_design directive (e.g. Quick)')
     ap.add_argument('--threads', type=int, default=2,
                     help='Vivado general.maxThreads')
     ap.add_argument('--reuse', type=int, default=1,
@@ -393,6 +436,7 @@ def main():
     ap.add_argument('gen_args', nargs='*')
     args = ap.parse_args()
     install_cleanup()
+    set_directive(args.directive)
     alldies = dieslib.load()
     dlist = [alldies[n] for n in args.die.split(',')]
     first, last = map(int, args.seeds.split(':'))
