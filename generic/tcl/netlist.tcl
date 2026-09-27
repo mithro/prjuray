@@ -823,6 +823,21 @@ proc nl_internal_vref {p} {
     }
 }
 
+# Remove a half built I/O buffer: its pad nets first (with them connected
+# remove_port / remove_cell fail, leaving a port at the default standard
+# that conflicts with the bank VCCO: "Bank 65 has terminals with
+# incompatible standards").
+proc nl_iob_drop {name ports} {
+    foreach p $ports {
+        catch {remove_net [get_nets -quiet ${p}_pad]}
+        catch {remove_port [get_ports -quiet $p]}
+    }
+    catch {remove_cell [get_cells -quiet $name]}
+    foreach p $ports {
+        if {[llength [get_ports -quiet $p]]} { nl_log "ioberr $name port $p left" }
+    }
+}
+
 proc nl_iob {name site mode ref stds props} {
     nl_flush_nets
     global nl_bank_vcco
@@ -936,8 +951,7 @@ proc nl_iob {name site mode ref stds props} {
     }
     if {[catch {set_property PACKAGE_PIN $pin [get_ports ${name}_p]} e]} {
         nl_log "ioberr $name pin [string range $e 0 150]"
-        foreach p $ports { catch {remove_port [get_ports $p]} }
-        catch {remove_cell [get_cells $name]}
+        nl_iob_drop $name $ports
         return 0
     }
     foreach p $ports {
@@ -945,8 +959,7 @@ proc nl_iob {name site mode ref stds props} {
             # Left at the default standard the buffer conflicts with the
             # bank VCCO chosen here: drop it.
             nl_log "ioberr $name IOSTANDARD $std"
-            foreach q $ports { catch {remove_port [get_ports $q]} }
-            catch {remove_cell [get_cells $name]}
+            nl_iob_drop $name $ports
             return 0
         }
     }

@@ -923,7 +923,10 @@ def recipe_clockgen(d, site, ref):
     pll = ref.startswith('PLL')
     props = d.random_params(ref)
     props.update(clockgen_params(ref, params, rng))
-    if props.get('SS_EN') == 'TRUE' and rng.random() < 0.6:
+    # Spread spectrum reprograms CLKFBOUT / CLKOUT2 / CLKOUT3 with values
+    # that are not derived from their settings (features.py leaves their
+    # counter features out): keep it rare.
+    if props.get('SS_EN') == 'TRUE' and rng.random() < 0.85:
         props['SS_EN'] = 'FALSE'
     fbbuf = rng.random() < (0.15 if pll else 0.3)
     if 'COMPENSATION' in params and rng.random() < 0.8:
