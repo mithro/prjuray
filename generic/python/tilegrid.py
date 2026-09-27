@@ -129,11 +129,38 @@ class Grid:
         if tw is None or base is None:
             return w
         lo, hi = base + tw[0], base + tw[1]
+        if not self.probe:
+            # Never over the structural window of another configurable tile
+            # (with sites, of a type without a learnt window) of the grid
+            # column: e.g. an I/O tile variant of a bank must not take the
+            # rows of the plain I/O tiles around it (whose bank wide
+            # features made its learnt window wide).
+            for n in self._column_owners(t):
+                ow = self.structural_window(n)
+                if ow is None or ow[0] != self.crrow[t['gy']]:
+                    continue
+                o_lo, o_hi = ow[1], ow[1] + ow[2]
+                if o_hi <= base:
+                    lo = max(lo, o_hi)
+                elif o_lo >= base:
+                    hi = min(hi, o_lo)
         if w is not None:
             lo, hi = min(lo, w[1]), max(hi, w[1] + w[2])
         if not self.probe:
             lo, hi = max(lo, 0), min(hi, self.frame_bits)
         return self.crrow[t['gy']], lo, hi - lo
+
+    def _column_owners(self, t):
+        """Tiles of t's grid column (other than t) with sites whose type has
+        no learnt window."""
+        if not hasattr(self, '_col_tiles'):
+            self._col_tiles = collections.defaultdict(list)
+            for n, x in self.tiles.items():
+                if x['type'] != 'NULL' and x['sites'] != '-':
+                    self._col_tiles[x['gx']].append(n)
+        return [n for n in self._col_tiles[t['gx']]
+                if n != t['name']
+                and self.tiles[n]['type'] not in self.type_windows]
 
     def structural_window(self, name):
         """The tile's INT row and the empty grid rows above it; the centre
