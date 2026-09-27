@@ -617,6 +617,25 @@ proc nl_directive {what} {
     return $opts
 }
 
+# 7-series global clock buffers fed by another global buffer (a cascade on
+# the dedicated clock route) cannot invert that input: "Pin I0 cannot be
+# inverted" (Constraints 18-608), failing placement.  Clear the inversion
+# of such inputs.
+proc nl_fix_bufg_inv {} {
+    foreach c [get_cells -quiet -hierarchical -filter {REF_NAME =~ BUFG*}] {
+        foreach pn {I0 I1 I} {
+            set p [get_pins -quiet $c/$pn]
+            if {$p eq ""} continue
+            if {[catch {get_property IS_${pn}_INVERTED $c} v] || $v ne "1'b1"} continue
+            set drv [get_cells -quiet -of_objects [get_pins -quiet -leaf -filter {DIRECTION == OUT} -of_objects [get_nets -quiet -of_objects $p]]]
+            if {$drv ne "" && [string match BUFG* [get_property REF_NAME $drv]]} {
+                catch {set_property IS_${pn}_INVERTED 1'b0 $c}
+                nl_log "bufginv $c $pn"
+            }
+        }
+    }
+}
+
 set nl_orphans [list]
 proc nl_finish {{relaxclk 0}} {
     nl_flush_nets
@@ -636,6 +655,7 @@ proc nl_finish {{relaxclk 0}} {
             catch {set_property CLOCK_DEDICATED_ROUTE TRUE [get_nets -quiet -of_objects [get_pins -quiet -of_objects $gen -filter {DIRECTION == OUT}]]}
         }
     }
+    nl_fix_bufg_inv
     foreach d [get_drc_checks] {
         catch {set_property SEVERITY Warning $d}
     }
