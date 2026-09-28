@@ -934,10 +934,9 @@ def _park_data(sitekeys):
 
 
 def parked_imux_features(feats, sitekeys):
-    """Adds PARK.<input>-><IMUX node> to INT tiles (see above).  Off
-    unless URAY_PARK=1: with it mkdb mis-assigns another feature's bits
-    (xcku025 GCLK_B_0_12->INT_NODE_GLOBAL_5_OUT0, +2.2k distinct)."""
-    if os.environ.get('URAY_PARK', '0') != '1':
+    """Adds PARK.<input>-><IMUX node> to INT tiles (see above); URAY_PARK=0
+    disables it."""
+    if os.environ.get('URAY_PARK', '1') == '0':
         return
     data = _park_data(sitekeys)
     if data is None:
