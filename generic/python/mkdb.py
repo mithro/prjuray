@@ -412,20 +412,21 @@ class Correlator:
         full_viol = (PF[idx] & pb) if clear else (PF[idx] & ~pb)
         return idx[~np.any(full_viol, axis=1)]
 
-    def bits(self, b0=0, b1=None):
-        """Single feature explanation of bits b0..b1-1: [(b, is_default,
-        feature names, left, pair)], pair: a pair cover may be tried (bits
-        in order get the pair budget)."""
+    def bits(self, b0=0, b1=None, step=1):
+        """Single feature explanation of bits b0, b0+step, ... < b1:
+        [(b, is_default, feature names, left, pair)], pair: a pair cover
+        may be tried (bits in order get the pair budget)."""
         PB, nb, full = self.PB, self.nb, self.full
-        empty_set = np.bitwise_count(PB[b0:b1] & self.EM).sum(axis=1)
+        brange = range(b0, self.nB if b1 is None else b1, step)
+        empty_set = np.bitwise_count(PB[b0:b1:step] & self.EM).sum(axis=1)
         out = []
-        for b in range(b0, self.nB if b1 is None else b1):
+        for j, b in enumerate(brange):
             pb = PB[b]
             # Default: set in (almost) every unused instance; the few
             # exceptions are tiles used in ways the feature dump does not
             # see.
             is_default = self.nempty > 0 and \
-                empty_set[b - b0] >= 0.97 * self.nempty
+                empty_set[j] >= 0.97 * self.nempty
             key = (full & ~pb) if is_default else pb
             ex = self.exact_features(key)
             if ex:
@@ -771,11 +772,13 @@ def _type_task(task):
         with open(os.path.join(sdir, 'names.pkl'), 'wb') as f:
             pickle.dump((fnames, bnames), f,
                         protocol=pickle.HIGHEST_PROTOCOL)
+        # Interleaved bit subsets (bits i, i+n, i+2n, ...): the expensive
+        # bits cluster (contiguous ranges differed 50x in run time).
         nB = len(bnames)
-        step = -(-nB // nparts)
+        nparts = min(nparts, nB)
         peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
-        return (tt, k), ('split', sdir, [(b, min(nB, b + step))
-                                         for b in range(0, nB, step)]), \
+        return (tt, k), ('split', sdir, [(i, nB, nparts)
+                                         for i in range(nparts)]), \
             None, peak, time.time() - t0
     res = correlate_packed(PF, PB, emptyv, fnames, bnames)
     return _written(outdir, tt, k, res, t0)
@@ -808,9 +811,9 @@ def _load_split(sdir):
 
 def _bits_task(item):
     """Worker: one bit range of a split task."""
-    sdir, b0, b1 = item
+    sdir, b0, b1, step = item
     t0 = time.time()
-    part = _load_split(sdir).bits(b0, b1)
+    part = _load_split(sdir).bits(b0, b1, step)
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
     return part, peak, time.time() - t0
 
@@ -1054,8 +1057,9 @@ def main():
                 if isinstance(summary, tuple):
                     _, sdir, ranges = summary
                     parts[key] = [sdir, len(ranges), {}]
-                    for i, (b0, b1) in enumerate(ranges):
-                        futs[ex.submit(_bits_task, (sdir, b0, b1))] = \
+                    for i, (b0, b1, step) in enumerate(ranges):
+                        futs[ex.submit(_bits_task,
+                                       (sdir, b0, b1, step))] = \
                             ('bits', (key, i))
                     print(f'# task {key[0]}.{key[1]} split into '
                           f'{len(ranges)} bit ranges ({dt:.0f} s, peak '
@@ -1075,8 +1079,9 @@ def main():
                     allparts = [p[2][j] for j in range(p[1])]
                     pbits = pair_bits_of(allparts)
                     rows = {r[0]: r for part in allparts for r in part}
-                    chunks = [pbits[i:i + PAIR_CHUNK]
-                              for i in range(0, len(pbits), PAIR_CHUNK)]
+                    # (interleaved, like the bit subsets)
+                    nch = -(-len(pbits) // PAIR_CHUNK)
+                    chunks = [pbits[i::nch] for i in range(nch)]
                     p.append(allparts)
                     p.append({'n': len(chunks), 'res': {}})
                     for i, bs in enumerate(chunks):
