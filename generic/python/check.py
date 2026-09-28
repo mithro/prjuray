@@ -500,6 +500,13 @@ def main():
         print(f'{tt}: {sum(c.values())} ({len(c)} distinct) e.g. '
               f'{", ".join(f"{b}x{n}" for b, n in c.most_common(args.top))}')
     print('unowned total', total_unowned)
+    # peak memory, for the pipeline's check scheduling (without workers the
+    # process itself stands for a worker)
+    import resource
+    me = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+    kids = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss * 1024
+    print(f'# check peak parent {me} worker {kids if ex else me} jobs '
+          f'{min(args.jobs, len(todo)) if ex else 1}', flush=True)
     return 1 if (total or total_unowned) else 0
 
 
