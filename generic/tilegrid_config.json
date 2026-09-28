@@ -1,0 +1,8 @@
+{
+ "_doc": "Per architecture tile grid settings used by pipeline.py. region_dies: dies with only region designs (r12reg): their evidence ignores tiles matching more than max_matches frame columns (tilegrid.py --max-matches) and colalign aligns them without learning from them (--learn-exclude); init_dies: the dies whose activity initialises colalign (--init-dies).",
+ "UltraScalePlus": {
+  "region_dies": ["xazu3teg", "xazu4ev", "xazu7ev", "xcau20p", "xck26", "xcku3p", "xczu4cg", "xczu7cg", "xcu25"],
+  "max_matches": 3,
+  "init_dies": ["xaau10p", "xaau7p", "xazu1eg", "xazu2eg"]
+ }
+}

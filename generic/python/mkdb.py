@@ -626,16 +626,15 @@ def _chunk_samples(raw):
             yield 'e', fflat[:0], bflat[bo[j]:bo[j + 1]]
 
 
-def _code_stamp():
-    """Checksum of the feature extraction code: changing how features are
-    derived from the dumps must invalidate cached samples."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    with open(os.path.join(here, 'features.py'), 'rb') as f:
-        return zlib.crc32(f.read())
+_TILES_TSV = {}
 
 
 def _cache_stamp(arch, dn, d):
-    st = [CACHE_VERSION, _code_stamp()]
+    # feature code, its data files and switches, the die's site files
+    # (designdata.feature_inputs_stamp): anything changing the features
+    if dn not in _TILES_TSV:
+        _TILES_TSV[dn] = dieslib.load()[dn].tiles_tsv
+    st = [CACHE_VERSION, DD.feature_inputs_stamp(_TILES_TSV[dn])]
     for p in (os.path.join(d, 'bits.npz'),
               os.path.join(d, 'design.features.gz'),
               os.path.join(dieslib.DB, arch, dn, 'tilegrid.json')):
@@ -707,15 +706,54 @@ def _cache_one(item):
     return [(k, v[2], v[3], v[4]) for k, v in keys]
 
 
+def _cache_task(item):
+    """Worker: _cache_one and the worker's peak memory (bytes)."""
+    keys = _cache_one(item)
+    return keys, resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+
+
+SAMPLE_PEAK_GUESS = 2 << 30
+
+
 def _sample_phase(work, jobs, budget_gib):
-    """Runs _cache_one on every work item; yields (index, keys) as they
-    complete, at most as many at once as fit the memory budget
-    (memsched.budget_map).  The work list is in die order and a worker
+    """Runs _cache_task on every work item; yields (index, keys) as they
+    complete.  With a memory budget, at most budget / (1.25 x largest
+    worker peak seen, at least SAMPLE_PEAK_GUESS) items run at once (the
+    pool only starts a process when no idle one is left, so this also
+    bounds the processes).  The work list is in die order and a worker
     keeps only its current die's Collector."""
-    import memsched
-    return memsched.budget_map(
-        _cache_one, work, jobs, budget_gib, label='sample phase',
-        log=lambda m: print(m, flush=True))
+    from concurrent.futures import ProcessPoolExecutor, FIRST_COMPLETED, wait
+    peak = SAMPLE_PEAK_GUESS
+
+    def limit():
+        if not budget_gib:
+            return jobs
+        return max(1, min(jobs, int(budget_gib * 2**30 // (peak * 1.25))))
+
+    lim = limit()
+    if budget_gib:
+        print(f'# sample phase: {lim} designs at once ({budget_gib} GiB, '
+              f'{peak / 2**30:.1f} GiB per worker assumed)', flush=True)
+    with ProcessPoolExecutor(jobs) as ex:
+        futs = {}
+        nxt = 0
+        while nxt < len(work) or futs:
+            while nxt < len(work) and len(futs) < lim:
+                futs[ex.submit(_cache_task, work[nxt])] = nxt
+                nxt += 1
+            done, _ = wait(futs, return_when=FIRST_COMPLETED)
+            for f in done:
+                i = futs.pop(f)
+                keys, p = f.result()
+                if budget_gib and p > peak:
+                    peak = p
+                    new = limit()
+                    if new != lim:
+                        print(f'# sample phase: worker peak '
+                              f'{p / 2**30:.2f} GiB: {new} designs at once',
+                              flush=True)
+                        lim = new
+                yield i, keys
 
 
 def _interned(rows, vmap, vocab, vids):

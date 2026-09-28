@@ -18,6 +18,14 @@ for d in DD.design_dirs(os.path.join(dieslib.BUILD, 'designs', dn, tag), v2only=
     t = time.time(); a = old.tile_features(p, sk_old); t1 = time.time()
     b = new.tile_features(p, sk_new); t2 = time.time()
     to += t1 - t; tn += t2 - t1
+    # EQ_IGNORE: regexp of features left out of the comparison (e.g. the
+    # features only one side's code has, when comparing merged code)
+    ign = os.environ.get('EQ_IGNORE')
+    if ign:
+        import re
+        r = re.compile(ign)
+        a = {k: {f for f in v if not r.search(f)} for k, v in a.items()}
+        b = {k: {f for f in v if not r.search(f)} for k, v in b.items()}
     a = {k: v for k, v in a.items() if v}
     b = {k: v for k, v in b.items() if v}
     same = a == b

@@ -184,6 +184,12 @@ python3 generic/python/tilegrid.py --die <die> \
     --colmap <dir>/<arch>/<die>/colmap.json --out tilegrid.json
 ```
 
+Dies with only region designs (all tiles of a block of clock regions used
+together, so a tile's usage matches many frame columns) get evidence with
+`tilegrid.py --max-matches N` and are aligned without being learnt from
+(`colalign.py --learn-exclude`, `--init-dies`); `generic/tilegrid_config.json`
+lists them per architecture and `pipeline.py` passes the options.
+
 The bits of a tile within its frame column (its *window*) are structural
 for fabric tiles: its INT row and the empty grid rows above it (on
 UltraScale(+) through an empty RCLK row: a GT quad or CMT in the bottom
