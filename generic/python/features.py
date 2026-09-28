@@ -106,6 +106,9 @@ class SiteKeys:
                     self.key[name] = (p[1], f'{prefix}_X{x - mx}Y{y - my}')
 
 
+# Environment switches changing the derived features (cache stamps).
+STAMP_ENV = ('URAY_PARK', 'URAY_LEAFPAIR')
+
 _EQN_CACHE = {}
 _IDX = np.arange(64, dtype=np.uint8)
 _ENV = {f'A{k + 1}': ((_IDX >> k) & 1).astype(np.uint8) for k in range(6)}
@@ -783,7 +786,11 @@ def leaf_clock_features(feats, sitekeys):
                     fs.add(f'GCLK_B_0_{g}->{wire}')
         # GCLK_B_0_g and GCLK_B_0_<g+8> feed the same two global nodes;
         # the node settings depend on which of the pair is live (xcku025
-        # 27_060: GCLK_B_0_15 live without GCLK_B_0_7).
+        # 27_060: GCLK_B_0_15 live without GCLK_B_0_7).  Off unless
+        # URAY_LEAFPAIR=1: mkdb then moves bits of the plain implied PIPs
+        # to the tagged copies (xcku025 ci: pred.missed +5.9k).
+        if os.environ.get('URAY_LEAFPAIR', '0') != '1':
+            continue
         gs = {(2 * int(f[len('LEAF_CLK_OUT'):])) % 16 +
               (1 if int(f[len('LEAF_CLK_OUT'):]) >= 8 else 0)
               for f in fs if f.startswith('LEAF_CLK_OUT')}

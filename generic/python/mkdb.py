@@ -638,7 +638,10 @@ def _code_stamp():
         for name in sorted(os.listdir(data)):
             with open(os.path.join(data, name), 'rb') as f:
                 crc = zlib.crc32(f.read(), crc)
-    return zlib.crc32(os.environ.get('URAY_PARK', '0').encode(), crc)
+    import features as featlib
+    for name in featlib.STAMP_ENV:
+        crc = zlib.crc32(os.environ.get(name, '').encode(), crc)
+    return crc
 
 
 def _cache_stamp(arch, dn, d):
