@@ -106,7 +106,7 @@ def _feature_code_stamp(sitekeys):
             for name in sorted(os.listdir(data)):
                 with open(os.path.join(data, name), 'rb') as f:
                     crc = zlib.crc32(f.read(), crc)
-        crc = zlib.crc32(os.environ.get('URAY_PARK', '1').encode(), crc)
+        crc = zlib.crc32(os.environ.get('URAY_PARK', '0').encode(), crc)
         sk = zlib.crc32(pickle.dumps(
             {k: v for k, v in vars(sitekeys).items()},
             protocol=pickle.HIGHEST_PROTOCOL))
