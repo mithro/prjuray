@@ -11,6 +11,10 @@
 # is hit systemd stops the whole scope (exit 143, journal says oom-kill, no
 # peak line).  Treat that as a retryable failure: lower --jobs and rerun,
 # don't just raise the cap.
+#
+# Jobs run at low priority (nice 19, best-effort IO priority 7) and
+# vivado.slice has CPUWeight=20, so the interactive Claude/tmux sessions in
+# app.slice stay responsive under load.
 set -u
 if [ $# -lt 3 ]; then
     echo "usage: $0 <name> <MemoryMax> <command...>" >&2
@@ -22,7 +26,7 @@ shift 2
 unit="prjuray-${name}-$(date +%s)-$$"
 exec systemd-run --user --scope --quiet --slice=vivado.slice --unit="$unit" \
     -p MemoryMax="$cap" -p MemorySwapMax=0 -- \
-    bash -c '
+    nice -n 19 ionice -c2 -n7 bash -c '
         "$@"
         rc=$?
         cg=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)
