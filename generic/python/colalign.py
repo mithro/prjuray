@@ -650,6 +650,30 @@ def edge_frames(dr, cr, full, table):
     return out
 
 
+def size_fix(dr, cr, full, table, silent):
+    """A column of a silent kind whose frame column has another size than
+    the kind's usual one (>= 60% of its columns over all dies) moves to the
+    neighbouring frame column (index +-1) of that size, shared or not
+    (xcku025 middle I/O column: HPIO_L 16 -> the 10 minor column holding
+    its pull bits, XIPHY_L sharing INT's 58 -> the 16 minor one)."""
+    M = dr.majors(cr)
+    out = dict(full)
+    kinds = dict(dr.rows[cr])
+    for gx, j in sorted(full.items()):
+        k = kinds.get(gx)
+        c = table.emit.get(k)
+        if k not in silent or not c:
+            continue
+        nf, n = c.most_common(1)[0]
+        if M[j][2] == nf or n < 0.6 * sum(c.values()):
+            continue
+        near = [i for i in (j - 1, j + 1) if 0 <= i < len(M) and
+                M[i][2] == nf]
+        if len(near) == 1:
+            out[gx] = near[0]
+    return out
+
+
 def minority_tiles(dr, cr, full):
     """Hard block tiles (with sites) of another type than their column's
     kind, e.g. a PCIE block over part of a CLB column, where the other grid
@@ -958,8 +982,9 @@ def main():
                     for gx, j in f2.items():
                         ref[gx].add((j, dr.majors(c2)[j][2]))
             ref = {gx: v for gx, v in ref.items() if len(v) == 1}
-            full = edge_frames(dr, cr, claim_unused(dr, cr, first[cr], ref),
-                               table)
+            full = size_fix(dr, cr, edge_frames(
+                dr, cr, claim_unused(dr, cr, first[cr], ref), table),
+                table, silent)
             for gx, j in sorted(full.items()):
                 colmap.append([cr, gx, m[j][0]])
             for name, j in minority_tiles(dr, cr, full).items():
