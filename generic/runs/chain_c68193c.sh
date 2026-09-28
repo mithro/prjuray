@@ -2,6 +2,7 @@
 # After merging us-residue c68193c (PARK: constant-net wires are not live):
 # CI compare (review the log), golden update, then rebuild the US DB (4 sample
 # workers; usdb-6 OOMed at 8) and the US+ DB with the gty1 + gty2 GT rounds.
+# US+ at 20 sample workers: at 40 its scope peak reached the 50G cap.
 # Series7 is unaffected (xa7s15 CI must be identical; checked below).
 set -u
 cd /home/tim/github/f4pga/prjuray
@@ -32,7 +33,7 @@ p1=$!
 generic/vrun.sh uspdb-7 50G python3 -u generic/python/pipeline.py \
     --dies xaau7p,xazu1eg,xaau10p,xazu2eg,xazu3teg,xcku3p,xczu4cg,xazu4ev,xcau20p,xck26,xazu7ev,xczu7cg,xcu25 \
     --tags r1,r3,r4,r7,r8,r9,r11,r12reg,r13d,gty1,gty2 --check-tags r13d,r12reg \
-    --skip-tilegrid --jobs 20 --sample-jobs 40 --mem-budget 40 > build/logs/pipeline_usp_9.log 2>&1 &
+    --skip-tilegrid --jobs 20 --sample-jobs 20 --mem-budget 40 > build/logs/pipeline_usp_9.log 2>&1 &
 p2=$!
 wait $p1; rc1=$?
 wait $p2; rc2=$?
