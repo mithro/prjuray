@@ -724,11 +724,13 @@ proc nl_finish {{relaxclk 0}} {
                 continue
             }
             nl_log "placed [expr [clock seconds] - $t0]"
-            global nl_wanted_pips
-            if {[llength $nl_wanted_pips]} { nl_force_pips; set nl_wanted_pips [list] }
             set stage route
         }
         if {$stage eq "route"} {
+            # Directed PIPs: before every routing attempt (the repair loop
+            # unroutes everything).
+            global nl_wanted_pips
+            if {[llength $nl_wanted_pips]} { nl_force_pips }
             if {[catch {route_design {*}[nl_directive ROUTE]} e]} {
                 nl_log "route_design failed: [string range $e 0 200]"
                 lassign [nl_offenders "ERROR: $e"] names nets
@@ -1063,9 +1065,25 @@ proc nl_want_pip {net pip} {
     lappend nl_wanted_pips $net $pip
 }
 
+# find_routing_path from a to b avoiding the nodes in the array usedv
+# (name -> 1) and the node list extra; retries a few times, each time also
+# excluding the used nodes the previous path ran into.
+proc nl_path_avoiding {usedv a b extra opts} {
+    upvar 1 $usedv used
+    set ex $extra
+    for {set try 0} {$try < 4} {incr try} {
+        set path [find_routing_path -quiet -from $a -to $b -max_nodes 60 -exclude_nodes $ex {*}$opts]
+        if {![llength $path]} { return [list] }
+        set hit [list]
+        foreach x $path { if {[info exists used($x)]} { lappend hit $x } }
+        if {![llength $hit]} { return $path }
+        set ex [concat $ex $hit]
+    }
+    return [list]
+}
+
 proc nl_force_pips {} {
     global nl_wanted_pips
-    set usedn [list]
     set ok 0
     set tf0 [clock milliseconds]
     set prop FIXED_ROUTE
@@ -1092,15 +1110,18 @@ proc nl_force_pips {} {
                 # Two plain searches joined by the PIP (n0 -> n1).
                 # Nodes of earlier forced routes are excluded (fixed routes
                 # must not overlap), and the second half avoids the first.
+                # (Excluding all used nodes up front made each search ~2 s;
+                # instead a search is repeated excluding only the used
+                # nodes it ran into.)
                 set path [list]
                 if {[info exists used($n0)] || [info exists used($n1)]} { error "pip nodes in use" }
-                set p0 [find_routing_path -quiet -from $from -to $n0 -max_nodes 60 -exclude_nodes [concat $usedn [list $n1]] {*}$opts]
+                set p0 [nl_path_avoiding used $from $n0 [list $n1] $opts]
                 if {[llength $p0]} {
-                    set p1 [find_routing_path -quiet -from $n1 -to $to -max_nodes 60 -exclude_nodes [concat $usedn $p0] {*}$opts]
+                    set p1 [nl_path_avoiding used $n1 $to $p0 $opts]
                     if {[llength $p1]} { set path [concat $p0 $p1] }
                 }
                 if {[llength $path] != [llength [lsort -unique $path]]} { set path [list] }
-                foreach x $path { set used($x) 1; lappend usedn $x }
+                foreach x $path { set used($x) 1 }
             } else {
                 set path [find_routing_path -quiet -from $from -to $to -include_nodes [list $n0 $n1] -sort_include_nodes -max_nodes 120 {*}$opts]
             }
