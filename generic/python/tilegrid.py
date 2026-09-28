@@ -158,11 +158,12 @@ class Grid:
             # next channel).
             s_lo, s_hi = w[1], w[1] + w[2]
             if not self.probe:
+                # (never into the tile's own grid row)
                 for o_lo, o_hi in self._column_learnt(t):
                     if o_lo >= hi and o_lo < s_hi:
-                        s_hi = o_lo
+                        s_hi = max(o_lo, base + self.bpr)
                     if o_hi <= lo and o_hi > s_lo:
-                        s_lo = o_hi
+                        s_lo = min(o_hi, base)
             lo, hi = min(lo, s_lo), max(hi, s_hi)
         if not self.probe:
             lo, hi = max(lo, 0), min(hi, self.frame_bits)
@@ -276,6 +277,7 @@ def probe_types(grid):
 
 
 PROBE_PER_ROW = 3
+MAX_MATCHES = None  # see --max-matches
 
 
 def frame_columns(dframes):
@@ -487,9 +489,15 @@ def collect(die, design_root, verbose=False, jobs=1):
             t, _, (cr, _, _) = tiles_used[i]
             gx = grid.tiles[t]['gx']
             v = vec[i]
+            hit = v >= 0.95
+            # --max-matches: a usage pattern matching many frame columns
+            # says nothing about the tile's (region designs, where all tiles
+            # of a block of clock regions are used together).
+            if MAX_MATCHES and hit.sum() > MAX_MATCHES:
+                continue
             row = scores.setdefault(cr, {})
             acc = row.setdefault(gx, np.zeros(len(v)))
-            acc += (v >= 0.95) * v
+            acc += hit * v
     # 3. Block RAM content columns (block type 1), same scoring.
     votes1 = collections.defaultdict(collections.Counter)
     for (lo, n), idx in groups.items():
@@ -1007,11 +1015,15 @@ def main():
                     'windows from a bit database built with it')
     ap.add_argument('--probe-span', type=int, default=None)
     ap.add_argument('--out', required=True)
+    ap.add_argument('--max-matches', type=int, default=None,
+                    help='evidence: ignore tiles whose usage matches more '
+                    'frame columns (e.g. 3 for dies with only region designs)')
     ap.add_argument('--jobs', type=int, default=1,
                     help='designs loaded in parallel for --designs (each '
                     'worker holds one design\'s features: large dies '
                     '~1-2 GB)')
     args = ap.parse_args()
+    globals()['MAX_MATCHES'] = args.max_matches
     die = dieslib.load()[args.die]
     grid = Grid(die)
     grid.stack_re = stack_re(args.stacks)

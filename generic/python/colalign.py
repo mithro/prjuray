@@ -558,6 +558,9 @@ def attach_silent(rows_all, assigned, model=None, maxdist=16):
     return out
 
 
+CLAIM_NEED_EVIDENCE = True
+
+
 def claim_unused(dr, cr, full, ref=None):
     """A grid column sharing its neighbour's frame column moves to an unused
     frame column right next to it on its own side, when its activity there
@@ -580,7 +583,8 @@ def claim_unused(dr, cr, full, ref=None):
             n = j + step
             if not side or n < 0 or n >= len(M) or n in used:
                 continue
-            if not ((v is not None and n < len(v) and v[n] > 0) or
+            if CLAIM_NEED_EVIDENCE and not (
+                    (v is not None and n < len(v) and v[n] > 0) or
                     (ref and (n, M[n][2]) in ref.get(gx, ()))):
                 continue
             # nothing between gx and the next grid column on that side may
@@ -705,10 +709,15 @@ def main():
                     'is printed')
     ap.add_argument('--init-dies', help='dies whose activity assignment '
                     'initialises the model (default: all)')
+    ap.add_argument('--learn-exclude', default='',
+                    help='comma separated dies aligned with the model but '
+                    'not learnt from (e.g. dies with only region designs, '
+                    'whose activity matches many frame columns)')
     args = ap.parse_args()
     globals()['W_ACT'] = args.w_act
     globals()['INIT_EA'] = args.init_explained
     globals()['SUPPORTED'] = args.supported
+    learn_ex = set(filter(None, args.learn_exclude.split(',')))
     alldies = dieslib.load()
     base = os.path.join(args.exp, args.arch)
     names = args.dies.split(',') if args.dies else sorted(
@@ -817,6 +826,8 @@ def main():
         # contradict (an alignment must not reinforce its own mistakes).
         data = []
         for (d, cr), asg in cur.items():
+            if d in learn_ex:
+                continue
             dr = rows[d]
             m = dr.majors(cr)
             sc = dr.ev['scores'].get(cr, {})
@@ -850,7 +861,7 @@ def main():
                rows[d].majors(cr)[cur[(d, cr)][gx]][2]
                if gx in cur[(d, cr)] else None)
               for gx, k in seqs(rows[d], cr)]
-             for (d, cr) in cur]
+             for (d, cr) in cur if d not in learn_ex]
     model.fit(final, nf_all, silent)
     with open(os.path.join(base, 'model.json'), 'w') as f:
         json.dump(model.to_json(), f, indent=1)
