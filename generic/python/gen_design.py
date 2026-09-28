@@ -169,6 +169,10 @@ class Design:
         self.prims = prims
         self.rng = rng
         self.lines = []
+        # GT data pins: GT outputs never drive GT inputs (such nets
+        # route through general interconnect only with long detours and
+        # end unroutable: xcau20p gty1 RXRECCLKOUT -> DRPADDR).
+        self.gt_pins = set()
         self.ncell = 0
         self.sources = []  # (pin, gx, gy)
         self.sinks = []  # (pin, gx, gy, kind)
@@ -321,10 +325,20 @@ class Design:
                 const1.extend(pins)
             else:
                 local = grid.get((gx // 16, gy // 16))
+                gt = self.gt_pins and any(p in self.gt_pins for p in pins)
+                if gt:
+                    local = [x for x in local or () if x not in self.gt_pins]
                 if local and rng.random() < 0.85:
                     drive[rng.choice(local)].extend(pins)
                 else:
-                    drive[rng.choice(allsrc)].extend(pins)
+                    src = rng.choice(allsrc)
+                    for _ in range(20 if gt else 0):
+                        if src not in self.gt_pins:
+                            break
+                        src = rng.choice(allsrc)
+                    if gt and src in self.gt_pins:
+                        continue  # (only GT sources: left unconnected)
+                    drive[src].extend(pins)
         for d, s in self.fixed_nets:
             drive[d].extend(s)
         for pin, v in self.ties:
@@ -1177,8 +1191,10 @@ def gt_block_pins(d, site, n, ref, refclks, common, chsite=None):
             if rng.random() < 0.6:
                 d.add_sink(full, site, 'gclock' if _GT_CLKIN.search(p)
                            else 'data', hard=True)
+                d.gt_pins.add(full)
         elif dr == 'OUT' and rng.random() < 0.5:
             d.add_source(full, site)
+            d.gt_pins.add(full)
 
 
 def recipe_gt(d, site, ref):
