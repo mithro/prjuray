@@ -39,7 +39,7 @@ import numpy as np
 # files read by a derived pass).  features.py itself, generic/data/*,
 # clockgen_tables.json and the die's tiles / bonded files are always
 # covered.
-STAMP_ENV = ('URAY_PARK', 'URAY_LEAFPAIR')
+STAMP_ENV = ('URAY_PARK', 'URAY_LEAFPAIR', 'URAY_GPARK')
 
 
 def stamp_files(tiles_tsv):
@@ -738,9 +738,15 @@ def derive(state, sitekeys):
                 feats[tile].add(f'{key}.EFF_PULL={pull}')
                 feats[tile].add(f'{key}.EFF_PULLDOWN={int(pull == "DOWN")}')
     hclk_row_features(feats, sitekeys)
-    # (parked IMUX first: the leaf clock PIPs are implied, not routed)
-    parked_imux_features(feats, sitekeys)
-    leaf_clock_features(feats, sitekeys)
+    # (leaf clocks first: parked global nodes depend on them; without
+    # URAY_GPARK parked IMUX first: the implied leaf clock PIPs are not
+    # routed)
+    if os.environ.get('URAY_GPARK', '1') != '0':
+        leaf_clock_features(feats, sitekeys)
+        parked_imux_features(feats, sitekeys)
+    else:
+        parked_imux_features(feats, sitekeys)
+        leaf_clock_features(feats, sitekeys)
     return feats
 
 
@@ -830,6 +836,8 @@ def leaf_clock_features(feats, sitekeys):
     # = GCLK_B_0_9 -> INT_NODE_GLOBAL_13_OUT1 / OUT0 for leaf output 12,
     # 3 exceptions in 22253; 27_026 / 25_026 = GCLK_B_0_11 -> node 2 for
     # output 13): the implied PIP is added as if routed.
+    if os.environ.get('URAY_GPARK', '1') != '0':
+        return  # parked_imux_features parks the global nodes instead
     feeds = _gclk_feeds(sitekeys)
     for t in touched:
         fs = feats[t]
@@ -907,8 +915,9 @@ _PARK = {}
 
 
 def _park_data(sitekeys):
-    """(node map {wire: [(dx, dy, wire)]}, {IMUX node: sorted inputs}) of
-    the die's architecture, or None without a node map."""
+    """(node map {wire: [(dx, dy, wire)]}, {IMUX node: sorted inputs},
+    {global node: sorted inputs}) of the die's architecture, or None
+    without a node map."""
     key = id(sitekeys)
     if key in _PARK:
         return _PARK[key]
@@ -931,13 +940,17 @@ def _park_data(sitekeys):
             w, dx, dy, w2 = line.split()
             nodes[w].append((int(dx), int(dy), w2))
     inputs = collections.defaultdict(set)
+    ginputs = collections.defaultdict(set)
     with open(pips) as f:
         for line in f:
             p = line.split()
-            if len(p) > 3 and p[0] == 'pip' and p[1] == 'INT' and \
-                    _IMUX.match(p[3]):
-                inputs[p[3]].add(p[2])
-    _PARK[key] = (dict(nodes), {n: sorted(v) for n, v in inputs.items()})
+            if len(p) > 3 and p[0] == 'pip' and p[1] == 'INT':
+                if _IMUX.match(p[3]):
+                    inputs[p[3]].add(p[2])
+                elif _GNODE.match(p[3]):
+                    ginputs[p[3]].add(p[2])
+    _PARK[key] = (dict(nodes), {n: sorted(v) for n, v in inputs.items()},
+                  {n: sorted(v) for n, v in ginputs.items()})
     return _PARK[key]
 
 
@@ -949,7 +962,7 @@ def parked_imux_features(feats, sitekeys):
     data = _park_data(sitekeys)
     if data is None:
         return
-    nodes, inputs = data
+    nodes, inputs, ginputs = data
     live = collections.defaultdict(set)
     fanout = collections.defaultdict(lambda: collections.defaultdict(list))
     for tile, fs in list(feats.items()):
@@ -1015,5 +1028,46 @@ def parked_imux_features(feats, sitekeys):
                 continue
             for src in ins[1:]:
                 if src not in ws:
+                    fs.add(f'PARK.{src}->{node}')
+                    break
+    if os.environ.get('URAY_GPARK', '1') == '0':
+        return
+    # Global node muxes (INT_NODE_GLOBAL_<n>_OUT<i>) are parked too: the
+    # all-zero setting selects the upper GCLK of the node's pair
+    # (GCLK_B_0_<g+8>, g < 8); when that one is live (its leaf clock
+    # drives the tile's half-column, LEAF_CLK_OUT<k>, g(k) as in
+    # leaf_clock_features) the node takes the lower GCLK, else (live
+    # too) the first input by name carrying no net.  xcku025 node 6
+    # (GCLK_B_0_13 / GCLK_B_0_5): leaf 10 (GCLK_B_0_5) alone: no bits,
+    # leaf 14 (GCLK_B_0_13) alone: GCLK_B_0_5's 24_046 25_045, both:
+    # INT_INT_SINGLE_13's 24_046 25_044, then WW2_W_END5's, WW4_END10's;
+    # node 13: leaf 12 (GCLK_B_0_9) -> GCLK_B_0_1 (24_012 25_011).  This
+    # replaces the implied leaf clock PIPs (URAY_GPARK=0: old behaviour).
+    for tile, fs in feats.items():
+        if sitekeys.tile_type.get(tile) != 'INT':
+            continue
+        gl = set()
+        for f in fs:
+            if f.startswith('LEAF_CLK_OUT'):
+                k = int(f[len('LEAF_CLK_OUT'):])
+                gl.add(f'GCLK_B_0_{(2 * k) % 16 + (1 if k >= 8 else 0)}')
+        if not gl:
+            continue
+        m = _INT_XY.match(tile)
+        ws = live.get((int(m.group(1)), int(m.group(2))), set()) \
+            if m else set()
+        driven = set()
+        for f in fs:
+            if '->' in f and not f.startswith('PARK'):
+                driven.add(f.split('->', 1)[1])
+        for node, ins in ginputs.items():
+            if node in driven:
+                continue
+            gck = sorted((w for w in ins if w.startswith('GCLK_B_0_')),
+                         key=lambda w: int(w.rsplit('_', 1)[1]))
+            if len(gck) != 2 or gck[1] not in gl:
+                continue
+            for src in [gck[0]] + [w for w in ins if w not in gck]:
+                if src not in gl and src not in ws:
                     fs.add(f'PARK.{src}->{node}')
                     break
