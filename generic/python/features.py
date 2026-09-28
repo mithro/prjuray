@@ -31,6 +31,19 @@ import re
 
 import numpy as np
 
+# Feature cache hooks (designdata.feature_inputs_stamp): environment
+# variables that change the features (A/B switches) and a function
+# returning the other files a die's features depend on (e.g. per die meta
+# files read by a derived pass).  features.py itself, generic/data/*,
+# clockgen_tables.json and the die's tiles / bonded files are always
+# covered.
+STAMP_ENV = ()
+
+
+def stamp_files(tiles_tsv):
+    return []
+
+
 _XY = re.compile(r'^(.*)_X(\d+)Y(\d+)$')
 _VEC = re.compile(r"^(\d+)'([bh])([0-9a-fA-F_]+)$")
 
@@ -408,6 +421,15 @@ def open_any(path):
 
 def tile_features(path, sitekeys):
     """Returns {tile: set(features)} for one design."""
+    return derive(parse_dump(path, sitekeys), sitekeys)
+
+
+def parse_dump(path, sitekeys):
+    """The features read directly from the dump lines, and what the derived
+    features need from it: (feats, site_map, glob_opts, bel_cfgs,
+    bank_stds).  (designdata caches this per design, keyed by the source
+    of this function and of everything it uses: keep derived features in
+    derive().)"""
     feats = collections.defaultdict(set)
     site_map = {}
     glob_opts = {}
@@ -456,6 +478,13 @@ def tile_features(path, sitekeys):
                 value = ' '.join(p[4:])
                 feats[tile].update(cfg_features(f'{key}.{p[2]}', p[3], value))
                 bel_cfgs[(tile, f'{key}.{p[2]}')][p[3]] = value
+    return feats, site_map, glob_opts, bel_cfgs, bank_stds
+
+
+def derive(state, sitekeys):
+    """Derived features added to parse_dump's state (modified in place);
+    returns {tile: set(features)}."""
+    feats, site_map, glob_opts, bel_cfgs, bank_stds = state
     # Bank VCCO (bank wide settings such as the 7-series STEPDOWN depend on
     # it rather than on single standards).
     global _VCCO
