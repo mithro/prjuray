@@ -292,12 +292,30 @@ def frame_columns(dframes):
     return cols
 
 
-def activity(die, dframes, design_root, maxd=192):
+_ACT = {}
+
+
+def _design_activity(d):
+    """Worker: (bits differing from the baseline, tiles in use) of a
+    design (the SiteKeys / DieFrames of the parent, forked)."""
+    dframes, sk = _ACT['dframes'], _ACT['sk']
+    b = DD.load_bits(dframes, d)
+    diff = np.setxor1d(b, dframes.base, assume_unique=True)
+    # Design wide pseudo features (unused pad pulls) do not mean the tile
+    # is used.
+    used = [t for t, fs in DD.load_features(d, sk).items()
+            if any('.UNUSEDPIN=' not in f for f in fs)]
+    return diff, used
+
+
+def activity(die, dframes, design_root, maxd=192, jobs=1):
     """Design activity: (act, use, number of designs).
     act[frame index, bit offset, word] = mask of the designs in which that
     bit differs from the baseline; use[tile] = mask of the designs using the
     tile.  Up to maxd designs, newest tags first (later tags use larger
-    parts of the die and better generators)."""
+    parts of the die and better generators).  jobs: designs loaded in
+    parallel (their features are the cold cost: large dies ~10-20 s each
+    without the feature cache)."""
     sk = featlib.SiteKeys(die.tiles_tsv)
     roots = design_root.split(',') if isinstance(design_root, str) \
         else list(design_root)
@@ -311,19 +329,86 @@ def activity(die, dframes, design_root, maxd=192):
                    dtype=np.uint64)
     flat = act.reshape(-1, NW)
     use = collections.defaultdict(int)
-    for i, d in enumerate(dirs):
-        b = DD.load_bits(dframes, d)
-        diff = np.setxor1d(b, dframes.base, assume_unique=True)
+    _ACT.update(dframes=dframes, sk=sk)
+    if jobs > 1 and D > 1:
+        from concurrent.futures import ProcessPoolExecutor
+        ex = ProcessPoolExecutor(min(jobs, D))
+        results = ex.map(_design_activity, dirs)
+    else:
+        ex = None
+        results = map(_design_activity, dirs)
+    for i, (diff, used) in enumerate(results):
         flat[diff, i // 64] |= np.uint64(1 << (i % 64))
-        for t, fs in DD.load_features(d, sk).items():
-            # Design wide pseudo features (unused pad pulls) do not mean the
-            # tile is used.
-            if any('.UNUSEDPIN=' not in f for f in fs):
-                use[t] |= 1 << i
+        for t in used:
+            use[t] |= 1 << i
+    if ex:
+        ex.shutdown()
     return act, use, D
 
 
-def collect(die, design_root, verbose=False):
+class _WindowScorer:
+    """Similarity between tile usage masks and frame column windows: the
+    better of the whole window change pattern and the best single frame
+    change pattern (tiles sharing a column use different frames), as the
+    Jaccard index of the design bit masks (numpy popcounts over the uint64
+    words of act).  The change patterns of the columns at the current
+    window rows (lo, n) are cached (tiles come grouped by window)."""
+
+    CHUNK = 1 << 24  # tile x row x word elements per step
+
+    def __init__(self, act):
+        self.act = act
+        self.NW = act.shape[2]
+        self.rows = None
+        self.cache = {}
+
+    def _col(self, first, nfr, lo, n):
+        if self.rows != (lo, n):
+            self.cache.clear()
+            self.rows = (lo, n)
+        m = self.cache.get((first, nfr))
+        if m is None:
+            masks = np.bitwise_or.reduce(
+                self.act[first:first + nfr, lo:lo + n], axis=1)
+            # distinct rows (1-D unique of the rows as opaque values)
+            v = np.ascontiguousarray(masks).view(
+                np.dtype((np.void, 8 * self.NW))).ravel()
+            m = self.cache[(first, nfr)] = np.unique(v).view(
+                np.uint64).reshape(-1, self.NW)
+        return m
+
+    def _to_words(self, u):
+        return [(u >> (64 * k)) & 0xFFFFFFFFFFFFFFFF for k in range(self.NW)]
+
+    @staticmethod
+    def _jaccard(U, R, out):
+        """out[t, r] = |U[t] & R[r]| / |U[t] | R[r]| (U rows non zero)."""
+        step = max(1, _WindowScorer.CHUNK // max(1, R.shape[0] * R.shape[1]))
+        for a in range(0, len(U), step):
+            u = U[a:a + step, None, :]
+            inter = np.bitwise_count(u & R[None]).sum(axis=2, dtype=np.int64)
+            union = np.bitwise_count(u | R[None]).sum(axis=2, dtype=np.int64)
+            out[a:a + step] = inter / union
+
+    def scores(self, us, lo, n, clist):
+        """[len(us) x len(clist)] scores of the usage masks us (ints)
+        against the columns clist ((col, first frame, frames))."""
+        U = np.array([self._to_words(u) for u in us], dtype=np.uint64)
+        pats = [self._col(first, nfr, lo, n) for _, first, nfr in clist]
+        R = np.concatenate(pats)
+        starts = np.cumsum([0] + [len(p) for p in pats])[:-1]
+        J = np.empty((len(U), len(R)))
+        self._jaccard(U, R, J)
+        best = np.maximum.reduceat(J, starts, axis=1)
+        W = np.array([np.bitwise_or.reduce(p, axis=0) for p in pats],
+                     dtype=np.uint64)
+        JW = np.empty((len(U), len(W)))
+        self._jaccard(U, W, JW)
+        # all zero patterns score 0 (as a skipped pattern did)
+        return np.maximum(np.maximum(best, JW), 0.0)
+
+
+def collect(die, design_root, verbose=False, jobs=1):
     """Design activity evidence for the frame row / frame column learners.
 
     Returns a dict:
@@ -336,50 +421,12 @@ def collect(die, design_root, verbose=False):
     """
     grid = Grid(die)
     dframes = DD.DieFrames(die)
-    act, use, D = activity(die, dframes, design_root)
+    act, use, D = activity(die, dframes, design_root, jobs=jobs)
     NW = act.shape[2]
-
-    def to_int(words):
-        v = 0
-        for k, w in enumerate(words):
-            v |= int(w) << (64 * k)
-        return v
 
     cols = frame_columns(dframes)
     block0 = {k: v for k, v in cols.items() if k[0] == 0}
-
-    # The per frame change patterns of the windows at the current rows
-    # (lo, n), cached per frame column: the tiles are visited sorted by
-    # window, so consecutive tiles share them (big dies: hours without).
-    mask_cache = {}
-    cache_rows = [None]
-
-    def window_masks(first, nfr, lo, n):
-        if cache_rows[0] != (lo, n):
-            mask_cache.clear()
-            cache_rows[0] = (lo, n)
-        m = mask_cache.get((first, nfr))
-        if m is None:
-            masks = np.bitwise_or.reduce(act[first:first + nfr, lo:lo + n],
-                                         axis=1)
-            m = mask_cache[(first, nfr)] = set(to_int(x) for x in masks)
-        return m
-
-    def col_score(u, col, lo, n):
-        """Similarity between a tile usage mask and a column window: the
-        better of the whole window change pattern and the best single frame
-        change pattern (tiles sharing a column use different frames)."""
-        _, first, nfr = col
-        best = 0.0
-        whole = 0
-        for m in window_masks(first, nfr, lo, n):
-            whole |= m
-            if m:
-                best = max(best, bin(u & m).count('1') / bin(u | m).count('1'))
-        if whole:
-            best = max(best,
-                       bin(u & whole).count('1') / bin(u | whole).count('1'))
-        return best
+    scorer = _WindowScorer(act)
 
     # Candidate (tile, window) pairs from used tiles: need a usage pattern
     # that is informative (used in some but not almost all designs).
@@ -393,52 +440,84 @@ def collect(die, design_root, verbose=False):
             continue
         tiles_used.append((t, u, w))
     tiles_used.sort(key=lambda x: (x[2][1], x[2][2], x[0]))
+    # Tiles by window rows (lo, n), in order: the column scores of a group
+    # are computed together (the column change patterns at those rows once).
+    groups = collections.OrderedDict()
+    for i, (t, u, (cr, lo, n)) in enumerate(tiles_used):
+        groups.setdefault((lo, n), []).append(i)
     # 1. Frame row of each clock region row: vote with sparse used tiles.
+    b0keys = list(block0)
+    b0cols = [col for key in b0keys for col in block0[key]]
+    b0start = np.cumsum([0] + [len(block0[k]) for k in b0keys])[:-1]
     rowvote = collections.defaultdict(collections.Counter)
-    for t, u, (cr, lo, n) in tiles_used:
-        if bin(u).count('1') > 0.5 * D:
+    for (lo, n), idx in groups.items():
+        idx = [i for i in idx if bin(tiles_used[i][1]).count('1') <= 0.5 * D]
+        if not idx:
             continue
-        # Best score per frame row; vote only when one row clearly wins.
-        per_row = {}
-        for key, clist in block0.items():
-            per_row[key] = max(col_score(u, col, lo, n) for col in clist)
-        ranked = sorted(per_row.items(), key=lambda kv: -kv[1])
-        if not ranked or ranked[0][1] <= 0.9:
-            continue
-        if len(ranked) > 1 and ranked[0][1] - ranked[1][1] < 0.05:
-            continue
-        rowvote[cr][ranked[0][0]] += 1
+        S = scorer.scores([tiles_used[i][1] for i in idx], lo, n, b0cols)
+        best = np.maximum.reduceat(S, b0start, axis=1)
+        for j, i in enumerate(idx):
+            cr = tiles_used[i][2][0]
+            # Best score per frame row; vote only when one row clearly wins.
+            per_row = dict(zip(b0keys, best[j].tolist()))
+            ranked = sorted(per_row.items(), key=lambda kv: -kv[1])
+            if not ranked or ranked[0][1] <= 0.9:
+                continue
+            if len(ranked) > 1 and ranked[0][1] - ranked[1][1] < 0.05:
+                continue
+            rowvote[cr][ranked[0][0]] += 1
     crmap = {cr: v.most_common(1)[0][0] for cr, v in rowvote.items()}
     # 2. Score every (grid column, frame column) pair of each clock region
     # row.
     scores = {}
-    for t, u, (cr, lo, n) in tiles_used:
-        key = crmap.get(cr)
-        if key is None:
-            continue
-        clist = block0[key]
-        gx = grid.tiles[t]['gx']
-        v = np.array([col_score(u, col, lo, n) for col in clist])
-        row = scores.setdefault(cr, {})
-        acc = row.setdefault(gx, np.zeros(len(clist)))
-        acc += (v >= 0.95) * v
+    for (lo, n), idx in groups.items():
+        bykey = collections.OrderedDict()
+        for i in idx:
+            key = crmap.get(tiles_used[i][2][0])
+            if key is not None:
+                bykey.setdefault(key, []).append(i)
+        vec = {}
+        for key, ii in bykey.items():
+            S = scorer.scores([tiles_used[i][1] for i in ii], lo, n,
+                              block0[key])
+            vec.update(zip(ii, S))
+        for i in idx:  # in tiles_used order, as before
+            if i not in vec:
+                continue
+            t, _, (cr, _, _) = tiles_used[i]
+            gx = grid.tiles[t]['gx']
+            v = vec[i]
+            row = scores.setdefault(cr, {})
+            acc = row.setdefault(gx, np.zeros(len(v)))
+            acc += (v >= 0.95) * v
     # 3. Block RAM content columns (block type 1), same scoring.
     votes1 = collections.defaultdict(collections.Counter)
-    for t, u, (cr, lo, n) in tiles_used:
-        tt = grid.tiles[t]
-        if not ('RAMB36' in tt['sites'] or 'RAMBFIFO36' in tt['sites']):
-            continue
-        key = crmap.get(cr)
-        if key is None:
-            continue
-        clist = cols.get((1, key[1], key[2]), [])
-        best = None
-        for col in clist:
-            sc = col_score(u, col, lo, n)
-            if best is None or sc > best[0]:
-                best = (sc, col[0])
-        if best and best[0] > 0.9:
-            votes1[(cr, tt['gx'])][best[1]] += 1
+    for (lo, n), idx in groups.items():
+        bykey = collections.OrderedDict()
+        for i in idx:
+            t, _, (cr, _, _) = tiles_used[i]
+            tt = grid.tiles[t]
+            if not ('RAMB36' in tt['sites'] or 'RAMBFIFO36' in tt['sites']):
+                continue
+            key = crmap.get(cr)
+            if key is None:
+                continue
+            bykey.setdefault(key, []).append(i)
+        vec = {}
+        for key, ii in bykey.items():
+            clist = cols.get((1, key[1], key[2]), [])
+            if not clist:
+                continue
+            S = scorer.scores([tiles_used[i][1] for i in ii], lo, n, clist)
+            vec.update((i, (S[j], clist)) for j, i in enumerate(ii))
+        for i in idx:  # in tiles_used order, as before
+            if i not in vec:
+                continue
+            v, clist = vec[i]
+            t, _, (cr, _, _) = tiles_used[i]
+            k = int(np.argmax(v))  # the first best, as before
+            if v[k] > 0.9:
+                votes1[(cr, grid.tiles[t]['gx'])][clist[k][0]] += 1
     if verbose:
         print('frame rows', crmap)
     return dict(crmap=crmap, scores=scores, bram1=votes1, ndesigns=D)
@@ -928,6 +1007,10 @@ def main():
                     'windows from a bit database built with it')
     ap.add_argument('--probe-span', type=int, default=None)
     ap.add_argument('--out', required=True)
+    ap.add_argument('--jobs', type=int, default=1,
+                    help='designs loaded in parallel for --designs (each '
+                    'worker holds one design\'s features: large dies '
+                    '~1-2 GB)')
     args = ap.parse_args()
     die = dieslib.load()[args.die]
     grid = Grid(die)
@@ -946,7 +1029,7 @@ def main():
     dframes = DD.DieFrames(die)
     cols = frame_columns(dframes)
     if args.designs:
-        ev = collect(die, args.designs, True)
+        ev = collect(die, args.designs, True, args.jobs)
         if args.evidence:
             save_evidence(ev, args.evidence)
             ev = load_evidence(args.evidence, cols)
