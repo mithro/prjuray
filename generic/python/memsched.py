@@ -18,12 +18,51 @@ worker after an item of that key (a worker's peak includes the items it
 ran before: an overestimate, never an underestimate); record(result):
 only results for which it is true count (e.g. real work, not cache
 hits).
+
+The estimate corrects itself while items run: every POLL seconds the
+pool's worker processes are read from /proc (VmHWM, their peak so far, and
+VmRSS): a worker above the estimate raises it at once (a known peak from
+an earlier run can be stale, e.g. after new features made the samples
+larger: rebuild_all6 US, known 2.03 GiB, OOM at 30 GiB with a 22 GiB
+budget).  A new item is also only started while the workers' current
+resident memory plus one estimated peak fits the budget.  If the workers
+still exceed the budget (items growing faster than the estimate caught
+up), the pool is killed and its running items start again with the
+corrected estimate: fn must be restartable (mkdb's sample cache writes a
+temporary file and renames it; tilegrid's design activity is pure).
 """
+import os
 import resource
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 
 MARGIN = 1.25
 FLOOR = 2 << 30
+POLL = 1.0
+
+
+def _proc_mem(pid):
+    """(VmHWM, VmRSS) bytes of a process, (0, 0) when gone."""
+    hwm = rss = 0
+    try:
+        with open(f'/proc/{pid}/status') as f:
+            for line in f:
+                if line.startswith('VmHWM:'):
+                    hwm = int(line.split()[1]) * 1024
+                elif line.startswith('VmRSS:'):
+                    rss = int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return hwm, rss
+
+
+def _workers_mem(ex):
+    """(largest VmHWM, total VmRSS) over the pool's worker processes."""
+    hwm = rss = 0
+    for pid in list(getattr(ex, '_processes', None) or ()):
+        h, r = _proc_mem(pid)
+        hwm = max(hwm, h)
+        rss += r
+    return hwm, rss
 
 
 def _call(args):
@@ -55,14 +94,56 @@ def budget_map(fn, items, jobs, budget_gib=None, floor=FLOOR, label='',
     elif budget_gib:
         log(f'# {label}: {budget_gib} GiB budget, one at a time until a '
             'worker peak is measured')
-    with ProcessPoolExecutor(max(1, min(jobs, len(items)))) as ex:
-        futs = {}
-        nxt = 0
-        while nxt < len(items) or futs:
-            while nxt < len(items) and len(futs) < lim:
-                futs[ex.submit(_call, (fn, items[nxt]))] = nxt
-                nxt += 1
-            done, _ = wait(futs, return_when=FIRST_COMPLETED)
+    budget = (budget_gib or 0) * 2**30
+    todo = list(range(len(items)))  # item indices not yet started, in order
+    todo.reverse()
+    ex = None
+    try:
+        while todo or ex is not None:
+            if ex is None:
+                ex = ProcessPoolExecutor(max(1, min(jobs, len(items))))
+                futs = {}
+            rss = 0
+            if budget:
+                hwm, rss = _workers_mem(ex)
+                if hwm > peak:
+                    peak = hwm
+                    measured = True
+                    new = limit()
+                    if new != lim:
+                        log(f'# {label}: running worker at '
+                            f'{hwm / 2**30:.2f} GiB: {new} at once')
+                        lim = new
+                if rss > budget and len(futs) > 1:
+                    # Over the budget (the estimate was too low): stop the
+                    # pool and start its items again with the corrected
+                    # estimate (items must be restartable).
+                    peak = max(peak, rss // len(futs))
+                    lim = limit()
+                    log(f'# {label}: workers at {rss / 2**30:.2f} GiB over '
+                        f'the budget: restarting {len(futs)} items, '
+                        f'{lim} at once')
+                    for pid in list(getattr(ex, '_processes', None) or ()):
+                        try:
+                            os.kill(pid, 9)
+                        except OSError:
+                            pass
+                    ex.shutdown(wait=True, cancel_futures=True)
+                    todo.extend(sorted(futs.values(), reverse=True))
+                    ex = None
+                    continue
+            while todo and len(futs) < lim and \
+                    (not budget or not futs or
+                     rss + peak * MARGIN <= budget):
+                i = todo.pop()
+                futs[ex.submit(_call, (fn, items[i]))] = i
+                rss += peak * MARGIN
+            if not futs:
+                ex.shutdown(wait=True)
+                ex = None
+                continue
+            done, _ = wait(futs, timeout=POLL if budget else None,
+                           return_when=FIRST_COMPLETED)
             for f in done:
                 i = futs.pop(f)
                 r, p = f.result()
@@ -79,3 +160,6 @@ def budget_map(fn, items, jobs, budget_gib=None, floor=FLOOR, label='',
                             f'{new} at once')
                         lim = new
                 yield i, r
+    finally:
+        if ex is not None:
+            ex.shutdown(wait=True, cancel_futures=True)
