@@ -500,13 +500,26 @@ def tile_features(path, sitekeys):
     # SDP with READ_WIDTH_A=36 -> 18, other SDP -> 0 whatever
     # READ_WIDTH_B).
     for (tile, prefix), cfgs in bel_cfgs.items():
-        if not prefix.endswith(('.RAMB18E1', '.RAMB36E1')):
+        bel = prefix.rsplit('.', 1)[-1]
+        if bel not in ('RAMB18E1', 'RAMB36E1', 'FIFO18E1', 'FIFO36E1'):
             continue
-        full = '72' if prefix.endswith('36E1') else '36'
+        full = '72' if '36' in bel else '36'
         half = '36' if full == '72' else '18'
-        eff = {k: cfgs.get(k) for k in ('READ_WIDTH_A', 'READ_WIDTH_B',
-                                        'WRITE_WIDTH_A', 'WRITE_WIDTH_B')}
-        if cfgs.get('RAM_MODE') == 'SDP':
+        if bel.startswith('FIFO'):
+            # A FIFO reads on port A and writes on port B, DATA_WIDTH wide
+            # (the full width: simple dual port).
+            dw = cfgs.get('DATA_WIDTH')
+            if dw is None:
+                continue
+            eff = {'READ_WIDTH_A': dw, 'WRITE_WIDTH_B': dw,
+                   'READ_WIDTH_B': '0', 'WRITE_WIDTH_A': '0'}
+            sdp = True
+        else:
+            eff = {k: cfgs.get(k) for k in ('READ_WIDTH_A', 'READ_WIDTH_B',
+                                            'WRITE_WIDTH_A', 'WRITE_WIDTH_B')}
+            sdp = cfgs.get('RAM_MODE') == 'SDP'
+        r = w = False
+        if sdp:
             r, w = eff['READ_WIDTH_A'] == full, eff['WRITE_WIDTH_B'] == full
             eff['READ_WIDTH_B'] = half if r else '0'
             eff['WRITE_WIDTH_A'] = half if w else '0'
@@ -514,6 +527,8 @@ def tile_features(path, sitekeys):
                 eff['READ_WIDTH_A'] = half
             if w:
                 eff['WRITE_WIDTH_B'] = half
+        feats[tile].add(f'{prefix}.EFF_SDP_READ_FULL={int(r)}')
+        feats[tile].add(f'{prefix}.EFF_SDP_WRITE_FULL={int(w)}')
         for k, v in eff.items():
             if v is None:
                 continue
