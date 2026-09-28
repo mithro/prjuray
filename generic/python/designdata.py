@@ -87,7 +87,7 @@ def load_bits(dframes, d):
 #   tile_features).  Its code checksum covers only parse_dump and what it
 #   uses (code_digest), so an edit of the derived features (derive() and
 #   its helpers) reuses it and only reruns derive().
-FEATURE_CACHE_VERSION = 2  # 2: joined feature strings, lz4
+FEATURE_CACHE_VERSION = 3  # 2: joined feature strings, lz4; 3: sorted
 _CODE = {}
 
 
@@ -203,9 +203,9 @@ except ImportError:  # zlib instead (slower)
 
 
 def _pack_feats(feats):
-    """{tile: set} -> {tile: '\\n'.join} (pickling millions of small
-    strings is slow)."""
-    return {t: '\n'.join(fs) for t, fs in feats.items()}
+    """{tile: set} -> {tile: '\\n'.join(sorted)} (pickling millions of small
+    strings is slow; sorted: a canonical form, see load_features_joined)."""
+    return {t: '\n'.join(sorted(fs)) for t, fs in feats.items()}
 
 
 def _unpack_feats(packed):
@@ -256,18 +256,31 @@ def _save(path, stamp, obj):
 
 def load_features(d, sitekeys):
     """{tile: set(features)} of a design (cached, see above)."""
+    packed, feats = _features(d, sitekeys)
+    return feats if feats is not None else _unpack_feats(packed)
+
+
+def load_features_joined(d, sitekeys):
+    """{tile: '\\n'.join(sorted features)} of a design (cached; a canonical
+    form of load_features, cheap to compare and hash)."""
+    packed, feats = _features(d, sitekeys)
+    return packed if packed is not None else _pack_feats(feats)
+
+
+def _features(d, sitekeys):
+    """(joined features or None, feature sets or None) of a design."""
     src = os.path.join(d, 'design.features.gz')
     path = None
     if os.environ.get('URAY_FEATURE_CACHE', '1') != '0':
         path = feature_cache_path(d, sitekeys)
     if path is None:
-        return featlib.tile_features(src, sitekeys)
+        return None, featlib.tile_features(src, sitekeys)
     code = _feature_code_stamp(sitekeys)
     st = os.stat(src)
     stamp = (FEATURE_CACHE_VERSION, code[:2], st.st_mtime_ns, st.st_size)
     packed = _load(path, stamp)
     if packed is not None:
-        return _unpack_feats(packed)
+        return packed, None
     # The parsed dump (reused across edits of the derived features).
     ppath = _cache_path(d, 'parse', code[2])
     pstamp = (FEATURE_CACHE_VERSION, code[2:], st.st_mtime_ns, st.st_size)
@@ -278,5 +291,6 @@ def load_features(d, sitekeys):
     else:
         state = (_unpack_feats(state[0]),) + tuple(state[1:])
     feats = featlib.derive(state, sitekeys)
-    _save(path, stamp, _pack_feats(feats))
-    return feats
+    packed = _pack_feats(feats)
+    _save(path, stamp, packed)
+    return packed, None

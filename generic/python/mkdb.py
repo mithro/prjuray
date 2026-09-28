@@ -145,6 +145,25 @@ class Collector:
                 yield self.regions[i][1], k, fs, code[a:b]
 
 
+    def sample_joined(self, design_dir, empty_keep=0.2, rng=None):
+        """sample_codes() with each tile's features as one string (sorted,
+        '\\n' separated; '' when unused), see load_features_joined."""
+        ids = DD.load_bits(self.df, design_dir)
+        _, reg, code = self.rmap.pairs(ids)
+        cut = (np.flatnonzero(reg[1:] != reg[:-1]) + 1).tolist()
+        starts = [0] + cut
+        sl = dict(zip(reg[starts].tolist() if len(reg) else [],
+                      zip(starts, cut + [len(reg)])))
+        feats = DD.load_features_joined(design_dir, self.sk)
+        for tile, rlist in self.tile_regions.items():
+            fs = feats.get(tile, '')
+            for k, i in enumerate(rlist):
+                if not fs and rng is not None and rng.random() > empty_keep:
+                    continue
+                a, b = sl.get(i, (0, 0))
+                yield self.regions[i][1], k, fs, code[a:b]
+
+
 def _packed(rows, S, n):
     """Bit-packed (n x ceil(S/64) uint64) matrix from rows: a list, per
     sample s, of the row indices set in column s (bit s % 64 of word
@@ -607,6 +626,61 @@ def _encode_chunk(used, empty, names):
                          1)
 
 
+def _encode_chunk_joined(used, empty, names):
+    """_encode_chunk with each sample's features as a sorted '\\n' joined
+    string: the same bytes (sorted strings give ascending vocabulary
+    indices), without per sample sorting."""
+    flat = '\n'.join(s for s, _ in used).split('\n') if used else []
+    fv = sorted(set(flat))
+    fidx = dict(zip(fv, range(len(fv))))
+    fid = np.fromiter(map(fidx.__getitem__, flat), dtype=_ids_dtype(fv),
+                      count=len(flat))
+    flen = np.array([s.count('\n') + 1 for s, _ in used], dtype=np.int32)
+    codes = [c for _, c in used] + empty
+    allc = np.concatenate(codes) if codes else np.zeros(0, np.int64)
+    uc = np.unique(allc)
+    bid = np.searchsorted(uc, allc).astype(_ids_dtype(uc))
+    blen = np.array([len(c) for c in codes], dtype=np.int32)
+    data = (fv, names(uc), fid, flen, bid, blen, len(used))
+    return zlib.compress(pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL),
+                         1)
+
+
+_ENC_ID = []
+
+
+def _encoding_id():
+    """Checksum of everything that turns a chunk's content into bytes: the
+    encoder and the bit code layout / names (regionmap), CACHE_VERSION."""
+    if not _ENC_ID:
+        here = os.path.dirname(os.path.abspath(__file__))
+        _ENC_ID.append(repr((
+            CACHE_VERSION,
+            DD.code_digest(os.path.join(here, 'mkdb.py'),
+                           ['_encode_chunk_joined', '_ids_dtype']),
+            DD.code_digest(os.path.join(here, 'regionmap.py'),
+                           ['code_name', 'name_code', 'CODE_M',
+                            'RegionMap']))).encode())
+    return _ENC_ID[0]
+
+
+def _content_digest(used, empty):
+    """Digest of a chunk's content: the samples' joined features and bit
+    codes, in order, and _encoding_id(): equal digests give equal bytes."""
+    import hashlib
+    h = hashlib.blake2b(_encoding_id(), digest_size=16)
+    for s, c in used:
+        h.update(s.encode())
+        h.update(b'\0')
+        h.update(np.ascontiguousarray(c, dtype=np.int64).tobytes())
+        h.update(b'\1')
+    h.update(b'\2')
+    for c in empty:
+        h.update(np.ascontiguousarray(c, dtype=np.int64).tobytes())
+        h.update(b'\1')
+    return h.hexdigest()
+
+
 def _read_raw(path, off, n):
     with open(path, 'rb') as f:
         f.seek(off)
@@ -671,18 +745,20 @@ def _cache_one(item):
     import random
     arch, dn, d, path = item
     stamp = _cache_stamp(arch, dn, d)
+    old = {}  # stale file: chunks whose content did not change are reused
     if os.path.exists(path):
         try:
             idx = _read_index(path)
             if idx['stamp'] == stamp:
                 return [(k, v[2], v[3], v[4]) for k, v in idx['keys']]
+            old = {k: v for k, v in idx['keys'] if len(v) > 5}
         except (OSError, ValueError, EOFError, pickle.UnpicklingError,
                 KeyError, IndexError):
             pass
     _MISS[0] = True
     col = _collector(arch, dn)
     chunks = {}
-    for tt, k, fs, codes in col.sample_codes(
+    for tt, k, fs, codes in col.sample_joined(
             d, rng=random.Random(design_seed(d))):
         c = chunks.setdefault((tt, k), ([], []))
         if fs:
@@ -692,12 +768,25 @@ def _cache_one(item):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = f'{path}.{os.getpid()}.tmp'
     keys = []
+    # (URAY_, not MKDB_: task digests include the MKDB_ settings)
+    reuse = os.environ.get('URAY_CHUNK_REUSE', '1') != '0'
     with open(tmp, 'wb') as f:
         for key, c in chunks.items():
-            data = _encode_chunk(*c, col.rmap.names)
+            cd = _content_digest(*c)
+            o = old.get(key)
+            data = None
+            if reuse and o is not None and o[5] == cd:
+                with open(path, 'rb') as of:
+                    of.seek(o[0])
+                    data = of.read(o[1])
+                if len(data) != o[1]:
+                    data = None
+            if data is None:
+                data = _encode_chunk_joined(*c, col.rmap.names)
             keys.append((key, (f.tell(), len(data), len(c[0]), len(c[1]),
                                hashlib.blake2b(data,
-                                               digest_size=16).hexdigest())))
+                                               digest_size=16).hexdigest(),
+                               cd)))
             f.write(data)
         off = f.tell()
         f.write(pickle.dumps({'stamp': stamp, 'keys': keys},
