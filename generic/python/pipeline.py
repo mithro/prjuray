@@ -6,6 +6,7 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 from concurrent.futures import ProcessPoolExecutor
 
 import dies as dieslib
@@ -22,7 +23,7 @@ def run(cmd, log):
 def evidence(args):
     """Design activity evidence of a die (and its activity only tile grid,
     for comparison)."""
-    die, arch, tags = args
+    die, arch, tags, jobs = args
     out = os.path.join(dieslib.DB, arch, die)
     os.makedirs(out, exist_ok=True)
     roots = ','.join(
@@ -32,7 +33,7 @@ def evidence(args):
         os.path.join(HERE, 'tilegrid.py'), '--die', die, '--designs', roots,
         '--evidence',
         os.path.join(out, 'evidence.json'), '--out',
-        os.path.join(out, 'tilegrid_activity.json')
+        os.path.join(out, 'tilegrid_activity.json'), '--jobs', str(jobs)
     ], os.path.join(out, 'evidence.log'))
 
 
@@ -142,6 +143,17 @@ def main():
                     'check the designs against it (consistency.py) and leave '
                     'the suspects out of the new database')
     ap.add_argument('--jobs', type=int, default=24)
+    ap.add_argument('--sample-jobs', type=int, default=None,
+                    help='mkdb per design sample cache workers (mkdb '
+                    '--sample-jobs; default --jobs).  Up to ~1.3 GiB per '
+                    'worker (Series7 xc7k160t), more on large US(+) dies: '
+                    'use --mem-budget with it')
+    ap.add_argument('--mem-budget', type=float, default=None,
+                    help='GiB for mkdb\'s sample phase (mkdb '
+                    '--sample-mem-budget): at most budget / (1.25 x the '
+                    'largest measured worker peak, >= 2 GiB) designs at '
+                    'once; set it below the vrun.sh cap (the phase 2 '
+                    'tasks are sized by --jobs as before)')
     args = ap.parse_args()
     alldies = dieslib.load()
     dlist = args.dies.split(',')
@@ -151,7 +163,11 @@ def main():
     logdir = os.path.join(dieslib.BUILD, 'logs')
     if not args.skip_tilegrid:
         with ProcessPoolExecutor(min(len(dlist), 8)) as ex:
-            for die, rc in ex.map(evidence, [(d, arch, tags) for d in dlist]):
+            # designs loaded in parallel per die (1-2 GB per worker on
+            # large dies)
+            ej = max(1, min(4, args.jobs // min(len(dlist), 8)))
+            for die, rc in ex.map(evidence, [(d, arch, tags, ej)
+                                             for d in dlist]):
                 print('evidence', die, 'rc', rc, flush=True)
         # Frame column alignment over every die of the architecture with
         # evidence (the kind tables are shared).
@@ -185,14 +201,38 @@ def main():
         path = consistency(dlist, arch, tags, logdir)
         if path:
             exclude = ['--exclude', path]
+    sj = []
+    if args.sample_jobs:
+        with open(os.path.join(HERE, 'mkdb.py')) as f:
+            if '--sample-jobs' not in f.read():
+                sys.exit('mkdb.py has no --sample-jobs')
+        sj = ['--sample-jobs', str(args.sample_jobs)]
+    if args.mem_budget:
+        sj += ['--sample-mem-budget', str(args.mem_budget)]
+    t0 = time.time()
+    mlog = os.path.join(logdir, f'mkdb_{arch}.log')
+    print(f'[{time.strftime("%H:%M:%S")}] mkdb started (progress in '
+          f'{mlog})', flush=True)
     rc = run([
         sys.executable,
         os.path.join(HERE, 'mkdb.py'), '--arch', arch, '--dies',
         args.dies, '--tag', args.tags, '--jobs',
         str(args.jobs)
-    ] + exclude, os.path.join(logdir, f'mkdb_{arch}.log'))
+    ] + sj + exclude, mlog)
+    print(f'[{time.strftime("%H:%M:%S")}] mkdb {time.time() - t0:.0f} s',
+          flush=True)
     print('build_db rc', rc, flush=True)
-    # Checks of all dies in parallel (each checks its designs in parallel).
+    # Checks of all dies in parallel, each checking its designs in
+    # parallel with a share of --jobs proportional to its size (the tile
+    # grid's size: bits per design), so that the big dies do not finish
+    # last with one job.
+    size = {d: os.path.getsize(os.path.join(dieslib.DB, arch, d,
+                                            'tilegrid.json'))
+            for d in dlist}
+    cjobs = {d: max(1, min(20, round(args.jobs * size[d] /
+                                     sum(size.values()))))
+             for d in dlist}
+
     def check(d):
         roots = ','.join(
             os.path.join(dieslib.BUILD, 'designs', d, t)
@@ -201,13 +241,17 @@ def main():
         run([
             sys.executable,
             os.path.join(HERE, 'check.py'), '--die', d, '--designs', roots,
-            '--max', '20', '--jobs',
-            str(max(1, min(20, args.jobs // len(dlist))))
+            '--max', '20', '--jobs', str(cjobs[d])
         ], log)
         return log
     from concurrent.futures import ThreadPoolExecutor
+    t0 = time.time()
+    print(f'[{time.strftime("%H:%M:%S")}] checks started', flush=True)
     with ThreadPoolExecutor(len(dlist)) as ex:
         logs = list(ex.map(check, dlist))
+    print(f'[{time.strftime("%H:%M:%S")}] checks {time.time() - t0:.0f} s '
+          f'(jobs per die '
+          f'{" ".join(f"{d}:{cjobs[d]}" for d in dlist)})', flush=True)
     for d, log in zip(dlist, logs):
         tail = open(log).read().strip().split('\n')
         summary = [l for l in tail if not l.startswith('/')]

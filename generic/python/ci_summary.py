@@ -5,6 +5,7 @@
 
   ci_summary.py summarize <db dir> <check log> <evalpred log> > summary.txt
   ci_summary.py compare <golden summary> <summary> [n]
+  ci_summary.py prune <db dir>
 
 A summary is "key value" lines: the database (files, feature lines, set /
 clear / default bits and a content hash of the segbits / defaults files),
@@ -99,8 +100,32 @@ def load(path):
     return out
 
 
+def prune(dbdir):
+    """Removes database files of (tile type, region)s the last mkdb run
+    did not write (not in its summary.json)."""
+    import json
+    keys = json.load(open(os.path.join(dbdir, 'summary.json')))
+    want = set()
+    for key in keys:
+        tt, k = key.rsplit('.', 1)
+        want.add(tt.lower() + (f'.{k}' if k != '0' else ''))
+    n = 0
+    for p in glob.glob(os.path.join(dbdir, '*_*.*')):
+        name = os.path.basename(p)
+        m = re.match(r'(segbits|defaults|counts|unexplained)_(.*)\.(db|txt)$',
+                     name)
+        if m and not m.group(2).startswith('opt_') and m.group(2) not in want:
+            os.remove(p)
+            n += 1
+    if n:
+        print(f'ci: removed {n} stale database files')
+
+
 def main():
     cmd = sys.argv[1]
+    if cmd == 'prune':
+        prune(sys.argv[2])
+        return 0
     if cmd == 'summarize':
         s = {}
         s.update(db_stats(sys.argv[2]))

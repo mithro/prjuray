@@ -636,6 +636,33 @@ proc nl_fix_bufg_inv {} {
     }
 }
 
+# A clock region has only one path from general interconnect into the BUFG_PS
+# inputs (Place 30-4506 "Only one connection is available for BUFG_PS driven
+# by a non IO/Clock element in a clock region").  With CLOCK_DEDICATED_ROUTE
+# FALSE the placer lets more through and route_design then loops on the same
+# overlaps until the time limit (the --region designs, where PS8 is outside
+# the region and fabric drives every BUFG_PS).  Keep one such BUFG_PS per
+# clock region.
+proc nl_fix_bufg_ps {} {
+    set drop [list]
+    foreach c [get_cells -quiet -hierarchical -filter {REF_NAME == BUFG_PS}] {
+        set loc [get_property LOC $c]
+        if {$loc eq ""} continue
+        set drv [get_cells -quiet -of_objects [get_pins -quiet -leaf -filter {DIRECTION == OUT} -of_objects [get_nets -quiet -of_objects [get_pins -quiet -of_objects $c -filter {REF_PIN_NAME == I}]]]]
+        if {[llength $drv] == 1 && [get_property REF_NAME $drv] eq "PS8"} continue
+        set cr [get_property CLOCK_REGION [get_sites -quiet $loc]]
+        if {[info exists seen($cr)]} {
+            lappend drop [get_property NAME $c]
+        } else {
+            set seen($cr) 1
+        }
+    }
+    if {[llength $drop]} {
+        nl_log "BUFG_PS driven from fabric: keeping one per clock region"
+        nl_remove $drop
+    }
+}
+
 set nl_orphans [list]
 proc nl_finish {{relaxclk 0}} {
     nl_flush_nets
@@ -646,6 +673,7 @@ proc nl_finish {{relaxclk 0}} {
         nl_log "orphans [llength $nl_orphans]"
         nl_remove [lsort -unique $nl_orphans]
     }
+    nl_fix_bufg_ps
     if {$relaxclk} {
         catch {set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets -quiet -hierarchical]}
         # Except the outputs of clock generators / transceivers: routed

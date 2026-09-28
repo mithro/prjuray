@@ -20,6 +20,7 @@ import gzip
 import json
 import os
 import random
+import re
 import shutil
 import signal
 import socket
@@ -208,6 +209,60 @@ def install_cleanup():
         signal.signal(s, _on_signal)
 
 
+class StallWatch:
+    """Notices a router that no longer makes progress: `STALL_ITERS`
+    consecutive rip-up iterations reporting the same nonzero "Number of Nodes
+    with overlaps".  Over all kept logs no route_design call ever got out of
+    a plateau longer than 4 iterations, while the stuck ones (e.g. BUFG_PS
+    outputs to fabric pins in --region designs) repeat one count until the
+    design timeout, 30-40 min later.  route_design cannot be interrupted
+    (SIGINT segfaults Vivado), so the caller kills the run."""
+
+    STALL_ITERS = int(os.environ.get('NL_STALL_ITERS', 10))
+    PAT = re.compile(rb'Number of Nodes with overlaps = (\d+)|'
+                     rb'Command: route_design')
+
+    def __init__(self, path):
+        self.path = path
+        try:
+            self.pos = os.path.getsize(path)
+        except OSError:
+            self.pos = 0
+        self.rest = b''
+        self.last = None
+        self.run = 0
+
+    def stalled(self):
+        """Reads what the log grew by; True once the router is stuck."""
+        if not self.STALL_ITERS:
+            return False
+        try:
+            with open(self.path, 'rb') as f:
+                f.seek(self.pos)
+                data = f.read()
+        except OSError:
+            return False
+        self.pos += len(data)
+        data = self.rest + data
+        cut = data.rfind(b'\n') + 1
+        self.rest = data[cut:]
+        for m in self.PAT.finditer(data[:cut]):
+            n = m.group(1)
+            if n is None or n == b'0' or n != self.last:
+                self.run = 0
+            else:
+                self.run += 1
+                if self.run >= self.STALL_ITERS:
+                    return True
+            self.last = n
+        return False
+
+    def note(self, wdir):
+        with open(os.path.join(wdir, 'nl.log'), 'a') as f:
+            f.write(f'route stalled: overlaps {self.last.decode()} for '
+                    f'{self.run + 1} iterations, killed\n')
+
+
 def run_fresh(die, wdir, timeout, threads, budget):
     """One Vivado process for the design.  Returns (status, cpu seconds,
     peak resident bytes)."""
@@ -218,6 +273,7 @@ def run_fresh(die, wdir, timeout, threads, budget):
     t0 = time.time()
     peak = 0
     n = 0
+    watch = StallWatch(os.path.join(wdir, 'vivado.log'))
     while True:
         pid, status, ru = os.wait4(p.pid, os.WNOHANG)
         if pid:
@@ -230,15 +286,20 @@ def run_fresh(die, wdir, timeout, threads, budget):
             # ru_maxrss (KiB): the largest process of the tree.
             return 'done', ru.ru_utime + ru.ru_stime, max(
                 peak, ru.ru_maxrss * 1024)
-        if time.time() - t0 > timeout:
+        stall = False
+        n += 1
+        if n % 10 == 0:
+            peak = max(peak, tree_stats(p.pid)[1])
+            stall = watch.stalled()
+        if stall or time.time() - t0 > timeout:
             cpu = tree_cpu(p.pid)
             os.killpg(p.pid, signal.SIGKILL)
             os.wait4(p.pid, 0)
             _reaped(p.pid)
+            if stall:
+                watch.note(wdir)
+                return 'stall', cpu, peak
             return 'timeout', cpu, peak
-        n += 1
-        if n % 10 == 0:
-            peak = max(peak, tree_stats(p.pid)[1])
         time.sleep(1)
 
 
@@ -304,12 +365,17 @@ class Worker:
         except OSError:
             pass
         status = 'done'
+        watch = StallWatch(self.log)
         with self.cond:
             while self.done is None:
                 self.cond.wait(5)
                 peak = max(peak, tree_stats(self.p.pid)[1])
                 if time.time() - t0 > timeout:
                     status = 'timeout'
+                    break
+                if self.done is None and watch.stalled():
+                    watch.note(wdir)
+                    status = 'stall'
                     break
             if self.done == 'eof':
                 status = 'crash'
@@ -420,7 +486,7 @@ def run_one(die, seed, wdir, gen_args, timeout, threads, pool=None):
         else:
             vstatus, cpu, rss = run_fresh(die, wdir, timeout, threads,
                                           budget_of(die, gen_args))
-        status = vstatus if vstatus in ('timeout', 'crash') else \
+        status = vstatus if vstatus in ('timeout', 'crash', 'stall') else \
             postprocess(die, wdir)
     t1 = time.time()
     stats.update(end=t1, wall=t1 - t0, cpu=cpu, status=status,
@@ -428,6 +494,24 @@ def run_one(die, seed, wdir, gen_args, timeout, threads, pool=None):
     with open(os.path.join(wdir, 'run.stats'), 'w') as f:
         json.dump(stats, f)
     return seed, status
+
+
+def job_wall(workdir, die):
+    """Expected wall time of a design of a die: the median of the run.stats
+    of its earlier designs (all tags); dies without any sort first."""
+    import glob
+    w = []
+    for p in glob.glob(os.path.join(workdir, die, '*', 's*', 'run.stats')):
+        try:
+            v = json.load(open(p)).get('wall')
+        except (OSError, ValueError):
+            continue
+        if v:
+            w.append(v)
+    if not w:
+        return float('inf')
+    w.sort()
+    return w[len(w) // 2]
 
 
 def job_memory(workdir, die):
@@ -497,6 +581,12 @@ def main():
                     'process per design)')
     ap.add_argument('--workdir',
                     default=os.path.join(dieslib.BUILD, 'designs'))
+    ap.add_argument('--usable-at', type=int, default=None,
+                    help='write <workdir>/.rounds/<tag>.usable when all '
+                    'designs are started and at most this many still run '
+                    '(slots idle), so chained steps can start on the '
+                    'finished ones (default max(2, jobs // 10)); '
+                    '<tag>.done is written at the end')
     ap.add_argument('gen_args', nargs='*')
     args = ap.parse_args()
     install_cleanup()
@@ -515,17 +605,25 @@ def main():
                   f'{args.jobs}', flush=True)
     first, last = map(int, args.seeds.split(':'))
     jobs = [(die, s) for s in range(first, last + 1) for die in dlist]
+    # Longest expected designs first (a slow die's last seeds would
+    # otherwise start near the end of the round and set its length).
+    wall = {d.name: job_wall(args.workdir, d.name) for d in dlist}
+    jobs.sort(key=lambda j: -wall[j[0].name])
     pool = None
     if args.reuse > 1:
         logdir = os.path.join(args.workdir, '.workers')
         os.makedirs(logdir, exist_ok=True)
         pool = WorkerPool(args.reuse, args.threads, logdir)
     queue = JobQueue(jobs)
+    running = set()
+    rlock = threading.Lock()
 
     def job():
         j = queue.take()
         die, s = j
         wdir = os.path.join(args.workdir, die.name, args.tag, f's{s}')
+        with rlock:
+            running.add((die.name, s))
         try:
             return die.name, s, run_one(die, s, wdir, args.gen_args,
                                         args.timeout, args.threads,
@@ -533,12 +631,41 @@ def main():
         except Exception as e:  # keep going on post-processing errors
             return die.name, s, f'exception {e}'
         finally:
+            with rlock:
+                running.discard((die.name, s))
             if pool:
                 pool.done(queue.pending)
 
     t0 = time.time()
     done = 0
     counts = collections.Counter()
+    usable = False
+    usable_at = args.usable_at if args.usable_at is not None else \
+        max(2, args.jobs // 10)
+    rounds = os.path.join(args.workdir, '.rounds')
+
+    def write_marker(kind, ndone, still):
+        """<tag>.<kind> (JSON), written atomically."""
+        os.makedirs(rounds, exist_ok=True)
+        path = os.path.join(rounds, f'{args.tag}.{kind}')
+        tmp = f'{path}.{os.getpid()}.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(dict(time=time.time(), done=ndone, total=len(jobs),
+                           counts=dict(counts),
+                           dies=[d.name for d in dlist],
+                           running=[f'{d}/s{s}' for d, s in still]), f)
+        os.replace(tmp, path)
+        print(f'[{time.strftime("%H:%M:%S")}] round {args.tag} {kind}: '
+              f'{ndone}/{len(jobs)} done'
+              + (f', still running {" ".join(f"{d}/s{s}" for d, s in still)}'
+                 if still else ''), flush=True)
+
+    # a rerun of the tag starts without markers
+    for kind in ('usable', 'done'):
+        try:
+            os.remove(os.path.join(rounds, f'{args.tag}.{kind}'))
+        except FileNotFoundError:
+            pass
     try:
         with ThreadPoolExecutor(args.jobs) as ex:
             futs = [ex.submit(job) for _ in jobs]
@@ -553,6 +680,13 @@ def main():
                       f'eta {eta:.0f}s ({time.strftime("%H:%M", time.localtime(time.time() + eta))}) '
                       f'{dict(counts)}',
                       flush=True)
+                left = len(jobs) - done
+                if not usable and 0 < left <= usable_at and left < args.jobs:
+                    with rlock:
+                        still = sorted(running)
+                    write_marker('usable', done, still)
+                    usable = True
+        write_marker('done', done, [])
     finally:
         if pool:
             pool.close()

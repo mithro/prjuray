@@ -74,13 +74,14 @@ class RegionMap:
     def names(self, codes):
         """Relative bit names of codes (memoised)."""
         tab = self._names
-        out = []
-        for c in codes.tolist():
+        uniq, inv = np.unique(codes, return_inverse=True)
+        names = np.empty(len(uniq), dtype=object)
+        for i, c in enumerate(uniq.tolist()):
             s = tab.get(c)
             if s is None:
                 s = tab[c] = code_name(c)
-            out.append(s)
-        return out
+            names[i] = s
+        return names[inv.reshape(-1)].tolist()
 
     def owned(self, ids, pos=None):
         """Boolean mask: ids[i] lies in some region."""

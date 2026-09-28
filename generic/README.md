@@ -245,6 +245,31 @@ feature whose bits all match.  ECC bits (7-series word 50 bits 0-12,
 UltraScale words 60/61, UltraScale+ words 45/46) are frame ECC, recomputed
 from the frame contents, and not part of any tile.
 
+### Caches and fast turnaround
+
+* Feature cache: `designdata.load_features` keeps `tile_features()` of
+  every design in `<build>/cache/features/<die>/<tag>/<sN>.<code>.pkl`
+  (`<code>`: checksum of the feature code; stale files can be deleted any
+  time, `URAY_FEATURE_CACHE=0` disables it).  Only a change of the
+  feature code recomputes features; tile grid changes, `evalpred.py`,
+  `tilegrid.py` evidence and scratch trees reuse them.
+* Sample cache (`mkdb.py --cache`, default `<db>/<arch>/cache`): per
+  design and (tile type, region) the samples, vocabulary encoded, with a
+  content digest per chunk.  `--sample-jobs N` sizes its (light) worker
+  pool separately from `--jobs`.
+* Task reuse: `mkdb.py` records per (tile type, region) the digest of its
+  inputs (the selected samples' chunks, mkdb.py, `MKDB_*` settings) in
+  `<db>/<arch>/.mkdb_tasks/` and does not rerun a task whose inputs and
+  database files are unchanged (a feature code change touching one tile
+  type reruns that type only).
+* `generic/ci.sh [-u] [-t tilegrid.json] [die...]`: regression run in a
+  minute or two (xa7s15, xazu1eg, xcku025 configured): a single die
+  database from fixed tags with the current code, `check.py` and
+  `evalpred.py` on frozen hold-out designs, compared with the golden
+  summary in `<build>/ci/golden/<die>` (database content hash, check and
+  prediction totals, per tile type changes).  Exit 0: identical, 1:
+  changed, 2: failed; `-u` makes the results golden.
+
 ## Configuration registers and bitstream options
 
 Outside the configuration frames a bitstream is a sequence of type 1/2

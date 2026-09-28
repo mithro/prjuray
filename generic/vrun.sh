@@ -19,7 +19,7 @@ fi
 name=$1
 cap=$2
 shift 2
-unit="prjuray-${name}-$(date +%s)"
+unit="prjuray-${name}-$(date +%s)-$$"
 exec systemd-run --user --scope --quiet --slice=vivado.slice --unit="$unit" \
     -p MemoryMax="$cap" -p MemorySwapMax=0 -- \
     bash -c '

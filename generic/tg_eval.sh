@@ -7,7 +7,7 @@
 # Builds $URAY_BUILD/tilegrid_exp/dbeval/{inst_<die>,<variant>_<die>} (the
 # installed baseline is built once and reused), runs check.py on 20 designs
 # of the check tag with both (TG_CHECK_MEM / TG_CHECK_JOBS: check.py memory
-# cap and jobs, default 6G / 3) and prints the distinct undocumented bits and
+# cap and jobs, default 8G / 6: check.py peaks at ~3.7 GB with 3 jobs on xcku025) and prints the distinct undocumented bits and
 # the per tile type differences.  Defaults: train r1..r5, check r5.
 set -u
 variant=$1; die=$2; cand=$3; tags=${4:-r1,r2,r3,r4,r5}; ctag=${5:-r5}
@@ -27,8 +27,8 @@ one() {  # one <name> <tilegrid.json>
         { echo "mkdb $1 failed: $(tail -n 1 "$B/logs/tg_mkdb_$1.log")"; return 1; }
     # check.py exits 1 whenever there are undocumented bits: judge by its
     # summary line instead
-    URAY_DB=$E "$G/vrun.sh" "tg-check-$1" ${TG_CHECK_MEM:-6G} python3 "$G/python/check.py" --die "$die" \
-        --designs "$B/designs/$die/$ctag" --max 20 --jobs ${TG_CHECK_JOBS:-3} > "$E/check_$die.log.tmp" 2>&1
+    URAY_DB=$E "$G/vrun.sh" "tg-check-$1" ${TG_CHECK_MEM:-8G} python3 "$G/python/check.py" --die "$die" \
+        --designs "$B/designs/$die/$ctag" --max 20 --jobs ${TG_CHECK_JOBS:-6} > "$E/check_$die.log.tmp" 2>&1
     grep -q '^unowned total' "$E/check_$die.log.tmp" ||
         { echo "check $1 failed: $(tail -n 1 "$E/check_$die.log.tmp")"; return 1; }
     mv "$E/check_$die.log.tmp" "$E/check_$die.log"
