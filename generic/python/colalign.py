@@ -650,6 +650,40 @@ def edge_frames(dr, cr, full, table):
     return out
 
 
+def vertical_silent(dr, first, silent):
+    """A grid column of a silent kind placed in different frame columns in
+    different clock region rows (no activity decides) takes the lowest of
+    them (the highest for a *_LEFT kind) in every row where that frame
+    column is free (xc7a200t: the middle GTP quad columns took 74 / 35 in
+    the bottom half, 73 / 36 in the top half; prjxray: 73 / 36)."""
+    addrs = collections.defaultdict(dict)  # gx -> {cr: address}
+    kind_of = {}
+    for cr, full in first.items():
+        M = dr.majors(cr)
+        kinds = dict(dr.rows[cr])
+        for gx, j in full.items():
+            if kinds.get(gx) in silent:
+                addrs[gx][cr] = M[j][0]
+                kind_of[gx] = kinds[gx]
+    for gx, per in addrs.items():
+        if len(set(per.values())) < 2:
+            continue
+        # a *_LEFT kind has its interface column on the left: it takes the
+        # higher frame column (xc7a200t GTP_*_MID_LEFT 36, prjxray)
+        pick = max if kind_of[gx].endswith('_LEFT') else min
+        low = pick(per.values())
+        for cr, a in per.items():
+            if a == low:
+                continue
+            M = dr.majors(cr)
+            idx = {c[0]: i for i, c in enumerate(M)}
+            j = idx.get(low)
+            if j is None or M[j][2] != M[first[cr][gx]][2] or \
+                    j in set(first[cr].values()):
+                continue
+            first[cr][gx] = j
+
+
 def size_fix(dr, cr, full, table, silent):
     """A column of a silent kind whose frame column has another size than
     the kind's usual one (>= 60% of its columns over all dies) moves to the
@@ -969,6 +1003,7 @@ def main():
             if dr.majors(cr):
                 first[cr] = claim_unused(dr, cr, attach_silent(
                     dr.rows[cr], cur[(d, cr)], model))
+        vertical_silent(dr, first, silent)
         for cr in sorted(dr.rows):
             m = dr.majors(cr)
             if not m:

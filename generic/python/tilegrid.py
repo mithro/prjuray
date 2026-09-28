@@ -278,6 +278,7 @@ def probe_types(grid):
 
 PROBE_PER_ROW = 3
 MAX_MATCHES = None  # see --max-matches
+MID_VARIANT = re.compile(r"^(.*)_MID_(?:LEFT|RIGHT)$")
 
 
 def frame_columns(dframes):
@@ -1038,6 +1039,13 @@ def main():
     if args.windows:
         with open(args.windows) as f:
             grid.type_windows = {t: tuple(w) for t, w in json.load(f).items()}
+        # Variants of a tile type in the middle of the die (Series7
+        # GTP_CHANNEL_0_MID_LEFT, ...: few dies, few designs) take the
+        # window of the plain type when it has one.
+        for tt in {t['type'] for t in grid.tiles.values()}:
+            m = MID_VARIANT.match(tt)
+            if m and m.group(1) in grid.type_windows:
+                grid.type_windows[tt] = grid.type_windows[m.group(1)]
     if args.probe:
         span = args.probe_span or grid.rows_per_cr * grid.bpr + grid.centre
         types = probe_types(grid) if args.probe == 'auto' else \
