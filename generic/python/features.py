@@ -495,6 +495,71 @@ def tile_features(path, sitekeys):
                     f'{key}.OUTFF.OUTFFTYPE=DDR' in fs:
                 edge = 'OPPOSITE_EDGE'
             fs.add(f'{key}.CLKINV.SP.{inv}.OUT@CLK_EDGE={edge}')
+    # 7-series block RAM port widths as programmed: in simple dual port
+    # mode port A only reads and port B only writes, and the full width
+    # (36 / 72) splits over both ports' fields; the other width settings
+    # are ignored (xa7s15 BRAM_R 27_275-277, upper RAMB18 READ_WIDTH_B:
+    # SDP with READ_WIDTH_A=36 -> 18, other SDP -> 0 whatever
+    # READ_WIDTH_B).
+    for (tile, prefix), cfgs in bel_cfgs.items():
+        bel = prefix.rsplit('.', 1)[-1]
+        if bel not in ('RAMB18E1', 'RAMB36E1', 'FIFO18E1', 'FIFO36E1'):
+            continue
+        full = '72' if '36' in bel else '36'
+        half = '36' if full == '72' else '18'
+        if bel.startswith('FIFO'):
+            # A FIFO reads on port A and writes on port B, DATA_WIDTH wide
+            # (the full width: simple dual port).
+            dw = cfgs.get('DATA_WIDTH')
+            if dw is None:
+                continue
+            eff = {'READ_WIDTH_A': dw, 'WRITE_WIDTH_B': dw,
+                   'READ_WIDTH_B': '0', 'WRITE_WIDTH_A': '0'}
+            sdp = True
+        else:
+            eff = {k: cfgs.get(k) for k in ('READ_WIDTH_A', 'READ_WIDTH_B',
+                                            'WRITE_WIDTH_A', 'WRITE_WIDTH_B')}
+            sdp = cfgs.get('RAM_MODE') == 'SDP'
+        r = w = False
+        if sdp:
+            r, w = eff['READ_WIDTH_A'] == full, eff['WRITE_WIDTH_B'] == full
+            eff['READ_WIDTH_B'] = half if r else '0'
+            eff['WRITE_WIDTH_A'] = half if w else '0'
+            if r:
+                eff['READ_WIDTH_A'] = half
+            if w:
+                eff['WRITE_WIDTH_B'] = half
+        feats[tile].add(f'{prefix}.EFF_SDP_READ_FULL={int(r)}')
+        feats[tile].add(f'{prefix}.EFF_SDP_WRITE_FULL={int(w)}')
+        for k, v in eff.items():
+            if v is None:
+                continue
+            feats[tile].add(f'{prefix}.EFF_{k}={v}')
+            # 3 bit width code of an 18 Kb half (prjxray READ_WIDTH_*):
+            # 1 (or unused) 0, 2 1, 4 2, 9 3, 18 4.
+            enc = {'0': 0, '1': 0, '2': 1, '4': 2, '9': 3, '18': 4}.get(v)
+            if full == '36' and enc is not None:
+                feats[tile].update(
+                    f'{prefix}.EFF_{k}.ENC[{i}]' + ('' if enc >> i & 1
+                                                    else '=0')
+                    for i in range(3))
+    # Block RAM output register settings as programmed: with a full width
+    # (simple dual port) read or write port, port B's output register
+    # follows port A's (xcku025 BRAM 03_072 = DOB_REG, 03_125 =
+    # RSTREG_PRIORITY_B: exact over 1367 lower RAMB18 samples with this
+    # rule, ~70 errors without).
+    for (tile, prefix), cfgs in bel_cfgs.items():
+        if 'DOB_REG' not in cfgs or 'DOA_REG' not in cfgs:
+            continue
+        full = '72' if '36' in prefix.rsplit('.', 1)[-1] else '36'
+        sdp = cfgs.get('RAM_MODE') == 'SDP' or \
+            cfgs.get('READ_WIDTH_A') == full or \
+            cfgs.get('WRITE_WIDTH_B') == full
+        for a, b in (('DOA_REG', 'DOB_REG'),
+                     ('RSTREG_PRIORITY_A', 'RSTREG_PRIORITY_B')):
+            v = cfgs.get(a if sdp else b)
+            if v is not None:
+                feats[tile].add(f'{prefix}.EFF_{b}={v}')
     # Clock generator counter registers (derived, see clockgen_drp_features).
     for (tile, prefix), cfgs in bel_cfgs.items():
         if re.search(r'\.(MMCME\d_ADV|PLLE\d_ADV|MMCM|PLL)$', prefix):
