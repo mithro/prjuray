@@ -4,7 +4,9 @@
 """Tile grids + bit database + check for a set of dies of one architecture."""
 import argparse
 import json
+import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -175,7 +177,10 @@ def main():
                     '--sample-mem-budget): at most budget / (1.25 x the '
                     'largest measured worker peak, >= 2 GiB) designs at '
                     'once; set it below the vrun.sh cap (the phase 2 '
-                    'tasks are sized by --jobs as before)')
+                    'tasks are sized by --jobs as before); also the check '
+                    'stage: dies check together as far as their measured '
+                    'peaks (<db>/<arch>/check_peaks.json) fit, unmeasured '
+                    'dies alone with ~4 GiB per job')
     args = ap.parse_args()
     alldies = dieslib.load()
     dlist = args.dies.split(',')
@@ -256,6 +261,21 @@ def main():
                                      sum(size.values()))))
              for d in dlist}
 
+    peaks_path = os.path.join(dieslib.DB, arch, 'check_peaks.json')
+    try:
+        with open(peaks_path) as f:
+            known = json.load(f)
+    except (OSError, ValueError):
+        known = {}
+
+    def estimate(d):
+        """Bytes a die's check.py needs (from its last run: the parent
+        and, per worker, the largest worker), or None."""
+        k = known.get(d)
+        if not k:
+            return None
+        return k['parent'] + min(cjobs[d], k['jobs'] or 1) * k['worker']
+
     def check(d):
         roots = ','.join(
             os.path.join(dieslib.BUILD, 'designs', d, t)
@@ -266,12 +286,52 @@ def main():
             os.path.join(HERE, 'check.py'), '--die', d, '--designs', roots,
             '--max', '20', '--jobs', str(cjobs[d])
         ], log)
+        for line in open(log):
+            m = re.match(r'# check peak parent (\d+) worker (\d+) jobs '
+                         r'(\d+)', line)
+            if m:
+                known[d] = dict(parent=int(m.group(1)),
+                                worker=int(m.group(2)),
+                                jobs=int(m.group(3)))
         return log
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import (FIRST_COMPLETED, ThreadPoolExecutor,
+                                    wait)
     t0 = time.time()
     print(f'[{time.strftime("%H:%M:%S")}] checks started', flush=True)
+    # With --mem-budget the dies' checks run together only as far as their
+    # measured peaks (check_peaks.json, from earlier runs) fit the budget;
+    # a die without a measurement runs alone.  Largest estimate first.
+    budget = args.mem_budget * 2**30 if args.mem_budget else None
+    todo = sorted(dlist, key=lambda d: -(estimate(d) or float('inf')))
+    logs = {}
     with ThreadPoolExecutor(len(dlist)) as ex:
-        logs = list(ex.map(check, dlist))
+        running = {}  # future -> estimate (inf: not measured yet)
+        while todo or running:
+            for d in list(todo):
+                e = estimate(d)
+                if budget is not None and running:
+                    if e is None or float('inf') in running.values() or \
+                            sum(running.values()) + 1.1 * e > budget:
+                        continue
+                todo.remove(d)
+                if budget is not None:
+                    # jobs that fit: measured, or ~4 GiB per job unmeasured
+                    k = known.get(d)
+                    fit = int((budget / 1.1 - k['parent']) // k['worker']) \
+                        if k and k['worker'] else int(budget // (4 << 30))
+                    cjobs[d] = max(1, min(cjobs[d], fit))
+                running[ex.submit(check, d)] = \
+                    float('inf') if e is None else e
+            done, _ = wait(running, return_when=FIRST_COMPLETED)
+            for f in done:
+                running.pop(f)
+                log = f.result()
+                logs[os.path.basename(log)[6:-4]] = log
+    logs = [logs[d] for d in dlist]
+    tmp = f'{peaks_path}.{os.getpid()}.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(known, f, indent=1, sort_keys=True)
+    os.replace(tmp, peaks_path)
     print(f'[{time.strftime("%H:%M:%S")}] checks {time.time() - t0:.0f} s '
           f'(jobs per die '
           f'{" ".join(f"{d}:{cjobs[d]}" for d in dlist)})', flush=True)
