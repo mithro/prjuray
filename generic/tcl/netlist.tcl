@@ -1067,6 +1067,9 @@ proc nl_force_pips {} {
     global nl_wanted_pips
     set usedn [list]
     set ok 0
+    set tf0 [clock milliseconds]
+    set prop FIXED_ROUTE
+    if {[info exists ::env(NL_PIPS_PROP)]} { set prop $::env(NL_PIPS_PROP) }
     set bad 0
     foreach {n p} $nl_wanted_pips {
         set net [get_nets -quiet $n]
@@ -1102,7 +1105,7 @@ proc nl_force_pips {} {
                 set path [find_routing_path -quiet -from $from -to $to -include_nodes [list $n0 $n1] -sort_include_nodes -max_nodes 120 {*}$opts]
             }
             if {[llength $path]} {
-                set_property FIXED_ROUTE $path $net
+                set_property $prop $path $net
                 incr ok
             } else {
                 incr bad
@@ -1111,5 +1114,5 @@ proc nl_force_pips {} {
             incr bad
         }
     }
-    nl_log "forced pips ok $ok failed $bad"
+    nl_log "forced pips ok $ok failed $bad in [expr {[clock milliseconds] - $tf0}] ms"
 }
