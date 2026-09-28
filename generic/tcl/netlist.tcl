@@ -1058,7 +1058,29 @@ proc nl_force_pips {} {
             set to [get_nodes -of_objects $ld]
             set n0 [get_nodes -uphill -of_objects $pip]
             set n1 [get_nodes -downhill -of_objects $pip]
-            set path [find_routing_path -quiet -from $from -to $to -include_nodes [list $n0 $n1] -sort_include_nodes -max_nodes 120]
+            if {[info exists ::env(NL_PIPS_DEBUG)]} {
+                nl_log "forcing $p: $from -> $n0 -> $n1 -> $to"
+                flush $::nl_logfp
+            }
+            set opts [list]
+            if {[info exists ::env(NL_PIPS_OPTS)]} { set opts $::env(NL_PIPS_OPTS) }
+            if {[info exists ::env(NL_PIPS_SPLIT)]} {
+                # Two plain searches joined by the PIP (n0 -> n1).
+                # Nodes of earlier forced routes are excluded (fixed routes
+                # must not overlap), and the second half avoids the first.
+                set path [list]
+                if {[info exists used($n0)] || [info exists used($n1)]} { error "pip nodes in use" }
+                set ex [array names used]
+                set p0 [find_routing_path -quiet -from $from -to $n0 -max_nodes 60 -exclude_nodes [get_nodes -quiet [concat $ex [list $n1]]] {*}$opts]
+                if {[llength $p0]} {
+                    set p1 [find_routing_path -quiet -from $n1 -to $to -max_nodes 60 -exclude_nodes [get_nodes -quiet [concat $ex $p0]] {*}$opts]
+                    if {[llength $p1]} { set path [concat $p0 $p1] }
+                }
+                if {[llength $path] != [llength [lsort -unique $path]]} { set path [list] }
+                foreach x $path { set used($x) 1 }
+            } else {
+                set path [find_routing_path -quiet -from $from -to $to -include_nodes [list $n0 $n1] -sort_include_nodes -max_nodes 120 {*}$opts]
+            }
             if {[llength $path]} {
                 set_property FIXED_ROUTE $path $net
                 incr ok
