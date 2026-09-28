@@ -7,7 +7,7 @@ set -u
 cd /home/tim/github/f4pga/prjuray
 log=build/logs/chain_usdb4.log
 echo "$(date +%T) waiting for r13 d05 arm" >> $log
-until grep -qE "vrun:|Terminated" build/logs/r13_us_d05.log; do sleep 30; done
+[ -n "${SKIP_WAIT:-}" ] || until grep -qE "vrun:|Terminated" build/logs/r13_us_d05.log; do sleep 30; done
 if systemctl --user list-units --plain --no-legend 'prjuray-uspdb-4*' 'prjuray-usdb-4*' | grep -q .; then
     echo "$(date +%T) db-4 scopes already exist, not launching" >> $log
     exit 1
