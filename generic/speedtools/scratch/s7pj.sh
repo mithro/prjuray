@@ -22,6 +22,6 @@ for f in windows.json frames.json; do
 done
 export PYTHONHASHSEED=0 URAY_BUILD=$B URAY_DB=$D
 /usr/bin/time -v -o $D/time.log $W/generic/vrun.sh sp-s7pj ${VMEM:-16G} python3 $W/generic/python/mkdb.py --arch Series7 \
-  --dies $dies --tag r3,r4,r5,r7,r8,r9,r10,r11,r12,mmcm1,hb_gtx2,gtx3 --sample-mem-budget 8 --cache $S/s7cache \
+  --dies $dies --tag r3,r4,r5,r7,r8,r9,r10,r11,r12,mmcm1,hb_gtx2,gtx3 --sample-mem-budget 13 --cache $S/s7cache \
   --types BRAM_L,BRAM_R "$@" > $D/mkdb.log 2>&1
 echo "EXIT $?" >> $D/mkdb.log
