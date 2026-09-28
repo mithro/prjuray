@@ -679,6 +679,7 @@ def _cache_one(item):
         except (OSError, ValueError, EOFError, pickle.UnpicklingError,
                 KeyError, IndexError):
             pass
+    _MISS[0] = True
     col = _collector(arch, dn)
     chunks = {}
     for tt, k, fs, codes in col.sample_codes(
@@ -706,54 +707,44 @@ def _cache_one(item):
     return [(k, v[2], v[3], v[4]) for k, v in keys]
 
 
-def _cache_task(item):
-    """Worker: _cache_one and the worker's peak memory (bytes)."""
+_MISS = [False]
+
+
+def _cache_item(item):
+    """_cache_one and whether the cache had to be (re)built."""
+    _MISS[0] = False
     keys = _cache_one(item)
-    return keys, resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+    return keys, _MISS[0]
 
 
-SAMPLE_PEAK_GUESS = 2 << 30
-
-
-def _sample_phase(work, jobs, budget_gib):
-    """Runs _cache_task on every work item; yields (index, keys) as they
-    complete.  With a memory budget, at most budget / (1.25 x largest
-    worker peak seen, at least SAMPLE_PEAK_GUESS) items run at once (the
-    pool only starts a process when no idle one is left, so this also
-    bounds the processes).  The work list is in die order and a worker
-    keeps only its current die's Collector."""
-    from concurrent.futures import ProcessPoolExecutor, FIRST_COMPLETED, wait
-    peak = SAMPLE_PEAK_GUESS
-
-    def limit():
-        if not budget_gib:
-            return jobs
-        return max(1, min(jobs, int(budget_gib * 2**30 // (peak * 1.25))))
-
-    lim = limit()
-    if budget_gib:
-        print(f'# sample phase: {lim} designs at once ({budget_gib} GiB, '
-              f'{peak / 2**30:.1f} GiB per worker assumed)', flush=True)
-    with ProcessPoolExecutor(jobs) as ex:
-        futs = {}
-        nxt = 0
-        while nxt < len(work) or futs:
-            while nxt < len(work) and len(futs) < lim:
-                futs[ex.submit(_cache_task, work[nxt])] = nxt
-                nxt += 1
-            done, _ = wait(futs, return_when=FIRST_COMPLETED)
-            for f in done:
-                i = futs.pop(f)
-                keys, p = f.result()
-                if budget_gib and p > peak:
-                    peak = p
-                    new = limit()
-                    if new != lim:
-                        print(f'# sample phase: worker peak '
-                              f'{p / 2**30:.2f} GiB: {new} designs at once',
-                              flush=True)
-                        lim = new
-                yield i, keys
+def _sample_phase(work, jobs, budget_gib, cache):
+    """Runs _cache_one on every work item; yields (index, keys) as they
+    complete, at most as many at once as fit the memory budget
+    (memsched.budget_map).  The work list is in die order and a worker
+    keeps only its current die's Collector.  The measured worker peaks per
+    die are kept in <cache>/worker_peaks.json: the next run starts from
+    them (Series7 ~1.3 GiB) instead of the 2 GiB floor."""
+    import memsched
+    path = os.path.join(cache, 'worker_peaks.json')
+    try:
+        with open(path) as f:
+            known = json.load(f)
+    except (OSError, ValueError):
+        known = {}
+    peaks = {}
+    for i, (keys, _) in memsched.budget_map(
+            _cache_item, work, jobs, budget_gib, label='sample phase',
+            log=lambda m: print(m, flush=True), key=lambda it: it[1],
+            known=known, peaks=peaks, record=lambda r: r[1]):
+        yield i, keys
+    if peaks:
+        for k, v in peaks.items():  # never below an earlier measurement
+            known[k] = max(known.get(k, 0), v)
+        os.makedirs(cache, exist_ok=True)
+        tmp = f'{path}.{os.getpid()}.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(known, f, indent=1, sort_keys=True)
+        os.replace(tmp, path)
 
 
 def _interned(rows, vmap, vocab, vids):
@@ -1058,7 +1049,8 @@ def main():
     per_key = {}  # key -> [(cache path, used, empty)], first seen order
     results = [None] * len(work)
     for n, (i, keys) in enumerate(_sample_phase(
-            work, args.sample_jobs or args.jobs, args.sample_mem_budget), 1):
+            work, args.sample_jobs or args.jobs, args.sample_mem_budget,
+            cache), 1):
         results[i] = keys
         if n % 50 == 0 or n == len(work):
             el = time.time() - t0
