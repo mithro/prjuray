@@ -560,6 +560,34 @@ def design_seed(d):
     return zlib.crc32(rel.encode())
 
 
+def _splitmix64(x):
+    x = x + np.uint64(0x9E3779B97F4A7C15)
+    x = (x ^ (x >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+    x = (x ^ (x >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    return x ^ (x >> np.uint64(31))
+
+
+def _stable_pick(designs, col, k):
+    """Subset of at most k of the designs' used (col 1) or empty (col 2)
+    samples, as sample numbers over their concatenation: the k with the
+    smallest hash of (design, sample number in the design).  Unlike a
+    random sample of range(n) it is stable: samples added to or removed
+    from some designs leave the choice among the others unchanged."""
+    total = sum(d[col] for d in designs)
+    if total <= k:
+        return list(range(total))
+    hs = []
+    with np.errstate(over='ignore'):
+        for d in designs:
+            rel = '/'.join(os.path.normpath(d[0]).split(os.sep)[-3:])
+            base = np.uint64(zlib.crc32(rel.encode()) << 32 | col)
+            hs.append(_splitmix64(np.arange(d[col], dtype=np.uint64) *
+                                  np.uint64(0x100000001B3) ^ base))
+    h = np.concatenate(hs)
+    pick = np.argpartition(h, k - 1)[:k]
+    return sorted(pick.tolist())
+
+
 def _collect_one(item):
     """Samples of one design [(tile type, region, features, bits)]."""
     import random
@@ -736,11 +764,54 @@ def _interned(rows, vmap, vocab, vids):
     return ids
 
 
+# MKDB_RARE_KEEP=N: when a tile type has more used samples than
+# --max-samples, also keep every sample of the features seen at most N
+# times in all samples.  Off by default: on ci xcku025 (N=100) the rare
+# features then get fewer coincident bits, but some features pick up extra
+# always-co-occurring bits, which then fail to decode on the hold-out
+# designs (check.undocumented +22.5k, pred.missed +3.4k).
+RARE_KEEP = int(os.environ.get('MKDB_RARE_KEEP', 0))
+
+
+def _rare_samples(designs, tt, k, have):
+    """Used sample numbers (over the designs' concatenated used samples) not
+    in have that contain a feature seen at most RARE_KEEP times."""
+    def chunks():
+        for path, nu, ne, _ in designs:
+            off, n = dict(_read_index(path)['keys'])[(tt, k)][:2]
+            fv, _, fflat, flen = _read_raw(path, off, n)[:4]
+            yield nu, fv, fflat, flen
+    counts = collections.Counter()
+    for nu, fv, fflat, flen in chunks():
+        c = np.bincount(fflat[:int(flen[:nu].sum())], minlength=len(fv))
+        for i in np.nonzero(c)[0].tolist():
+            counts[fv[i]] += int(c[i])
+    rare = {f for f, c in counts.items() if c <= RARE_KEEP}
+    extra = []
+    if not rare:
+        return extra
+    g = 0
+    for nu, fv, fflat, flen in chunks():
+        rm = np.fromiter((f in rare for f in fv), dtype=bool, count=len(fv))
+        if rm.any():
+            fo = np.concatenate(([0], np.cumsum(flen[:nu], dtype=np.int64)))
+            hit = np.add.reduceat(rm[fflat[:fo[-1]]].astype(np.int64),
+                                  fo[:-1]) if fo[-1] else np.zeros(nu, int)
+            hit[flen[:nu] == 0] = 0
+            for j in np.nonzero(hit)[0].tolist():
+                if g + j not in have:
+                    extra.append(g + j)
+        g += nu
+    return extra
+
+
 def _type_task(task):
     """Worker: gathers the selected samples of one (tile type, region) from
     the design caches, correlates them and writes the database files."""
     outdir, (tt, k), designs, sel_used, sel_empty, split_dir = task
     t0 = time.time()
+    if RARE_KEEP and len(sel_used) < sum(d[1] for d in designs):
+        sel_used = sel_used + _rare_samples(designs, tt, k, set(sel_used))
     nu_sel = len(sel_used)
     pos = {('u', g): i for i, g in enumerate(sel_used)}
     pos.update({('e', g): nu_sel + i for i, g in enumerate(sel_empty)})
@@ -999,7 +1070,6 @@ def main():
     import random
     import time
     from concurrent.futures import ProcessPoolExecutor, as_completed
-    rng = random.Random(0)
     outdir = os.path.join(dieslib.DB, args.arch)
     cache = args.cache or os.path.join(outdir, 'cache')
     os.makedirs(outdir, exist_ok=True)
@@ -1046,10 +1116,11 @@ def main():
     for key, designs in per_key.items():
         nu = sum(x[1] for x in designs)
         ne = sum(x[2] for x in designs)
-        su = rng.sample(range(nu), args.max_samples) \
-            if nu > args.max_samples else list(range(nu))
-        se = rng.sample(range(ne), args.max_samples // 5) \
-            if ne > args.max_samples // 5 else list(range(ne))
+        su = _stable_pick(designs, 1, args.max_samples)
+        se = _stable_pick(designs, 2, args.max_samples // 5)
+        if nu > args.max_samples or ne > args.max_samples // 5:
+            print(f'# {key[0]}.{key[1]}: used samples {nu} (kept {len(su)}), '
+                  f'empty {ne} (kept {len(se)})', flush=True)
         tasks.append((outdir, key, designs, su, se,
                       os.path.join(cache, 'split')))
     # Phase 2: one task per (tile type, region), largest first.  A task
