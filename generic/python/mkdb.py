@@ -263,6 +263,14 @@ class Correlator:
     pair covers and the result assembly (finish())."""
 
     PAIR_BUDGET = 3000
+    # Features whose sample pattern is shared by more than TWIN_MAX features
+    # cannot be told apart (e.g. GTY_R: 8 used samples, 99k features in 19
+    # patterns): their bits are left unexplained ("ambiguous"), rather than
+    # given to every one of them (1.3 GB segbits_gty_r.db).  Smaller groups
+    # of always co-occurring features keep their bits: in the few-sample
+    # hard block types (CMT, IOI) they do predict the hold-out designs (with
+    # 16: ci xa7s15 pred.missed +4040, xazu1eg +2904).
+    TWIN_MAX = int(os.environ.get('MKDB_TWIN_MAX', 1000))
     # A feature seen n times implies a bit that is set in a fraction p of
     # all samples by chance with probability p**n: only accept implications
     # less likely than this to be coincidences (rare features otherwise
@@ -291,6 +299,12 @@ class Correlator:
         self.exact = collections.defaultdict(list)
         for f in np.nonzero(self.nf >= 2)[0].tolist():
             self.exact[hash(PF[f].tobytes())].append(f)
+        # Size of each feature's group of identical sample patterns.
+        self.twins = np.ones(self.nF, dtype=np.int64)
+        for fs in self.exact.values():
+            if len(fs) > 1:
+                self.twins[fs] = len(fs)
+        self.distinct = self.twins <= self.TWIN_MAX
 
     @staticmethod
     def popcount(a):
@@ -344,12 +358,14 @@ class Correlator:
             cnt = self.count_in(residual).astype(np.int64)
             score = cnt - self.nf * (popcount(residual) / self.S)
             score[cnt < 2] = -np.inf
+            score[~self.distinct] = -np.inf
             top = [int(i) for i in np.argsort(-score, kind='stable')[:K]
-                   if cnt[i] >= 2]
+                   if cnt[i] >= 2 and self.distinct[i]]
             return self._pairs_from(top, residual, is_default, pb)
         # (Signed: with the unsigned counts -cnt sorted the absent features
         # first and top was empty for almost every bit.)
         cnt = self.count_in(target).astype(np.int64)
+        cnt[~self.distinct] = 0
         top = [int(i) for i in np.argsort(-cnt, kind='stable')[:K]
                if cnt[i] > 0]
         return self._pairs_from(top, target, is_default, pb)
@@ -406,6 +422,7 @@ class Correlator:
         q = pb[self.qidx]
         viol = (PFq & q) if clear else (PFq & ~q)
         ok &= ~np.any(viol, axis=1)
+        ok &= self.distinct
         idx = np.nonzero(ok)[0]
         if len(idx) == 0:
             return idx
@@ -429,6 +446,10 @@ class Correlator:
                 empty_set[j] >= 0.97 * self.nempty
             key = (full & ~pb) if is_default else pb
             ex = self.exact_features(key)
+            if ex and len(ex) > self.TWIN_MAX:
+                out.append((b, is_default, [], self.popcount(key), False,
+                            len(ex)))
+                continue
             if ex:
                 out.append((b, is_default, [self.fnames[f] for f in ex], 0,
                             False))
@@ -486,7 +507,7 @@ class Correlator:
         defaults = {}
         unexplained = {}
         for part in parts:
-            for b, is_default, names, left, _ in part:
+            for b, is_default, names, left, _, *amb in part:
                 bn = self.bnames[b]
                 pre = '!' if is_default else ''
                 if is_default:
@@ -498,7 +519,8 @@ class Correlator:
                     for n in pnames:
                         feat_bits[n].append(pre + bn)
                 if left:
-                    unexplained[bn] = (left, int(self.nb[b]), is_default)
+                    unexplained[bn] = (left, int(self.nb[b]), is_default,
+                                       amb[0] if amb else 0)
         return dict(samples=self.S,
                     empty=self.nempty,
                     feat_bits=feat_bits,
@@ -531,8 +553,11 @@ def write_db(outdir, ttype, k, res):
         for feat, n in sorted(res['counts'].items()):
             f.write(f'{ttype}.{feat} {n}\n')
     with open(os.path.join(outdir, f'unexplained_{suffix}.txt'), 'w') as f:
-        for b, (left, n, d) in sorted(res['unexplained'].items()):
-            f.write(f'{b} unexplained {left} of {n} default {d}\n')
+        for b, (left, n, d, amb) in sorted(res['unexplained'].items()):
+            # ambiguous N: N features share the bit's sample pattern (more
+            # samples needed to tell them apart)
+            f.write(f'{b} unexplained {left} of {n} default {d}' +
+                    (f' ambiguous {amb}' if amb else '') + '\n')
 
 
 _COLLECTORS = {}
@@ -558,6 +583,34 @@ def design_seed(d):
     directory locations (hash() of a string changes every run)."""
     rel = '/'.join(os.path.normpath(d).split(os.sep)[-3:])  # die/tag/sN
     return zlib.crc32(rel.encode())
+
+
+def _splitmix64(x):
+    x = x + np.uint64(0x9E3779B97F4A7C15)
+    x = (x ^ (x >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+    x = (x ^ (x >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    return x ^ (x >> np.uint64(31))
+
+
+def _stable_pick(designs, col, k):
+    """Subset of at most k of the designs' used (col 1) or empty (col 2)
+    samples, as sample numbers over their concatenation: the k with the
+    smallest hash of (design, sample number in the design).  Unlike a
+    random sample of range(n) it is stable: samples added to or removed
+    from some designs leave the choice among the others unchanged."""
+    total = sum(d[col] for d in designs)
+    if total <= k:
+        return list(range(total))
+    hs = []
+    with np.errstate(over='ignore'):
+        for d in designs:
+            rel = '/'.join(os.path.normpath(d[0]).split(os.sep)[-3:])
+            base = np.uint64(zlib.crc32(rel.encode()) << 32 | col)
+            hs.append(_splitmix64(np.arange(d[col], dtype=np.uint64) *
+                                  np.uint64(0x100000001B3) ^ base))
+    h = np.concatenate(hs)
+    pick = np.argpartition(h, k - 1)[:k]
+    return sorted(pick.tolist())
 
 
 def _collect_one(item):
@@ -758,11 +811,54 @@ def _interned(rows, vmap, vocab, vids):
     return ids
 
 
+# MKDB_RARE_KEEP=N: when a tile type has more used samples than
+# --max-samples, also keep every sample of the features seen at most N
+# times in all samples.  Off by default: on ci xcku025 (N=100) the rare
+# features then get fewer coincident bits, but some features pick up extra
+# always-co-occurring bits, which then fail to decode on the hold-out
+# designs (check.undocumented +22.5k, pred.missed +3.4k).
+RARE_KEEP = int(os.environ.get('MKDB_RARE_KEEP', 0))
+
+
+def _rare_samples(designs, tt, k, have):
+    """Used sample numbers (over the designs' concatenated used samples) not
+    in have that contain a feature seen at most RARE_KEEP times."""
+    def chunks():
+        for path, nu, ne, _ in designs:
+            off, n = dict(_read_index(path)['keys'])[(tt, k)][:2]
+            fv, _, fflat, flen = _read_raw(path, off, n)[:4]
+            yield nu, fv, fflat, flen
+    counts = collections.Counter()
+    for nu, fv, fflat, flen in chunks():
+        c = np.bincount(fflat[:int(flen[:nu].sum())], minlength=len(fv))
+        for i in np.nonzero(c)[0].tolist():
+            counts[fv[i]] += int(c[i])
+    rare = {f for f, c in counts.items() if c <= RARE_KEEP}
+    extra = []
+    if not rare:
+        return extra
+    g = 0
+    for nu, fv, fflat, flen in chunks():
+        rm = np.fromiter((f in rare for f in fv), dtype=bool, count=len(fv))
+        if rm.any():
+            fo = np.concatenate(([0], np.cumsum(flen[:nu], dtype=np.int64)))
+            hit = np.add.reduceat(rm[fflat[:fo[-1]]].astype(np.int64),
+                                  fo[:-1]) if fo[-1] else np.zeros(nu, int)
+            hit[flen[:nu] == 0] = 0
+            for j in np.nonzero(hit)[0].tolist():
+                if g + j not in have:
+                    extra.append(g + j)
+        g += nu
+    return extra
+
+
 def _type_task(task):
     """Worker: gathers the selected samples of one (tile type, region) from
     the design caches, correlates them and writes the database files."""
     outdir, (tt, k), designs, sel_used, sel_empty, split_dir = task
     t0 = time.time()
+    if RARE_KEEP and len(sel_used) < sum(d[1] for d in designs):
+        sel_used = sel_used + _rare_samples(designs, tt, k, set(sel_used))
     nu_sel = len(sel_used)
     pos = {('u', g): i for i, g in enumerate(sel_used)}
     pos.update({('e', g): nu_sel + i for i, g in enumerate(sel_empty)})
@@ -1021,7 +1117,6 @@ def main():
     import random
     import time
     from concurrent.futures import ProcessPoolExecutor, as_completed
-    rng = random.Random(0)
     outdir = os.path.join(dieslib.DB, args.arch)
     cache = args.cache or os.path.join(outdir, 'cache')
     os.makedirs(outdir, exist_ok=True)
@@ -1069,10 +1164,11 @@ def main():
     for key, designs in per_key.items():
         nu = sum(x[1] for x in designs)
         ne = sum(x[2] for x in designs)
-        su = rng.sample(range(nu), args.max_samples) \
-            if nu > args.max_samples else list(range(nu))
-        se = rng.sample(range(ne), args.max_samples // 5) \
-            if ne > args.max_samples // 5 else list(range(ne))
+        su = _stable_pick(designs, 1, args.max_samples)
+        se = _stable_pick(designs, 2, args.max_samples // 5)
+        if nu > args.max_samples or ne > args.max_samples // 5:
+            print(f'# {key[0]}.{key[1]}: used samples {nu} (kept {len(su)}), '
+                  f'empty {ne} (kept {len(se)})', flush=True)
         tasks.append((outdir, key, designs, su, se,
                       os.path.join(cache, 'split')))
     # Phase 2: one task per (tile type, region), largest first.  A task
