@@ -1065,6 +1065,7 @@ proc nl_want_pip {net pip} {
 
 proc nl_force_pips {} {
     global nl_wanted_pips
+    set usedn [list]
     set ok 0
     set bad 0
     foreach {n p} $nl_wanted_pips {
@@ -1090,14 +1091,13 @@ proc nl_force_pips {} {
                 # must not overlap), and the second half avoids the first.
                 set path [list]
                 if {[info exists used($n0)] || [info exists used($n1)]} { error "pip nodes in use" }
-                set ex [array names used]
-                set p0 [find_routing_path -quiet -from $from -to $n0 -max_nodes 60 -exclude_nodes [get_nodes -quiet [concat $ex [list $n1]]] {*}$opts]
+                set p0 [find_routing_path -quiet -from $from -to $n0 -max_nodes 60 -exclude_nodes [concat $usedn [list $n1]] {*}$opts]
                 if {[llength $p0]} {
-                    set p1 [find_routing_path -quiet -from $n1 -to $to -max_nodes 60 -exclude_nodes [get_nodes -quiet [concat $ex $p0]] {*}$opts]
+                    set p1 [find_routing_path -quiet -from $n1 -to $to -max_nodes 60 -exclude_nodes [concat $usedn $p0] {*}$opts]
                     if {[llength $p1]} { set path [concat $p0 $p1] }
                 }
                 if {[llength $path] != [llength [lsort -unique $path]]} { set path [list] }
-                foreach x $path { set used($x) 1 }
+                foreach x $path { set used($x) 1; lappend usedn $x }
             } else {
                 set path [find_routing_path -quiet -from $from -to $to -include_nodes [list $n0 $n1] -sort_include_nodes -max_nodes 120 {*}$opts]
             }
