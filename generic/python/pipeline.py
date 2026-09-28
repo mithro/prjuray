@@ -23,7 +23,7 @@ def run(cmd, log):
 def evidence(args):
     """Design activity evidence of a die (and its activity only tile grid,
     for comparison)."""
-    die, arch, tags = args
+    die, arch, tags, jobs = args
     out = os.path.join(dieslib.DB, arch, die)
     os.makedirs(out, exist_ok=True)
     roots = ','.join(
@@ -33,7 +33,7 @@ def evidence(args):
         os.path.join(HERE, 'tilegrid.py'), '--die', die, '--designs', roots,
         '--evidence',
         os.path.join(out, 'evidence.json'), '--out',
-        os.path.join(out, 'tilegrid_activity.json')
+        os.path.join(out, 'tilegrid_activity.json'), '--jobs', str(jobs)
     ], os.path.join(out, 'evidence.log'))
 
 
@@ -163,7 +163,11 @@ def main():
     logdir = os.path.join(dieslib.BUILD, 'logs')
     if not args.skip_tilegrid:
         with ProcessPoolExecutor(min(len(dlist), 8)) as ex:
-            for die, rc in ex.map(evidence, [(d, arch, tags) for d in dlist]):
+            # designs loaded in parallel per die (1-2 GB per worker on
+            # large dies)
+            ej = max(1, min(4, args.jobs // min(len(dlist), 8)))
+            for die, rc in ex.map(evidence, [(d, arch, tags, ej)
+                                             for d in dlist]):
                 print('evidence', die, 'rc', rc, flush=True)
         # Frame column alignment over every die of the architecture with
         # evidence (the kind tables are shared).
