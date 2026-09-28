@@ -22,12 +22,12 @@
 # the baseline; -t runs with another tile grid instead (e.g. a candidate).
 # -u makes the current results the golden ones (do this after merging a
 # change whose numbers were reviewed).  Heavy steps run through vrun.sh
-# (memory cap CI_MEM, default 8G).  Deterministic: PYTHONHASHSEED=0, fixed
+# (memory cap CI_MEM, default per die, see conf).  Deterministic: PYTHONHASHSEED=0, fixed
 # tags, and a design list frozen in the golden directory.
 set -u
 G=$(cd "$(dirname "$0")" && pwd)
 B=${URAY_BUILD:-$(cd "$G/.." && pwd)/build}
-update=0; tgopt=; jobs=16
+update=0; tgopt=; jobs=
 while getopts "ut:j:" o; do
     case $o in
         u) update=1 ;;
@@ -38,15 +38,15 @@ while getopts "ut:j:" o; do
 done
 shift $((OPTIND - 1))
 [ $# -eq 0 ] && set -- xa7s15
-mem=${CI_MEM:-8G}
 export PYTHONHASHSEED=0
 
-# die -> "arch train_tags holdout_tag holdout_max"
+# die -> "arch train_tags holdout_tag holdout_max mkdb_jobs memory"
+# (measured peaks: xa7s15 2.3 GB, xazu1eg 4.7 GB, xcku025 9.2 GB at 8 jobs)
 conf() {
     case $1 in
-        xa7s15) echo "Series7 r9,r10 r11 20" ;;
-        xazu1eg) echo "UltraScalePlus r8,r9 r11 12" ;;
-        xcku025) echo "UltraScale r8,r9 r11 8" ;;
+        xa7s15) echo "Series7 r9,r10 r11 20 16 8G" ;;
+        xazu1eg) echo "UltraScalePlus r8,r9 r11 12 16 8G" ;;
+        xcku025) echo "UltraScale r8,r9 r11 8 8 14G" ;;
         *) return 1 ;;
     esac
 }
@@ -57,7 +57,8 @@ el() { printf '%.0f' "$(echo "$(now) - $1" | bc)"; }
 rc_all=0
 for die in "$@"; do
     c=$(conf "$die") || { echo "ci: no configuration for $die"; exit 2; }
-    read -r arch train hold hmax <<< "$c"
+    read -r arch train hold hmax djobs dmem <<< "$c"
+    j=${jobs:-$djobs}; mem=${CI_MEM:-$dmem}
     GD=$B/ci/golden/$die
     X=$B/ci/work/$(basename "$(dirname "$G")")/$die
     mkdir -p "$GD" "$X"
@@ -99,7 +100,7 @@ for die in "$@"; do
     XB=$X/build XD=$X/build/db
     t1=$(now)
     URAY_BUILD=$XB URAY_DB=$XD "$G/vrun.sh" "ci-mkdb-$die" "$mem" python3 "$G/python/mkdb.py" --arch "$arch" --dies "$die" \
-        --tag "$train" --jobs "$jobs" --cache "$X/cache" > "$X/mkdb.log" 2>&1 ||
+        --tag "$train" --jobs "$j" --cache "$X/cache" > "$X/mkdb.log" 2>&1 ||
         { echo "ci: $die: mkdb failed, see $X/mkdb.log"; rc_all=2; continue; }
     python3 "$G/python/ci_summary.py" prune "$XD/$arch" ||
         { echo "ci: $die: prune failed"; rc_all=2; continue; }
