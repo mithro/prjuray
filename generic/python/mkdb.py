@@ -412,20 +412,21 @@ class Correlator:
         full_viol = (PF[idx] & pb) if clear else (PF[idx] & ~pb)
         return idx[~np.any(full_viol, axis=1)]
 
-    def bits(self, b0=0, b1=None):
-        """Single feature explanation of bits b0..b1-1: [(b, is_default,
-        feature names, left, pair)], pair: a pair cover may be tried (bits
-        in order get the pair budget)."""
+    def bits(self, b0=0, b1=None, step=1):
+        """Single feature explanation of bits b0, b0+step, ... < b1:
+        [(b, is_default, feature names, left, pair)], pair: a pair cover
+        may be tried (bits in order get the pair budget)."""
         PB, nb, full = self.PB, self.nb, self.full
-        empty_set = np.bitwise_count(PB[b0:b1] & self.EM).sum(axis=1)
+        brange = range(b0, self.nB if b1 is None else b1, step)
+        empty_set = np.bitwise_count(PB[b0:b1:step] & self.EM).sum(axis=1)
         out = []
-        for b in range(b0, self.nB if b1 is None else b1):
+        for j, b in enumerate(brange):
             pb = PB[b]
             # Default: set in (almost) every unused instance; the few
             # exceptions are tiles used in ways the feature dump does not
             # see.
             is_default = self.nempty > 0 and \
-                empty_set[b - b0] >= 0.97 * self.nempty
+                empty_set[j] >= 0.97 * self.nempty
             key = (full & ~pb) if is_default else pb
             ex = self.exact_features(key)
             if ex:
@@ -706,54 +707,15 @@ def _cache_one(item):
     return [(k, v[2], v[3], v[4]) for k, v in keys]
 
 
-def _cache_task(item):
-    """Worker: _cache_one and the worker's peak memory (bytes)."""
-    keys = _cache_one(item)
-    return keys, resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
-
-
-SAMPLE_PEAK_GUESS = 2 << 30
-
-
 def _sample_phase(work, jobs, budget_gib):
-    """Runs _cache_task on every work item; yields (index, keys) as they
-    complete.  With a memory budget, at most budget / (1.25 x largest
-    worker peak seen, at least SAMPLE_PEAK_GUESS) items run at once (the
-    pool only starts a process when no idle one is left, so this also
-    bounds the processes).  The work list is in die order and a worker
+    """Runs _cache_one on every work item; yields (index, keys) as they
+    complete, at most as many at once as fit the memory budget
+    (memsched.budget_map).  The work list is in die order and a worker
     keeps only its current die's Collector."""
-    from concurrent.futures import ProcessPoolExecutor, FIRST_COMPLETED, wait
-    peak = SAMPLE_PEAK_GUESS
-
-    def limit():
-        if not budget_gib:
-            return jobs
-        return max(1, min(jobs, int(budget_gib * 2**30 // (peak * 1.25))))
-
-    lim = limit()
-    if budget_gib:
-        print(f'# sample phase: {lim} designs at once ({budget_gib} GiB, '
-              f'{peak / 2**30:.1f} GiB per worker assumed)', flush=True)
-    with ProcessPoolExecutor(jobs) as ex:
-        futs = {}
-        nxt = 0
-        while nxt < len(work) or futs:
-            while nxt < len(work) and len(futs) < lim:
-                futs[ex.submit(_cache_task, work[nxt])] = nxt
-                nxt += 1
-            done, _ = wait(futs, return_when=FIRST_COMPLETED)
-            for f in done:
-                i = futs.pop(f)
-                keys, p = f.result()
-                if budget_gib and p > peak:
-                    peak = p
-                    new = limit()
-                    if new != lim:
-                        print(f'# sample phase: worker peak '
-                              f'{p / 2**30:.2f} GiB: {new} designs at once',
-                              flush=True)
-                        lim = new
-                yield i, keys
+    import memsched
+    return memsched.budget_map(
+        _cache_one, work, jobs, budget_gib, label='sample phase',
+        log=lambda m: print(m, flush=True))
 
 
 def _interned(rows, vmap, vocab, vids):
@@ -827,11 +789,13 @@ def _type_task(task):
         with open(os.path.join(sdir, 'names.pkl'), 'wb') as f:
             pickle.dump((fnames, bnames), f,
                         protocol=pickle.HIGHEST_PROTOCOL)
+        # Interleaved bit subsets (bits i, i+n, i+2n, ...): the expensive
+        # bits cluster (contiguous ranges differed 50x in run time).
         nB = len(bnames)
-        step = -(-nB // nparts)
+        nparts = min(nparts, nB)
         peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
-        return (tt, k), ('split', sdir, [(b, min(nB, b + step))
-                                         for b in range(0, nB, step)]), \
+        return (tt, k), ('split', sdir, [(i, nB, nparts)
+                                         for i in range(nparts)]), \
             None, peak, time.time() - t0
     res = correlate_packed(PF, PB, emptyv, fnames, bnames)
     return _written(outdir, tt, k, res, t0)
@@ -864,9 +828,9 @@ def _load_split(sdir):
 
 def _bits_task(item):
     """Worker: one bit range of a split task."""
-    sdir, b0, b1 = item
+    sdir, b0, b1, step = item
     t0 = time.time()
-    part = _load_split(sdir).bits(b0, b1)
+    part = _load_split(sdir).bits(b0, b1, step)
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
     return part, peak, time.time() - t0
 
@@ -1118,8 +1082,9 @@ def main():
                 if isinstance(summary, tuple):
                     _, sdir, ranges = summary
                     parts[key] = [sdir, len(ranges), {}]
-                    for i, (b0, b1) in enumerate(ranges):
-                        futs[ex.submit(_bits_task, (sdir, b0, b1))] = \
+                    for i, (b0, b1, step) in enumerate(ranges):
+                        futs[ex.submit(_bits_task,
+                                       (sdir, b0, b1, step))] = \
                             ('bits', (key, i))
                     print(f'# task {key[0]}.{key[1]} split into '
                           f'{len(ranges)} bit ranges ({dt:.0f} s, peak '
@@ -1139,8 +1104,9 @@ def main():
                     allparts = [p[2][j] for j in range(p[1])]
                     pbits = pair_bits_of(allparts)
                     rows = {r[0]: r for part in allparts for r in part}
-                    chunks = [pbits[i:i + PAIR_CHUNK]
-                              for i in range(0, len(pbits), PAIR_CHUNK)]
+                    # (interleaved, like the bit subsets)
+                    nch = -(-len(pbits) // PAIR_CHUNK)
+                    chunks = [pbits[i::nch] for i in range(nch)]
                     p.append(allparts)
                     p.append({'n': len(chunks), 'res': {}})
                     for i, bs in enumerate(chunks):
