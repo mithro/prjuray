@@ -951,6 +951,7 @@ def parked_imux_features(feats, sitekeys):
         return
     nodes, inputs = data
     live = collections.defaultdict(set)
+    fanout = collections.defaultdict(lambda: collections.defaultdict(list))
     for tile, fs in list(feats.items()):
         if sitekeys.tile_type.get(tile) != 'INT':
             continue
@@ -962,11 +963,15 @@ def parked_imux_features(feats, sitekeys):
             if '->' not in f:
                 continue
             a, b = f.split('->', 1)
-            if a.endswith('<'):
+            bidir = a.endswith('<')
+            if bidir:
                 a = a[:-1]
             if '.' in a:  # PARK / site features
                 continue
             live[(x, y)].update((a, b))
+            fanout[(x, y)][a].append(b)
+            if bidir:
+                fanout[(x, y)][b].append(a)
     spread = collections.defaultdict(set)
     for (x, y), ws in live.items():
         for w in ws:
@@ -974,6 +979,26 @@ def parked_imux_features(feats, sitekeys):
                 spread[(x + dx, y + dy)].add(w2)
     for xy, ws in spread.items():
         live[xy] |= ws
+    # Wires of the constant nets (VCC_WIRE / GND_WIRE and what their PIPs
+    # and nodes reach) do not count as live: an IMUX input carrying VCC is
+    # still parked on (xcku025 IMUX_50, r9 s1-s3: parked inputs predicted
+    # 1562 right / 246 wrong with them, 1661 / 28 without).
+    todo = [(xy, c) for xy, fo in fanout.items()
+            for c in ('VCC_WIRE', 'GND_WIRE') if c in fo]
+    const = collections.defaultdict(set)
+    for xy, c in todo:
+        const[xy].add(c)
+    while todo:
+        (x, y), w = todo.pop()
+        nxt = [((x, y), b) for b in fanout[(x, y)].get(w, ())]
+        nxt += [((x + dx, y + dy), w2) for dx, dy, w2 in nodes.get(w, ())]
+        for xy2, w2 in nxt:
+            if w2 not in const[xy2]:
+                const[xy2].add(w2)
+                todo.append((xy2, w2))
+    for xy, ws in const.items():
+        if xy in live:
+            live[xy] -= ws
     for (x, y), ws in live.items():
         tile = f'INT_X{x}Y{y}'
         if sitekeys.tile_type.get(tile) != 'INT':
