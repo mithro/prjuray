@@ -515,6 +515,12 @@ def main():
                     'process per design)')
     ap.add_argument('--workdir',
                     default=os.path.join(dieslib.BUILD, 'designs'))
+    ap.add_argument('--usable-at', type=int, default=None,
+                    help='write <workdir>/.rounds/<tag>.usable when all '
+                    'designs are started and at most this many still run '
+                    '(slots idle), so chained steps can start on the '
+                    'finished ones (default max(2, jobs // 10)); '
+                    '<tag>.done is written at the end')
     ap.add_argument('gen_args', nargs='*')
     args = ap.parse_args()
     install_cleanup()
@@ -543,11 +549,15 @@ def main():
         os.makedirs(logdir, exist_ok=True)
         pool = WorkerPool(args.reuse, args.threads, logdir)
     queue = JobQueue(jobs)
+    running = set()
+    rlock = threading.Lock()
 
     def job():
         j = queue.take()
         die, s = j
         wdir = os.path.join(args.workdir, die.name, args.tag, f's{s}')
+        with rlock:
+            running.add((die.name, s))
         try:
             return die.name, s, run_one(die, s, wdir, args.gen_args,
                                         args.timeout, args.threads,
@@ -555,12 +565,41 @@ def main():
         except Exception as e:  # keep going on post-processing errors
             return die.name, s, f'exception {e}'
         finally:
+            with rlock:
+                running.discard((die.name, s))
             if pool:
                 pool.done(queue.pending)
 
     t0 = time.time()
     done = 0
     counts = collections.Counter()
+    usable = False
+    usable_at = args.usable_at if args.usable_at is not None else \
+        max(2, args.jobs // 10)
+    rounds = os.path.join(args.workdir, '.rounds')
+
+    def write_marker(kind, ndone, still):
+        """<tag>.<kind> (JSON), written atomically."""
+        os.makedirs(rounds, exist_ok=True)
+        path = os.path.join(rounds, f'{args.tag}.{kind}')
+        tmp = f'{path}.{os.getpid()}.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(dict(time=time.time(), done=ndone, total=len(jobs),
+                           counts=dict(counts),
+                           dies=[d.name for d in dlist],
+                           running=[f'{d}/s{s}' for d, s in still]), f)
+        os.replace(tmp, path)
+        print(f'[{time.strftime("%H:%M:%S")}] round {args.tag} {kind}: '
+              f'{ndone}/{len(jobs)} done'
+              + (f', still running {" ".join(f"{d}/s{s}" for d, s in still)}'
+                 if still else ''), flush=True)
+
+    # a rerun of the tag starts without markers
+    for kind in ('usable', 'done'):
+        try:
+            os.remove(os.path.join(rounds, f'{args.tag}.{kind}'))
+        except FileNotFoundError:
+            pass
     try:
         with ThreadPoolExecutor(args.jobs) as ex:
             futs = [ex.submit(job) for _ in jobs]
@@ -575,6 +614,13 @@ def main():
                       f'eta {eta:.0f}s ({time.strftime("%H:%M", time.localtime(time.time() + eta))}) '
                       f'{dict(counts)}',
                       flush=True)
+                left = len(jobs) - done
+                if not usable and 0 < left <= usable_at and left < args.jobs:
+                    with rlock:
+                        still = sorted(running)
+                    write_marker('usable', done, still)
+                    usable = True
+        write_marker('done', done, [])
     finally:
         if pool:
             pool.close()
