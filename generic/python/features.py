@@ -76,6 +76,14 @@ class SiteKeys:
         self.key = {}
         self.tile_type = {}
         self.pads = collections.defaultdict(list)  # tile -> pad sites
+        # Bonded pad sites (build/meta/bonded/<die>.txt from
+        # tcl/dump_bonded.tcl), None when not known.
+        self.bonded = None
+        bp = os.path.join(os.path.dirname(os.path.dirname(tiles_tsv)),
+                          'bonded', os.path.basename(tiles_tsv)[:-4] + '.txt')
+        if os.path.exists(bp):
+            with open(bp) as f:
+                self.bonded = set(f.read().split())
         self.region = {}  # tile -> clock region (X<c>Y<r>, '-')
         self.xy = {}  # tile -> (grid x, grid y)
         self.tiles_tsv = tiles_tsv
@@ -670,8 +678,24 @@ def tile_features(path, sitekeys):
         v = glob_opts['UNUSEDPIN'].upper()
         for tile, pads in sitekeys.pads.items():
             for s in pads:
+                key = sitekeys.key[s][1]
                 if s not in site_map:
-                    feats[tile].add(f'{sitekeys.key[s][1]}.UNUSEDPIN={v}')
+                    feats[tile].add(f'{key}.UNUSEDPIN={v}')
+                    pull = v
+                else:
+                    pull = bel_cfgs.get((tile, f'{key}.PAD'), {}).get(
+                        'PULLTYPE', 'NONE').upper()
+                # The pad's pull as programmed, used or not: the pull down
+                # is the all-zero setting (xcku025 HPIO_L 04_1858 /
+                # 08_1538 / 00_898 set with PULLNONE and PULLUP alike).
+                pull = {'PULLNONE': 'NONE', 'PULLUP': 'UP',
+                        'PULLDOWN': 'DOWN', 'PULLKEEPER': 'KEEPER'}.get(
+                            pull, pull)
+                if sitekeys.bonded is not None and \
+                        s not in sitekeys.bonded:
+                    continue  # (unbonded: no pull programming)
+                feats[tile].add(f'{key}.EFF_PULL={pull}')
+                feats[tile].add(f'{key}.EFF_PULLDOWN={int(pull == "DOWN")}')
     hclk_row_features(feats, sitekeys)
     leaf_clock_features(feats, sitekeys)
     return feats
