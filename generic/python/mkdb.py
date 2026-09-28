@@ -626,16 +626,15 @@ def _chunk_samples(raw):
             yield 'e', fflat[:0], bflat[bo[j]:bo[j + 1]]
 
 
-def _code_stamp():
-    """Checksum of the feature extraction code: changing how features are
-    derived from the dumps must invalidate cached samples."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    with open(os.path.join(here, 'features.py'), 'rb') as f:
-        return zlib.crc32(f.read())
+_TILES_TSV = {}
 
 
 def _cache_stamp(arch, dn, d):
-    st = [CACHE_VERSION, _code_stamp()]
+    # feature code, its data files and switches, the die's site files
+    # (designdata.feature_inputs_stamp): anything changing the features
+    if dn not in _TILES_TSV:
+        _TILES_TSV[dn] = dieslib.load()[dn].tiles_tsv
+    st = [CACHE_VERSION, DD.feature_inputs_stamp(_TILES_TSV[dn])]
     for p in (os.path.join(d, 'bits.npz'),
               os.path.join(d, 'design.features.gz'),
               os.path.join(dieslib.DB, arch, dn, 'tilegrid.json')):
@@ -680,6 +679,7 @@ def _cache_one(item):
         except (OSError, ValueError, EOFError, pickle.UnpicklingError,
                 KeyError, IndexError):
             pass
+    _MISS[0] = True
     col = _collector(arch, dn)
     chunks = {}
     for tt, k, fs, codes in col.sample_codes(
@@ -707,15 +707,44 @@ def _cache_one(item):
     return [(k, v[2], v[3], v[4]) for k, v in keys]
 
 
-def _sample_phase(work, jobs, budget_gib):
+_MISS = [False]
+
+
+def _cache_item(item):
+    """_cache_one and whether the cache had to be (re)built."""
+    _MISS[0] = False
+    keys = _cache_one(item)
+    return keys, _MISS[0]
+
+
+def _sample_phase(work, jobs, budget_gib, cache):
     """Runs _cache_one on every work item; yields (index, keys) as they
     complete, at most as many at once as fit the memory budget
     (memsched.budget_map).  The work list is in die order and a worker
-    keeps only its current die's Collector."""
+    keeps only its current die's Collector.  The measured worker peaks per
+    die are kept in <cache>/worker_peaks.json: the next run starts from
+    them (Series7 ~1.3 GiB) instead of the 2 GiB floor."""
     import memsched
-    return memsched.budget_map(
-        _cache_one, work, jobs, budget_gib, label='sample phase',
-        log=lambda m: print(m, flush=True))
+    path = os.path.join(cache, 'worker_peaks.json')
+    try:
+        with open(path) as f:
+            known = json.load(f)
+    except (OSError, ValueError):
+        known = {}
+    peaks = {}
+    for i, (keys, _) in memsched.budget_map(
+            _cache_item, work, jobs, budget_gib, label='sample phase',
+            log=lambda m: print(m, flush=True), key=lambda it: it[1],
+            known=known, peaks=peaks, record=lambda r: r[1]):
+        yield i, keys
+    if peaks:
+        for k, v in peaks.items():  # never below an earlier measurement
+            known[k] = max(known.get(k, 0), v)
+        os.makedirs(cache, exist_ok=True)
+        tmp = f'{path}.{os.getpid()}.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(known, f, indent=1, sort_keys=True)
+        os.replace(tmp, path)
 
 
 def _interned(rows, vmap, vocab, vids):
@@ -1020,7 +1049,8 @@ def main():
     per_key = {}  # key -> [(cache path, used, empty)], first seen order
     results = [None] * len(work)
     for n, (i, keys) in enumerate(_sample_phase(
-            work, args.sample_jobs or args.jobs, args.sample_mem_budget), 1):
+            work, args.sample_jobs or args.jobs, args.sample_mem_budget,
+            cache), 1):
         results[i] = keys
         if n % 50 == 0 or n == len(work):
             el = time.time() - t0
