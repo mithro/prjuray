@@ -30,6 +30,8 @@ def classify(log, rlog):
     if re.search(r'hs_err_pid|Abnormal program termination|Segmentation',
                  rlog):
         return 'crash'
+    if 'route stalled:' in log:
+        return 'route stall'
     if 'timeout' in rlog[-200:]:
         return 'timeout'
     sig = re.findall(

@@ -20,6 +20,7 @@ import gzip
 import json
 import os
 import random
+import re
 import shutil
 import signal
 import socket
@@ -208,6 +209,60 @@ def install_cleanup():
         signal.signal(s, _on_signal)
 
 
+class StallWatch:
+    """Notices a router that no longer makes progress: `STALL_ITERS`
+    consecutive rip-up iterations reporting the same nonzero "Number of Nodes
+    with overlaps".  Over all kept logs no route_design call ever got out of
+    a plateau longer than 4 iterations, while the stuck ones (e.g. BUFG_PS
+    outputs to fabric pins in --region designs) repeat one count until the
+    design timeout, 30-40 min later.  route_design cannot be interrupted
+    (SIGINT segfaults Vivado), so the caller kills the run."""
+
+    STALL_ITERS = int(os.environ.get('NL_STALL_ITERS', 10))
+    PAT = re.compile(rb'Number of Nodes with overlaps = (\d+)|'
+                     rb'Command: route_design')
+
+    def __init__(self, path):
+        self.path = path
+        try:
+            self.pos = os.path.getsize(path)
+        except OSError:
+            self.pos = 0
+        self.rest = b''
+        self.last = None
+        self.run = 0
+
+    def stalled(self):
+        """Reads what the log grew by; True once the router is stuck."""
+        if not self.STALL_ITERS:
+            return False
+        try:
+            with open(self.path, 'rb') as f:
+                f.seek(self.pos)
+                data = f.read()
+        except OSError:
+            return False
+        self.pos += len(data)
+        data = self.rest + data
+        cut = data.rfind(b'\n') + 1
+        self.rest = data[cut:]
+        for m in self.PAT.finditer(data[:cut]):
+            n = m.group(1)
+            if n is None or n == b'0' or n != self.last:
+                self.run = 0
+            else:
+                self.run += 1
+                if self.run >= self.STALL_ITERS:
+                    return True
+            self.last = n
+        return False
+
+    def note(self, wdir):
+        with open(os.path.join(wdir, 'nl.log'), 'a') as f:
+            f.write(f'route stalled: overlaps {self.last.decode()} for '
+                    f'{self.run + 1} iterations, killed\n')
+
+
 def run_fresh(die, wdir, timeout, threads, budget):
     """One Vivado process for the design.  Returns (status, cpu seconds,
     peak resident bytes)."""
@@ -218,6 +273,7 @@ def run_fresh(die, wdir, timeout, threads, budget):
     t0 = time.time()
     peak = 0
     n = 0
+    watch = StallWatch(os.path.join(wdir, 'vivado.log'))
     while True:
         pid, status, ru = os.wait4(p.pid, os.WNOHANG)
         if pid:
@@ -230,15 +286,20 @@ def run_fresh(die, wdir, timeout, threads, budget):
             # ru_maxrss (KiB): the largest process of the tree.
             return 'done', ru.ru_utime + ru.ru_stime, max(
                 peak, ru.ru_maxrss * 1024)
-        if time.time() - t0 > timeout:
+        stall = False
+        n += 1
+        if n % 10 == 0:
+            peak = max(peak, tree_stats(p.pid)[1])
+            stall = watch.stalled()
+        if stall or time.time() - t0 > timeout:
             cpu = tree_cpu(p.pid)
             os.killpg(p.pid, signal.SIGKILL)
             os.wait4(p.pid, 0)
             _reaped(p.pid)
+            if stall:
+                watch.note(wdir)
+                return 'stall', cpu, peak
             return 'timeout', cpu, peak
-        n += 1
-        if n % 10 == 0:
-            peak = max(peak, tree_stats(p.pid)[1])
         time.sleep(1)
 
 
@@ -304,12 +365,17 @@ class Worker:
         except OSError:
             pass
         status = 'done'
+        watch = StallWatch(self.log)
         with self.cond:
             while self.done is None:
                 self.cond.wait(5)
                 peak = max(peak, tree_stats(self.p.pid)[1])
                 if time.time() - t0 > timeout:
                     status = 'timeout'
+                    break
+                if self.done is None and watch.stalled():
+                    watch.note(wdir)
+                    status = 'stall'
                     break
             if self.done == 'eof':
                 status = 'crash'
@@ -420,7 +486,7 @@ def run_one(die, seed, wdir, gen_args, timeout, threads, pool=None):
         else:
             vstatus, cpu, rss = run_fresh(die, wdir, timeout, threads,
                                           budget_of(die, gen_args))
-        status = vstatus if vstatus in ('timeout', 'crash') else \
+        status = vstatus if vstatus in ('timeout', 'crash', 'stall') else \
             postprocess(die, wdir)
     t1 = time.time()
     stats.update(end=t1, wall=t1 - t0, cpu=cpu, status=status,
