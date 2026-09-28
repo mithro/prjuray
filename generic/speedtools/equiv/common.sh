@@ -16,4 +16,10 @@ eq_tree_old() {  # (re)exports $BASE into $S/old
     rm -rf "$S/old"
     mkdir -p "$S/old"
     git -C "$W" archive "$BASE" generic | tar -x -C "$S/old"
+    git -C "$W" rev-parse "$BASE" > "$S/old/.base"
 }
+# a stale export (BASE moved) is replaced
+if [ -d "$S/old/generic" ] && [ "$(cat "$S/old/.base" 2>&1)" != \
+        "$(git -C "$W" rev-parse "$BASE")" ]; then
+    rm -rf "$S/old"
+fi

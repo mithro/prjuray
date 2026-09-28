@@ -124,9 +124,12 @@ class TypeCodes:
         self = cls.__new__(cls)
         self.names = []
         pos, neg = [], []
-        for path in segbits:
+        for n, path in enumerate(segbits):
             if not os.path.exists(path):
                 continue
+            # mkdb writes distinct bits per line (sets); other writers
+            # (segbits_opt) are made distinct here
+            dedupe = n > 0
             with open(path, 'rb') as f:
                 for line in f:
                     parts = line.rstrip(b'\n').split(b' ', 1)
@@ -135,8 +138,7 @@ class TypeCodes:
                     self.names.append(parts[0].decode())
                     if len(parts) > 1 and parts[1].strip():
                         pc, nc = _parse_segbits_line(parts[1])
-                        if len(pc) != len(np.unique(pc)) or \
-                                len(nc) != len(np.unique(nc)):
+                        if dedupe:
                             pc, nc = np.unique(pc), np.unique(nc)
                     else:
                         pc = nc = np.zeros(0, dtype=np.int64)
