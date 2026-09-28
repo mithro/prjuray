@@ -263,6 +263,14 @@ class Correlator:
     pair covers and the result assembly (finish())."""
 
     PAIR_BUDGET = 3000
+    # Features whose sample pattern is shared by more than TWIN_MAX features
+    # cannot be told apart (e.g. GTY_R: 8 used samples, 99k features in 19
+    # patterns): their bits are left unexplained ("ambiguous"), rather than
+    # given to every one of them (1.3 GB segbits_gty_r.db).  Smaller groups
+    # of always co-occurring features keep their bits: in the few-sample
+    # hard block types (CMT, IOI) they do predict the hold-out designs (with
+    # 16: ci xa7s15 pred.missed +4040, xazu1eg +2904).
+    TWIN_MAX = int(os.environ.get('MKDB_TWIN_MAX', 1000))
     # A feature seen n times implies a bit that is set in a fraction p of
     # all samples by chance with probability p**n: only accept implications
     # less likely than this to be coincidences (rare features otherwise
@@ -291,6 +299,12 @@ class Correlator:
         self.exact = collections.defaultdict(list)
         for f in np.nonzero(self.nf >= 2)[0].tolist():
             self.exact[hash(PF[f].tobytes())].append(f)
+        # Size of each feature's group of identical sample patterns.
+        self.twins = np.ones(self.nF, dtype=np.int64)
+        for fs in self.exact.values():
+            if len(fs) > 1:
+                self.twins[fs] = len(fs)
+        self.distinct = self.twins <= self.TWIN_MAX
 
     @staticmethod
     def popcount(a):
@@ -344,12 +358,14 @@ class Correlator:
             cnt = self.count_in(residual).astype(np.int64)
             score = cnt - self.nf * (popcount(residual) / self.S)
             score[cnt < 2] = -np.inf
+            score[~self.distinct] = -np.inf
             top = [int(i) for i in np.argsort(-score, kind='stable')[:K]
-                   if cnt[i] >= 2]
+                   if cnt[i] >= 2 and self.distinct[i]]
             return self._pairs_from(top, residual, is_default, pb)
         # (Signed: with the unsigned counts -cnt sorted the absent features
         # first and top was empty for almost every bit.)
         cnt = self.count_in(target).astype(np.int64)
+        cnt[~self.distinct] = 0
         top = [int(i) for i in np.argsort(-cnt, kind='stable')[:K]
                if cnt[i] > 0]
         return self._pairs_from(top, target, is_default, pb)
@@ -406,6 +422,7 @@ class Correlator:
         q = pb[self.qidx]
         viol = (PFq & q) if clear else (PFq & ~q)
         ok &= ~np.any(viol, axis=1)
+        ok &= self.distinct
         idx = np.nonzero(ok)[0]
         if len(idx) == 0:
             return idx
@@ -429,6 +446,10 @@ class Correlator:
                 empty_set[j] >= 0.97 * self.nempty
             key = (full & ~pb) if is_default else pb
             ex = self.exact_features(key)
+            if ex and len(ex) > self.TWIN_MAX:
+                out.append((b, is_default, [], self.popcount(key), False,
+                            len(ex)))
+                continue
             if ex:
                 out.append((b, is_default, [self.fnames[f] for f in ex], 0,
                             False))
@@ -486,7 +507,7 @@ class Correlator:
         defaults = {}
         unexplained = {}
         for part in parts:
-            for b, is_default, names, left, _ in part:
+            for b, is_default, names, left, _, *amb in part:
                 bn = self.bnames[b]
                 pre = '!' if is_default else ''
                 if is_default:
@@ -498,7 +519,8 @@ class Correlator:
                     for n in pnames:
                         feat_bits[n].append(pre + bn)
                 if left:
-                    unexplained[bn] = (left, int(self.nb[b]), is_default)
+                    unexplained[bn] = (left, int(self.nb[b]), is_default,
+                                       amb[0] if amb else 0)
         return dict(samples=self.S,
                     empty=self.nempty,
                     feat_bits=feat_bits,
@@ -531,8 +553,11 @@ def write_db(outdir, ttype, k, res):
         for feat, n in sorted(res['counts'].items()):
             f.write(f'{ttype}.{feat} {n}\n')
     with open(os.path.join(outdir, f'unexplained_{suffix}.txt'), 'w') as f:
-        for b, (left, n, d) in sorted(res['unexplained'].items()):
-            f.write(f'{b} unexplained {left} of {n} default {d}\n')
+        for b, (left, n, d, amb) in sorted(res['unexplained'].items()):
+            # ambiguous N: N features share the bit's sample pattern (more
+            # samples needed to tell them apart)
+            f.write(f'{b} unexplained {left} of {n} default {d}' +
+                    (f' ambiguous {amb}' if amb else '') + '\n')
 
 
 _COLLECTORS = {}
