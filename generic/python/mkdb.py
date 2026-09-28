@@ -1106,6 +1106,12 @@ def main():
                     'the budget over the largest worker peak measured so '
                     'far and a 2 GiB floor (x 1.25; measured Series7 up '
                     'to ~1.3 GiB per worker)')
+    ap.add_argument('--pair-jobs', type=int, default=0,
+                    help='separate processes for the pair cover chunks of '
+                    'split tasks (light, ~0.8 GiB each on Series7 BRAM: the '
+                    'chunks of the largest types come last and otherwise run '
+                    'in waves of --jobs); up to --jobs + --pair-jobs '
+                    'processes then run at once.  0: in the --jobs pool')
     ap.add_argument('--max-samples', type=int, default=50000)
     ap.add_argument('--exclude', action='append', default=[],
                     help='file of design directories to leave out, one per '
@@ -1195,7 +1201,11 @@ def main():
     # Large (tile type, region) tasks come back split into bit range
     # tasks, whose results then go to a finishing task.
     with ProcessPoolExecutor(min(len(tasks), args.jobs) or 1,
-                             max_tasks_per_child=1) as ex:
+                             max_tasks_per_child=1) as ex, \
+            ProcessPoolExecutor(max(1, args.pair_jobs),
+                                max_tasks_per_child=1) as pex:
+        if not args.pair_jobs:
+            pex = ex
         futs = {ex.submit(_type_task, t): ('type', t[1]) for t in tasks}
         parts = {}
         ndone = 0
@@ -1236,7 +1246,7 @@ def main():
                     p.append(allparts)
                     p.append({'n': len(chunks), 'res': {}})
                     for i, bs in enumerate(chunks):
-                        futs[ex.submit(_pairs_task, (
+                        futs[pex.submit(_pairs_task, (
                             p[0], bs, [rows[b] for b in bs]))] = \
                             ('pairs', (key, i))
                     if not chunks:
