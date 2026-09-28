@@ -14,6 +14,7 @@
 #                                                    (also IS_<pin>_INVERTED of
 #                                                    placed cells, on the site
 #                                                    pin the cell pin reaches)
+#   pin <site> <pin> SIGNAL|GND|VCC                 hard block input pin driver
 
 proc _df_cfg_props {bel} {
     global _df_prop_cache
@@ -465,6 +466,27 @@ proc dump_features {out} {
         }
     }
     puts $fp "# t_inv [expr {[clock milliseconds] - $t0}]"
+    # Scalar input pins of placed hard blocks (not slice logic): driven by a
+    # signal or tied to a constant.  A tied pin is often routed through the
+    # same site input mux as a signal, so the routing does not tell them
+    # apart (e.g. a STARTUPE2 GTS driven by logic sets 7-series
+    # configuration bits, a GTS tied to ground does not):
+    # "pin <site> <cell pin> SIGNAL|GND|VCC".  Unconnected pins are left out.
+    set hard [filter -quiet $placed {REF_NAME !~ LUT* && REF_NAME !~ FD* && REF_NAME !~ LD* && REF_NAME !~ CARRY* && REF_NAME !~ MUXF* && REF_NAME !~ SRL* && REF_NAME !~ RAM32* && REF_NAME !~ RAM64* && REF_NAME !~ RAM128* && REF_NAME !~ RAM256* && REF_NAME !~ RAMD* && REF_NAME !~ RAMS* && REF_NAME != GND && REF_NAME != VCC}]
+    if {[llength $hard]} {
+        set hpins [get_pins -quiet -of_objects $hard -filter {DIRECTION == IN && BUS_NAME == "" && IS_CONNECTED}]
+        array unset hsite
+        foreach c [_df_props NAME $hard] s [_df_props SITE $hard] { set hsite($c) $s }
+        foreach q $hpins {
+            set i [string last / $q]
+            set c [string range $q 0 [expr {$i - 1}]]
+            if {![info exists hsite($c)] || $hsite($c) eq ""} continue
+            set how SIGNAL
+            if {[info exists constpin($q)]} { set how [expr {$constpin($q) ? "VCC" : "GND"}] }
+            puts $fp "pin $hsite($c) [string range $q [expr {$i + 1}] end] $how"
+        }
+    }
+    puts $fp "# t_pin [expr {[clock milliseconds] - $t0}]"
     # Bank wide settings (e.g. the 7-series STEPDOWN of low voltage banks)
     # also change unused pads: report the I/O standards used in each bank on
     # every pad site of the bank.

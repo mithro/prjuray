@@ -16,6 +16,8 @@ Feature naming (relative to the tile, prefixed by the tile type in the DB):
   <SITEKEY>.BANK.IOSTD=<std>       an I/O standard used in the pad's bank
   <SITEKEY>.BANK.VCCO=<volts>      the bank's VCCO (from its I/O standards)
   <SITEKEY>.PAD.PULLTYPE=<v>       pull resistor of a used pad
+  <SITEKEY>.PIN.<pin>=<how>        hard block input pin driven by a
+                                   SIGNAL or tied to GND / VCC
   <SITEKEY>.<BEL>.<CFG>=<v>@<STD>=<s>  I/O buffer setting together with its
                                    I/O standard (SLEW, DRIVE, IN_TERM, ...)
   <vector bit feature>@<W>=<v>     vector bit together with a WIDTH setting
@@ -477,6 +479,12 @@ def parse_dump(path, sitekeys):
                     feats[tile].add(f'{key}.BANK.{p[2]}={p[3]}')
                     if p[2] == 'IOSTD':
                         bank_stds[(tile, key)].add(p[3])
+            elif kind == 'pin':
+                # Hard block input pin: driven by a signal or tied to a
+                # constant (dump_features.tcl "pin <site> <pin> <how>").
+                if len(p) >= 4 and p[1] in site_map:
+                    tile, key = site_map[p[1]]
+                    feats[tile].add(f'{key}.PIN.{p[2]}={p[3]}')
             elif kind == 'cfg':
                 tile, key = site_map[p[1]]
                 value = ' '.join(p[4:])
@@ -934,10 +942,9 @@ def _park_data(sitekeys):
 
 
 def parked_imux_features(feats, sitekeys):
-    """Adds PARK.<input>-><IMUX node> to INT tiles (see above).  Off
-    unless URAY_PARK=1: with it mkdb mis-assigns another feature's bits
-    (xcku025 GCLK_B_0_12->INT_NODE_GLOBAL_5_OUT0, +2.2k distinct)."""
-    if os.environ.get('URAY_PARK', '0') != '1':
+    """Adds PARK.<input>-><IMUX node> to INT tiles (see above); URAY_PARK=0
+    disables it."""
+    if os.environ.get('URAY_PARK', '1') == '0':
         return
     data = _park_data(sitekeys)
     if data is None:

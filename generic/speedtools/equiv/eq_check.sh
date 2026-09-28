@@ -16,8 +16,8 @@ for v in new ref; do
         --fasm $S/${die}_$v.fasm $flag > $S/${die}_$v.log 2>&1
     cat $S/${die}_$v.time; grep vrun: $S/${die}_$v.log
 done
-grep -v '^vrun:' $S/${die}_new.log > $S/${die}_new.cmp
-grep -v '^vrun:' $S/${die}_ref.log > $S/${die}_ref.cmp
+grep -v '^vrun:\|^# check peak' $S/${die}_new.log > $S/${die}_new.cmp
+grep -v '^vrun:\|^# check peak' $S/${die}_ref.log > $S/${die}_ref.cmp
 if cmp $S/${die}_new.cmp $S/${die}_ref.cmp && cmp $S/${die}_new.fasm $S/${die}_ref.fasm; then
     echo "$die IDENTICAL log ($(wc -l < $S/${die}_new.cmp) lines) + fasm ($(wc -l < $S/${die}_new.fasm) lines)"
 else

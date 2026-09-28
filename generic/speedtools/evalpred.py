@@ -43,25 +43,34 @@ class TypeDB:
         pos, neg = [], []
         p = os.path.join(dbdir, f'segbits_{suffix}.db')
         if os.path.exists(p):
-            for l in open(p):
-                f = l.split()
-                parts = f[0].split('.', 1)[1].split('&')
-                i = len(self.nparts)
-                for x in set(parts):
-                    self.by_part[x].append(i)
-                self.nparts.append(len(set(parts)))
-                pos.append([RM.name_code(b) for b in f[1:]
-                            if not b.startswith('!')])
-                neg.append([RM.name_code(b[1:]) for b in f[1:]
-                            if b.startswith('!')])
+            # bits straight into numpy (some types have ~10^8 feature bits)
+            import check as CK
+            with open(p, 'rb') as fh:
+                for l in fh:
+                    f = l.rstrip(b'\n').split(b' ', 1)
+                    if not f[0]:
+                        continue
+                    parts = f[0].decode().split('.', 1)[1].split('&')
+                    i = len(self.nparts)
+                    for x in set(parts):
+                        self.by_part[x].append(i)
+                    self.nparts.append(len(set(parts)))
+                    if len(f) > 1 and f[1].strip():
+                        pc, nc = CK._parse_segbits_line(f[1])
+                    else:
+                        pc = nc = np.zeros(0, dtype=np.int64)
+                    pos.append(pc)
+                    neg.append(nc)
         self.single = {x: v for x, v in self.by_part.items()
                        if all(self.nparts[i] == 1 for i in v)}
         self.npos = np.array([len(x) for x in pos], dtype=np.int64)
         self.nneg = np.array([len(x) for x in neg], dtype=np.int64)
         self.pos_ptr = np.concatenate(([0], np.cumsum(self.npos)))
         self.neg_ptr = np.concatenate(([0], np.cumsum(self.nneg)))
-        self.pos = np.array([c for x in pos for c in x], dtype=np.int64)
-        self.neg = np.array([c for x in neg for c in x], dtype=np.int64)
+        cat = (lambda x: np.concatenate(x).astype(np.int64) if x else
+               np.zeros(0, dtype=np.int64))
+        self.pos = cat(pos)
+        self.neg = cat(neg)
         d = set()
         p = os.path.join(dbdir, f'defaults_{suffix}.db')
         if os.path.exists(p):

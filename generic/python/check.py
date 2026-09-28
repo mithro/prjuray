@@ -60,11 +60,16 @@ class Database:
         return self.types[key]
 
     def codes(self, ttype, k):
-        """TypeCodes of a (tile type, region index), cached."""
+        """TypeCodes of a (tile type, region index), cached; read straight
+        from the files (no per bit Python objects: some tile types have
+        hundreds of millions of feature bits)."""
         key = (ttype, k)
         if key not in self.type_codes:
-            feats, defaults, _ = self.get(ttype, k)
-            self.type_codes[key] = TypeCodes(feats, defaults)
+            suffix = ttype.lower() + (f'.{k}' if k else '')
+            self.type_codes[key] = TypeCodes.from_files(
+                [os.path.join(self.dbdir, f'segbits_{suffix}.db'),
+                 os.path.join(self.dbdir, f'segbits_opt_{suffix}.db')],
+                os.path.join(self.dbdir, f'defaults_{suffix}.db'))
         return self.type_codes[key]
 
     def decode(self, ttype, k, bits):
@@ -86,34 +91,106 @@ class Database:
         return matched, doc
 
 
+_NEG_MARK = 999999  # '!' in a segbits line (no frame / offset is this big)
+
+
+def _parse_segbits_line(rest):
+    """'FF_BBB !FF_BBB ...' -> (set bit codes, clear bit codes)."""
+    v = np.fromstring(rest.replace(b'_', b' ').replace(b'!', b'999999 '),
+                      dtype=np.int64, sep=' ')
+    m = np.flatnonzero(v == _NEG_MARK)
+    if len(m):
+        neg = np.zeros(len(v), dtype=bool)
+        neg[m + 1] = True
+        keep = np.ones(len(v), dtype=bool)
+        keep[m] = False
+        v, neg = v[keep], neg[keep]
+        neg = neg[0::2]
+    else:
+        neg = np.zeros(len(v) // 2, dtype=bool)
+    code = v[0::2] * RM.CODE_M + v[1::2]
+    return code[~neg], code[neg]
+
+
 class TypeCodes:
     """Database of one (tile type, region index) with relative bits as
     integer codes (regionmap.name_code), for vectorised decoding."""
 
-    def __init__(self, feats, defaults):
-        self.names = [f[0] for f in feats]
-        pos = [[RM.name_code(b) for b in f[1]] for f in feats]
-        neg = [[RM.name_code(b) for b in f[2]] for f in feats]
+    @classmethod
+    def from_files(cls, segbits, defaults_path):
+        """From segbits files (in order; missing ones skipped) and a
+        defaults file.  Same result as TypeCodes(Database.get(...)[:2])
+        for files written by mkdb (bits of a line distinct)."""
+        self = cls.__new__(cls)
+        self.names = []
+        pos, neg = [], []
+        for n, path in enumerate(segbits):
+            if not os.path.exists(path):
+                continue
+            # mkdb writes distinct bits per line (sets); other writers
+            # (segbits_opt) are made distinct here
+            dedupe = n > 0
+            with open(path, 'rb') as f:
+                for line in f:
+                    parts = line.rstrip(b'\n').split(b' ', 1)
+                    if not parts[0]:
+                        continue
+                    self.names.append(parts[0].decode())
+                    if len(parts) > 1 and parts[1].strip():
+                        pc, nc = _parse_segbits_line(parts[1])
+                        if dedupe:
+                            pc, nc = np.unique(pc), np.unique(nc)
+                    else:
+                        pc = nc = np.zeros(0, dtype=np.int64)
+                    pos.append(pc)
+                    neg.append(nc)
+        d = []
+        if os.path.exists(defaults_path):
+            d = sorted({l.split()[0] for l in open(defaults_path)
+                        if l.strip()})
+        self._arrays(pos, neg, np.unique(np.array(
+            [RM.name_code(b) for b in d], dtype=np.int64)))
+        return self
+
+    def _arrays(self, pos, neg, defaults):
         self.npos = np.array([len(p) for p in pos], dtype=np.int64)
         self.nneg = np.array([len(p) for p in neg], dtype=np.int64)
         self.pos_ptr = np.concatenate(([0], np.cumsum(self.npos)))
         self.neg_ptr = np.concatenate(([0], np.cumsum(self.nneg)))
-        self.pos = np.array([c for p in pos for c in p], dtype=np.int64)
-        self.neg = np.array([c for p in neg for c in p], dtype=np.int64)
-        self.defaults = np.unique(np.array(
-            [RM.name_code(b) for b in defaults], dtype=np.int64))
+        cat = (lambda x: np.concatenate(x).astype(np.int64) if x else
+               np.zeros(0, dtype=np.int64))
+        self.pos = cat(pos)
+        self.neg = cat(neg)
+        self.defaults = defaults
         # Every feature with set bits is found through one anchor bit (its
-        # least shared set bit): the candidates are the (region, feature)
-        # pairs with the anchor set, whose other bits are then verified.
-        fan = collections.Counter(c for p in pos for c in p)
-        fid, anc = [], []
-        for i, p in enumerate(pos):
-            if p:
-                fid.append(i)
-                anc.append(min(p, key=lambda c: (fan[c], c)))
-        order = np.argsort(np.array(anc, dtype=np.int64), kind='stable')
-        self.anchor = np.array(anc, dtype=np.int64)[order]
-        self.anchor_f = np.array(fid, dtype=np.int64)[order]
+        # least shared set bit, ties by code): the candidates are the
+        # (region, feature) pairs with the anchor set, whose other bits are
+        # then verified.
+        fid = np.flatnonzero(self.npos)
+        if len(self.pos):
+            fan = np.bincount(self.pos)
+            key = fan[self.pos] * (np.int64(1) << np.int64(32)) + self.pos
+            best = np.minimum.reduceat(key, self.pos_ptr[fid])
+            anc = best & ((np.int64(1) << np.int64(32)) - 1)
+        else:
+            anc = np.zeros(0, dtype=np.int64)
+        order = np.argsort(anc, kind='stable')
+        self.anchor = anc[order]
+        self.anchor_f = fid[order]
+        # per anchor-sorted feature: bits to verify (for chunking)
+        self.anchor_cost = np.concatenate(([0], np.cumsum(
+            self.npos[self.anchor_f] + self.nneg[self.anchor_f])))
+
+    def __init__(self, feats, defaults):
+        """From Database.get's (name, pos set, neg set) features."""
+        self.names = [f[0] for f in feats]
+        self._arrays(
+            [np.array(sorted(RM.name_code(b) for b in f[1]), dtype=np.int64)
+             for f in feats],
+            [np.array(sorted(RM.name_code(b) for b in f[2]), dtype=np.int64)
+             for f in feats],
+            np.unique(np.array([RM.name_code(b) for b in defaults],
+                               dtype=np.int64)))
 
 
 def _expand(ptr, counts, sel):
@@ -140,7 +217,40 @@ def _member(sorted_keys, q):
 _KEY_M = np.int64(1) << np.int64(32)
 
 
+# feature bits verified per step (memory bound; URAY_CHECK_CHUNK for tests)
+DECODE_CHUNK = int(os.environ.get("URAY_CHECK_CHUNK", 1 << 25))
+
+
 def decode_type(tc, reg, code):
+    """_decode_type in chunks of whole regions (pairs are grouped by
+    region), each verifying at most ~DECODE_CHUNK feature bits (types
+    with huge feature bit sets otherwise expand to tens of GB)."""
+    lo = np.searchsorted(tc.anchor, code, 'left')
+    hi = np.searchsorted(tc.anchor, code, 'right')
+    cost = np.cumsum(tc.anchor_cost[hi] - tc.anchor_cost[lo])
+    if not len(cost) or cost[-1] <= DECODE_CHUNK:
+        return _decode_type(tc, reg, code)
+    # region boundaries, and cut points at most DECODE_CHUNK apart
+    starts = np.concatenate(([0], np.flatnonzero(reg[1:] != reg[:-1]) + 1))
+    before = np.concatenate(([0], cost))[starts]
+    cuts = [0]
+    before_cut = 0
+    for i, c in zip(starts.tolist(), before.tolist()):
+        if i and c - before_cut > DECODE_CHUNK:
+            cuts.append(i)
+            before_cut = c
+    cuts.append(len(reg))
+    doc = np.zeros(len(reg), dtype=bool)
+    mr, mf = [], []
+    for a, b in zip(cuts, cuts[1:]):
+        d, (r, f) = _decode_type(tc, reg[a:b], code[a:b])
+        doc[a:b] = d
+        mr.append(r)
+        mf.append(f)
+    return doc, (np.concatenate(mr), np.concatenate(mf))
+
+
+def _decode_type(tc, reg, code):
     """Vectorised Database.decode of all regions of one (tile type, region
     index).  reg, code: the (region, relative bit code) pairs of the set
     bits.  Returns (documented mask of the pairs, (regions, feature
@@ -392,6 +502,13 @@ def main():
         print(f'{tt}: {sum(c.values())} ({len(c)} distinct) e.g. '
               f'{", ".join(f"{b}x{n}" for b, n in c.most_common(args.top))}')
     print('unowned total', total_unowned)
+    # peak memory, for the pipeline's check scheduling (without workers the
+    # process itself stands for a worker)
+    import resource
+    me = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+    kids = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss * 1024
+    print(f'# check peak parent {me} worker {kids if ex else me} jobs '
+          f'{min(args.jobs, len(todo)) if ex else 1}', flush=True)
     return 1 if (total or total_unowned) else 0
 
 
