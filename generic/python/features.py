@@ -31,6 +31,23 @@ import re
 
 import numpy as np
 
+# Feature cache hooks (designdata.feature_inputs_stamp): environment
+# variables that change the features (A/B switches) and a function
+# returning the other files a die's features depend on (e.g. per die meta
+# files read by a derived pass).  features.py itself, generic/data/*,
+# clockgen_tables.json and the die's tiles / bonded files are always
+# covered.
+STAMP_ENV = ('URAY_PARK', 'URAY_LEAFPAIR')
+
+
+def stamp_files(tiles_tsv):
+    # the die's PIP list (build/meta/pips/<die>.txt): _gclk_feeds,
+    # parked_imux_features
+    meta = os.path.dirname(os.path.dirname(tiles_tsv))
+    name = os.path.splitext(os.path.basename(tiles_tsv))[0]
+    return [os.path.join(meta, 'pips', name + '.txt')]
+
+
 _XY = re.compile(r'^(.*)_X(\d+)Y(\d+)$')
 _VEC = re.compile(r"^(\d+)'([bh])([0-9a-fA-F_]+)$")
 
@@ -76,6 +93,14 @@ class SiteKeys:
         self.key = {}
         self.tile_type = {}
         self.pads = collections.defaultdict(list)  # tile -> pad sites
+        # Bonded pad sites (build/meta/bonded/<die>.txt from
+        # tcl/dump_bonded.tcl), None when not known.
+        self.bonded = None
+        bp = os.path.join(os.path.dirname(os.path.dirname(tiles_tsv)),
+                          'bonded', os.path.basename(tiles_tsv)[:-4] + '.txt')
+        if os.path.exists(bp):
+            with open(bp) as f:
+                self.bonded = set(f.read().split())
         self.region = {}  # tile -> clock region (X<c>Y<r>, '-')
         self.xy = {}  # tile -> (grid x, grid y)
         self.tiles_tsv = tiles_tsv
@@ -105,9 +130,6 @@ class SiteKeys:
                 for name, x, y in lst:
                     self.key[name] = (p[1], f'{prefix}_X{x - mx}Y{y - my}')
 
-
-# Environment switches changing the derived features (cache stamps).
-STAMP_ENV = ('URAY_PARK', 'URAY_LEAFPAIR')
 
 _EQN_CACHE = {}
 _IDX = np.arange(64, dtype=np.uint8)
@@ -403,6 +425,15 @@ def open_any(path):
 
 def tile_features(path, sitekeys):
     """Returns {tile: set(features)} for one design."""
+    return derive(parse_dump(path, sitekeys), sitekeys)
+
+
+def parse_dump(path, sitekeys):
+    """The features read directly from the dump lines, and what the derived
+    features need from it: (feats, site_map, glob_opts, bel_cfgs,
+    bank_stds).  (designdata caches this per design, keyed by the source
+    of this function and of everything it uses: keep derived features in
+    derive().)"""
     feats = collections.defaultdict(set)
     site_map = {}
     glob_opts = {}
@@ -451,6 +482,13 @@ def tile_features(path, sitekeys):
                 value = ' '.join(p[4:])
                 feats[tile].update(cfg_features(f'{key}.{p[2]}', p[3], value))
                 bel_cfgs[(tile, f'{key}.{p[2]}')][p[3]] = value
+    return feats, site_map, glob_opts, bel_cfgs, bank_stds
+
+
+def derive(state, sitekeys):
+    """Derived features added to parse_dump's state (modified in place);
+    returns {tile: set(features)}."""
+    feats, site_map, glob_opts, bel_cfgs, bank_stds = state
     # Bank VCCO (bank wide settings such as the 7-series STEPDOWN depend on
     # it rather than on single standards).
     global _VCCO
@@ -673,8 +711,24 @@ def tile_features(path, sitekeys):
         v = glob_opts['UNUSEDPIN'].upper()
         for tile, pads in sitekeys.pads.items():
             for s in pads:
+                key = sitekeys.key[s][1]
                 if s not in site_map:
-                    feats[tile].add(f'{sitekeys.key[s][1]}.UNUSEDPIN={v}')
+                    feats[tile].add(f'{key}.UNUSEDPIN={v}')
+                    pull = v
+                else:
+                    pull = bel_cfgs.get((tile, f'{key}.PAD'), {}).get(
+                        'PULLTYPE', 'NONE').upper()
+                # The pad's pull as programmed, used or not: the pull down
+                # is the all-zero setting (xcku025 HPIO_L 04_1858 /
+                # 08_1538 / 00_898 set with PULLNONE and PULLUP alike).
+                pull = {'PULLNONE': 'NONE', 'PULLUP': 'UP',
+                        'PULLDOWN': 'DOWN', 'PULLKEEPER': 'KEEPER'}.get(
+                            pull, pull)
+                if sitekeys.bonded is not None and \
+                        s not in sitekeys.bonded:
+                    continue  # (unbonded: no pull programming)
+                feats[tile].add(f'{key}.EFF_PULL={pull}')
+                feats[tile].add(f'{key}.EFF_PULLDOWN={int(pull == "DOWN")}')
     hclk_row_features(feats, sitekeys)
     # (parked IMUX first: the leaf clock PIPs are implied, not routed)
     parked_imux_features(feats, sitekeys)
