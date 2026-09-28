@@ -100,6 +100,13 @@ def _feature_code_stamp(sitekeys):
                     crc = zlib.crc32(f.read(), crc)
         crc = zlib.crc32(repr(sorted(featlib._std_vcco().items())).encode(),
                          crc)
+        # data files the features use (INT node maps) and feature switches
+        data = os.path.join(os.path.dirname(here), 'data')
+        if os.path.isdir(data):
+            for name in sorted(os.listdir(data)):
+                with open(os.path.join(data, name), 'rb') as f:
+                    crc = zlib.crc32(f.read(), crc)
+        crc = zlib.crc32(os.environ.get('URAY_PARK', '1').encode(), crc)
         sk = zlib.crc32(pickle.dumps(
             {k: v for k, v in vars(sitekeys).items()},
             protocol=pickle.HIGHEST_PROTOCOL))

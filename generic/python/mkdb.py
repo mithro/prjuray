@@ -631,7 +631,14 @@ def _code_stamp():
     derived from the dumps must invalidate cached samples."""
     here = os.path.dirname(os.path.abspath(__file__))
     with open(os.path.join(here, 'features.py'), 'rb') as f:
-        return zlib.crc32(f.read())
+        crc = zlib.crc32(f.read())
+    # data files the features use (INT node maps) and feature switches
+    data = os.path.join(os.path.dirname(here), 'data')
+    if os.path.isdir(data):
+        for name in sorted(os.listdir(data)):
+            with open(os.path.join(data, name), 'rb') as f:
+                crc = zlib.crc32(f.read(), crc)
+    return zlib.crc32(os.environ.get('URAY_PARK', '1').encode(), crc)
 
 
 def _cache_stamp(arch, dn, d):
