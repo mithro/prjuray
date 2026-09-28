@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+# Copyright 2020-2026 F4PGA Authors
+# SPDX-License-Identifier: Apache-2.0
+"""Tile grids + bit database + check for a set of dies of one architecture."""
+import argparse
+import json
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from concurrent.futures import ProcessPoolExecutor
+
+import dies as dieslib
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def run(cmd, log):
+    with open(log, 'w') as f:
+        r = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT)
+    return r.returncode
+
+
+def tg_config(arch):
+    """The architecture's settings in generic/tilegrid_config.json."""
+    path = os.path.join(os.path.dirname(HERE), 'tilegrid_config.json')
+    with open(path) as f:
+        return json.load(f).get(arch, {})
+
+
+def colalign_extra(arch):
+    cfg = tg_config(arch)
+    out = []
+    if cfg.get('region_dies'):
+        out += ['--learn-exclude', ','.join(cfg['region_dies'])]
+    if cfg.get('init_dies'):
+        out += ['--init-dies', ','.join(cfg['init_dies'])]
+    return out
+
+
+def evidence(args):
+    """Design activity evidence of a die (and its activity only tile grid,
+    for comparison)."""
+    die, arch, tags, jobs = args
+    cfg = tg_config(arch)
+    extra = []
+    if die in cfg.get('region_dies', ()) and cfg.get('max_matches'):
+        extra = ['--max-matches', str(cfg['max_matches'])]
+    out = os.path.join(dieslib.DB, arch, die)
+    os.makedirs(out, exist_ok=True)
+    roots = ','.join(
+        os.path.join(dieslib.BUILD, 'designs', die, t) for t in tags)
+    return die, run([
+        sys.executable,
+        os.path.join(HERE, 'tilegrid.py'), '--die', die, '--designs', roots,
+        '--evidence',
+        os.path.join(out, 'evidence.json'), '--out',
+        os.path.join(out, 'tilegrid_activity.json'), '--jobs', str(jobs)
+    ] + extra, os.path.join(out, 'evidence.log'))
+
+
+def tilegrid(args):
+    """Tile grid from the evidence and the structural frame column
+    alignment."""
+    die, arch = args
+    out = os.path.join(dieslib.DB, arch, die)
+    win = os.path.join(dieslib.DB, arch, 'windows.json')
+    frm = os.path.join(dieslib.DB, arch, 'frames.json')
+    return die, run([
+        sys.executable,
+        os.path.join(HERE, 'tilegrid.py'), '--die', die, '--evidence',
+        os.path.join(out, 'evidence.json'), '--colmap',
+        os.path.join(out, 'colmap.json'), '--out',
+        os.path.join(out, 'tilegrid.json')
+    ] + (['--windows', win] if os.path.exists(win) else []) + (
+        ['--frames', frm] if os.path.exists(frm) else []),
+        os.path.join(out, 'tilegrid.log'))
+
+
+def probe(args):
+    """Tile type windows of a die: a tile grid giving the doubtful tile
+    types wide windows, a bit database of these types built with it (in
+    <BUILD>/probe/<die>), and the rows their features use."""
+    die, arch, tags = args
+    root = os.path.join(dieslib.BUILD, 'probe', die)
+    out = os.path.join(root, arch, die)
+    os.makedirs(out, exist_ok=True)
+    src = os.path.join(dieslib.DB, arch, die)
+    rc = run([
+        sys.executable,
+        os.path.join(HERE, 'tilegrid.py'), '--die', die, '--evidence',
+        os.path.join(src, 'evidence.json'), '--colmap',
+        os.path.join(src, 'colmap.json'), '--probe', 'auto', '--out',
+        os.path.join(out, 'tilegrid.json')
+    ], os.path.join(out, 'tilegrid.log'))
+    if rc:
+        return die, rc
+    types = []
+    for line in open(os.path.join(out, 'tilegrid.log')):
+        if line.startswith('probe '):
+            types = line.split()[1:]
+    if not types:
+        return die, 0
+    env = dict(os.environ, URAY_DB=root, PYTHONHASHSEED='0')
+    with open(os.path.join(out, 'mkdb.log'), 'w') as f:
+        rc = subprocess.run([
+            sys.executable,
+            os.path.join(HERE, 'mkdb.py'), '--arch', arch, '--dies', die,
+            '--tag', ','.join(tags), '--types', ','.join(types), '--jobs',
+            '16'
+        ], stdout=f, stderr=subprocess.STDOUT, env=env).returncode
+    if rc:
+        return die, rc
+    return die, run([
+        sys.executable,
+        os.path.join(HERE, 'windows.py'), '--die', die, '--probe-db',
+        os.path.join(root, arch), '--probe-types', ','.join(types),
+        '--out', os.path.join(out, 'windows.json')
+    ], os.path.join(out, 'windows.log'))
+
+
+def consistency(dlist, arch, tags, logdir):
+    """Checks the designs of every die against the existing bit database
+    (consistency.py, one die at a time) and writes the suspects to
+    <logdir>/suspects_<arch>.txt.  Returns that path, or None when there is
+    no database (or no suspect)."""
+    dbdir = os.path.join(dieslib.DB, arch)
+    if not any(f.startswith('segbits_') for f in os.listdir(dbdir)):
+        print('consistency: no bit database yet', flush=True)
+        return None
+    suspects = []
+    for d in dlist:
+        roots = ','.join(
+            os.path.join(dieslib.BUILD, 'designs', d, t) for t in tags)
+        log = os.path.join(logdir, f'consistency_{d}.log')
+        rc = run([
+            sys.executable,
+            os.path.join(HERE, 'consistency.py'), '--die', d, '--designs',
+            roots
+        ], log)
+        found = [line.split(None, 1)[1].strip() for line in open(log)
+                 if line.startswith('SUSPECT ')]
+        print(f'consistency {d} rc {rc} suspects {len(found)}', flush=True)
+        suspects += found
+    if not suspects:
+        return None
+    path = os.path.join(logdir, f'suspects_{arch}.txt')
+    with open(path, 'w') as f:
+        f.write('\n'.join(suspects) + '\n')
+    return path
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--dies', required=True)
+    ap.add_argument('--tags', required=True)
+    ap.add_argument('--check-tags', default=None)
+    ap.add_argument('--skip-tilegrid', action='store_true')
+    ap.add_argument('--probe-windows', action='store_true',
+                    help='learn the tile type windows of hard blocks (a '
+                    'probe bit database per die) into <db>/<arch>/'
+                    'windows.json before building the tile grids')
+    ap.add_argument('--consistency', action='store_true',
+                    help='when a bit database of the architecture exists, '
+                    'check the designs against it (consistency.py) and leave '
+                    'the suspects out of the new database')
+    ap.add_argument('--jobs', type=int, default=24)
+    ap.add_argument('--sample-jobs', type=int, default=None,
+                    help='mkdb per design sample cache workers (mkdb '
+                    '--sample-jobs; default --jobs).  Up to ~1.3 GiB per '
+                    'worker (Series7 xc7k160t), more on large US(+) dies: '
+                    'use --mem-budget with it')
+    ap.add_argument('--mem-budget', type=float, default=None,
+                    help='GiB for mkdb\'s sample phase (mkdb '
+                    '--sample-mem-budget): at most budget / (1.25 x the '
+                    'largest measured worker peak, >= 2 GiB) designs at '
+                    'once; set it below the vrun.sh cap (the phase 2 '
+                    'tasks are sized by --jobs as before); also the check '
+                    'stage: dies check together as far as their measured '
+                    'peaks (<db>/<arch>/check_peaks.json) fit, unmeasured '
+                    'dies alone with ~4 GiB per job')
+    args = ap.parse_args()
+    alldies = dieslib.load()
+    dlist = args.dies.split(',')
+    arch = alldies[dlist[0]].arch
+    assert all(alldies[d].arch == arch for d in dlist)
+    tags = args.tags.split(',')
+    logdir = os.path.join(dieslib.BUILD, 'logs')
+    if not args.skip_tilegrid:
+        with ProcessPoolExecutor(min(len(dlist), 8)) as ex:
+            # designs loaded in parallel per die (1-2 GB per worker on
+            # large dies)
+            ej = max(1, min(4, args.jobs // min(len(dlist), 8)))
+            for die, rc in ex.map(evidence, [(d, arch, tags, ej)
+                                             for d in dlist]):
+                print('evidence', die, 'rc', rc, flush=True)
+        # Frame column alignment over every die of the architecture with
+        # evidence (the kind tables are shared).
+        rc = run([
+            sys.executable,
+            os.path.join(HERE, 'colalign.py'), '--arch', arch, '--exp',
+            dieslib.DB, '--verbose'
+        ] + (['--supported'] if arch != 'Series7' else []) + colalign_extra(
+            arch),
+            os.path.join(logdir, f'colalign_{arch}.log'))
+        print('colalign rc', rc, flush=True)
+        if args.probe_windows:
+            with ProcessPoolExecutor(min(len(dlist), 4)) as ex:
+                for die, rc in ex.map(probe, [(d, arch, tags)
+                                              for d in dlist]):
+                    print('probe', die, 'rc', rc, flush=True)
+            files = [os.path.join(dieslib.BUILD, 'probe', d, arch, d,
+                                  'windows.json') for d in dlist]
+            files = [f for f in files if os.path.exists(f)]
+            rc = run([
+                sys.executable,
+                os.path.join(HERE, 'windows.py'), '--die', dlist[0],
+                '--merge'] + files + [
+                '--out', os.path.join(dieslib.DB, arch, 'windows.json')
+            ], os.path.join(logdir, f'windows_{arch}.log'))
+            print('windows rc', rc, flush=True)
+        with ProcessPoolExecutor(min(len(dlist), 8)) as ex:
+            for die, rc in ex.map(tilegrid, [(d, arch) for d in dlist]):
+                print('tilegrid', die, 'rc', rc, flush=True)
+    exclude = []
+    if args.consistency:
+        path = consistency(dlist, arch, tags, logdir)
+        if path:
+            exclude = ['--exclude', path]
+    sj = []
+    if args.sample_jobs:
+        with open(os.path.join(HERE, 'mkdb.py')) as f:
+            if '--sample-jobs' not in f.read():
+                sys.exit('mkdb.py has no --sample-jobs')
+        sj = ['--sample-jobs', str(args.sample_jobs)]
+    if args.mem_budget:
+        sj += ['--sample-mem-budget', str(args.mem_budget)]
+    t0 = time.time()
+    mlog = os.path.join(logdir, f'mkdb_{arch}.log')
+    print(f'[{time.strftime("%H:%M:%S")}] mkdb started (progress in '
+          f'{mlog})', flush=True)
+    rc = run([
+        sys.executable,
+        os.path.join(HERE, 'mkdb.py'), '--arch', arch, '--dies',
+        args.dies, '--tag', args.tags, '--jobs',
+        str(args.jobs)
+    ] + sj + exclude, mlog)
+    print(f'[{time.strftime("%H:%M:%S")}] mkdb {time.time() - t0:.0f} s',
+          flush=True)
+    print('build_db rc', rc, flush=True)
+    # Checks of all dies in parallel, each checking its designs in
+    # parallel with a share of --jobs proportional to its size (the tile
+    # grid's size: bits per design), so that the big dies do not finish
+    # last with one job.
+    size = {d: os.path.getsize(os.path.join(dieslib.DB, arch, d,
+                                            'tilegrid.json'))
+            for d in dlist}
+    cjobs = {d: max(1, min(20, round(args.jobs * size[d] /
+                                     sum(size.values()))))
+             for d in dlist}
+
+    peaks_path = os.path.join(dieslib.DB, arch, 'check_peaks.json')
+    try:
+        with open(peaks_path) as f:
+            known = json.load(f)
+    except (OSError, ValueError):
+        known = {}
+
+    def estimate(d):
+        """Bytes a die's check.py needs (from its last run: the parent
+        and, per worker, the largest worker), or None."""
+        k = known.get(d)
+        if not k:
+            return None
+        return k['parent'] + min(cjobs[d], k['jobs'] or 1) * k['worker']
+
+    def check(d):
+        roots = ','.join(
+            os.path.join(dieslib.BUILD, 'designs', d, t)
+            for t in (args.check_tags or args.tags).split(','))
+        log = os.path.join(logdir, f'check_{d}.log')
+        run([
+            sys.executable,
+            os.path.join(HERE, 'check.py'), '--die', d, '--designs', roots,
+            '--max', '20', '--jobs', str(cjobs[d])
+        ], log)
+        for line in open(log):
+            m = re.match(r'# check peak parent (\d+) worker (\d+) jobs '
+                         r'(\d+)', line)
+            if m:
+                known[d] = dict(parent=int(m.group(1)),
+                                worker=int(m.group(2)),
+                                jobs=int(m.group(3)))
+        return log
+    from concurrent.futures import (FIRST_COMPLETED, ThreadPoolExecutor,
+                                    wait)
+    t0 = time.time()
+    print(f'[{time.strftime("%H:%M:%S")}] checks started', flush=True)
+    # With --mem-budget the dies' checks run together only as far as their
+    # measured peaks (check_peaks.json, from earlier runs) fit the budget;
+    # a die without a measurement runs alone.  Largest estimate first.
+    budget = args.mem_budget * 2**30 if args.mem_budget else None
+    todo = sorted(dlist, key=lambda d: -(estimate(d) or float('inf')))
+    logs = {}
+    with ThreadPoolExecutor(len(dlist)) as ex:
+        running = {}  # future -> estimate (inf: not measured yet)
+        while todo or running:
+            for d in list(todo):
+                e = estimate(d)
+                if budget is not None and running:
+                    if e is None or float('inf') in running.values() or \
+                            sum(running.values()) + 1.1 * e > budget:
+                        continue
+                todo.remove(d)
+                if budget is not None:
+                    # jobs that fit: measured, or ~4 GiB per job unmeasured
+                    k = known.get(d)
+                    fit = int((budget / 1.1 - k['parent']) // k['worker']) \
+                        if k and k['worker'] else int(budget // (4 << 30))
+                    cjobs[d] = max(1, min(cjobs[d], fit))
+                running[ex.submit(check, d)] = \
+                    float('inf') if e is None else e
+            done, _ = wait(running, return_when=FIRST_COMPLETED)
+            for f in done:
+                running.pop(f)
+                log = f.result()
+                logs[os.path.basename(log)[6:-4]] = log
+    logs = [logs[d] for d in dlist]
+    tmp = f'{peaks_path}.{os.getpid()}.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(known, f, indent=1, sort_keys=True)
+    os.replace(tmp, peaks_path)
+    print(f'[{time.strftime("%H:%M:%S")}] checks {time.time() - t0:.0f} s '
+          f'(jobs per die '
+          f'{" ".join(f"{d}:{cjobs[d]}" for d in dlist)})', flush=True)
+    for d, log in zip(dlist, logs):
+        tail = open(log).read().strip().split('\n')
+        summary = [l for l in tail if not l.startswith('/')]
+        print(f'== check {d}')
+        print('\n'.join(l[:300] for l in summary[:25]), flush=True)
+
+
+if __name__ == '__main__':
+    main()
