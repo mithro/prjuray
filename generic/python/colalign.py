@@ -619,6 +619,37 @@ def claim_unused(dr, cr, full, ref=None):
     return out
 
 
+def edge_frames(dr, cr, full, table):
+    """The last (first) grid column of a row whose frame column has another
+    frame count than its kind usually has (over all dies, silent kinds
+    included) moves to the nearest unused frame column further out with
+    that count (xazu3teg: a GTH_QUAD_RIGHT of the row without CMT took the
+    4 minor column before the die edge's 8 minor one)."""
+    if len(full) < 2:
+        return full
+    M = dr.majors(cr)
+    out = dict(full)
+    used = set(out.values())
+    kinds = dict(dr.rows[cr])
+    order = sorted(out.items())
+    for (gx, j), step in ((order[-1], 1), (order[0], -1)):
+        c = table.emit.get(kinds.get(gx))
+        if not c:
+            continue
+        nf, n = c.most_common(1)[0]
+        if M[j][2] == nf or n < 0.8 * sum(c.values()):
+            continue
+        k = j + step
+        while 0 <= k < len(M):
+            if k not in used and M[k][2] == nf:
+                used.discard(j)
+                out[gx] = k
+                used.add(k)
+                break
+            k += step
+    return out
+
+
 def minority_tiles(dr, cr, full):
     """Hard block tiles (with sites) of another type than their column's
     kind, e.g. a PCIE block over part of a CLB column, where the other grid
@@ -927,7 +958,8 @@ def main():
                     for gx, j in f2.items():
                         ref[gx].add((j, dr.majors(c2)[j][2]))
             ref = {gx: v for gx, v in ref.items() if len(v) == 1}
-            full = claim_unused(dr, cr, first[cr], ref)
+            full = edge_frames(dr, cr, claim_unused(dr, cr, first[cr], ref),
+                               table)
             for gx, j in sorted(full.items()):
                 colmap.append([cr, gx, m[j][0]])
             for name, j in minority_tiles(dr, cr, full).items():
