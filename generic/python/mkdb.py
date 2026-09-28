@@ -626,23 +626,15 @@ def _chunk_samples(raw):
             yield 'e', fflat[:0], bflat[bo[j]:bo[j + 1]]
 
 
-def _code_stamp():
-    """Checksum of the feature extraction code: changing how features are
-    derived from the dumps must invalidate cached samples."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    with open(os.path.join(here, 'features.py'), 'rb') as f:
-        crc = zlib.crc32(f.read())
-    # data files the features use (INT node maps) and feature switches
-    data = os.path.join(os.path.dirname(here), 'data')
-    if os.path.isdir(data):
-        for name in sorted(os.listdir(data)):
-            with open(os.path.join(data, name), 'rb') as f:
-                crc = zlib.crc32(f.read(), crc)
-    return zlib.crc32(os.environ.get('URAY_PARK', '0').encode(), crc)
+_TILES_TSV = {}
 
 
 def _cache_stamp(arch, dn, d):
-    st = [CACHE_VERSION, _code_stamp()]
+    # feature code, its data files and switches, the die's site files
+    # (designdata.feature_inputs_stamp): anything changing the features
+    if dn not in _TILES_TSV:
+        _TILES_TSV[dn] = dieslib.load()[dn].tiles_tsv
+    st = [CACHE_VERSION, DD.feature_inputs_stamp(_TILES_TSV[dn])]
     for p in (os.path.join(d, 'bits.npz'),
               os.path.join(d, 'design.features.gz'),
               os.path.join(dieslib.DB, arch, dn, 'tilegrid.json')):

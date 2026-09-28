@@ -71,89 +71,212 @@ def load_bits(dframes, d):
                    z['bit'].astype(np.int64))
 
 
-# Per design feature cache: tile_features() of a design, pickled, next to
-# the build's designs (<build>/cache/features/<die>/<tag>/<sN>.<code>.pkl,
-# the build of the design directory's real path, so scratch trees of
-# symlinked designs share it; <code> is the feature code checksum, so
-# checkouts with different feature code do not overwrite each other's
-# entries: stale ones can be deleted at any time).  The stamp covers the dump (mtime, size), the feature
-# code (features.py, clockgen_tables.json, the I/O standard table from
-# gen_design.py) and the site keys, so a tile grid change (a new sample
-# cache) reuses the features and only a feature code change recomputes
-# them.  URAY_FEATURE_CACHE=0 disables it.  (pickle: like mkdb's sample
-# cache, a private cache of the build tree written only here.)
-FEATURE_CACHE_VERSION = 1
+# Per design feature caches, next to the build's designs (the build of the
+# design directory's real path, so scratch trees of symlinked designs
+# share them; pickle: private caches of the build tree written only here;
+# stale files can be deleted at any time; URAY_FEATURE_CACHE=0 disables
+# both):
+#
+# * <build>/cache/features/<die>/<tag>/<sN>.<code>.pkl: tile_features() of
+#   the design.  Stamp: the dump (mtime, size) and feature_inputs_stamp()
+#   (feature code, data files, the die's site files, STAMP_ENV switches).
+#   <code> (that checksum) in the name: checkouts with different feature
+#   code do not overwrite each other's entries.
+# * <build>/cache/parse/<die>/<tag>/<sN>.<parse code>.pkl: parse_dump() of
+#   the design (the dump read into features and BEL settings, ~80% of
+#   tile_features).  Its code checksum covers only parse_dump and what it
+#   uses (code_digest), so an edit of the derived features (derive() and
+#   its helpers) reuses it and only reruns derive().
+FEATURE_CACHE_VERSION = 2  # 2: joined feature strings, lz4
 _CODE = {}
 
 
-def _feature_code_stamp(sitekeys):
-    key = id(sitekeys)
+def code_digest(path, roots):
+    """Checksum of the source of the top level functions / classes /
+    assignments named roots in the module at path and, transitively, of
+    every top level name they refer to."""
+    import ast
+    import hashlib
+    src = open(path).read()
+    tree = ast.parse(src)
+    top = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef,
+                             ast.AsyncFunctionDef)):
+            top.setdefault(node.name, []).append(node)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else \
+                [node.target]
+            for t in targets:
+                for n in ast.walk(t):
+                    if isinstance(n, ast.Name):
+                        top.setdefault(n.id, []).append(node)
+    seen, todo, parts = set(), list(roots), []
+    while todo:
+        name = todo.pop()
+        if name in seen or name not in top:
+            continue
+        seen.add(name)
+        for node in top[name]:
+            parts.append(f'{name}:{ast.get_source_segment(src, node)}')
+            for n in ast.walk(node):
+                if isinstance(n, ast.Name) and n.id in top:
+                    todo.append(n.id)
+    h = hashlib.blake2b(digest_size=8)
+    for x in sorted(parts):
+        h.update(x.encode() + b'\0')
+    return int(h.hexdigest(), 16) & 0xFFFFFFFF
+
+
+def feature_inputs_stamp(tiles_tsv):
+    """Checksum of everything tile_features() depends on besides the dump:
+    features.py and clockgen_tables.json, every file under generic/data/,
+    the die's tiles_tsv and bonded pad list, the I/O standard VCCO table
+    (gen_design.py), the environment variables named in
+    features.STAMP_ENV and the files returned by features.stamp_files(
+    tiles_tsv) (hooks for feature code reading other inputs).  Cached per
+    tiles_tsv."""
+    key = ('inputs', tiles_tsv)
     if key not in _CODE:
-        import pickle
+        import glob
         import zlib
         here = os.path.dirname(os.path.abspath(featlib.__file__))
+        files = [os.path.join(here, 'features.py'),
+                 os.path.join(here, 'clockgen_tables.json'), tiles_tsv,
+                 os.path.join(os.path.dirname(os.path.dirname(tiles_tsv)),
+                              'bonded',
+                              os.path.basename(tiles_tsv)[:-4] + '.txt')]
+        files += sorted(glob.glob(os.path.join(os.path.dirname(here), 'data',
+                                               '**', '*'), recursive=True))
+        hook = getattr(featlib, 'stamp_files', None)
+        if hook:
+            files += list(hook(tiles_tsv))
         crc = FEATURE_CACHE_VERSION
-        for name in ('features.py', 'clockgen_tables.json'):
-            p = os.path.join(here, name)
-            if os.path.exists(p):
+        for p in files:
+            crc = zlib.crc32(p.encode(), crc)
+            if os.path.isfile(p):
                 with open(p, 'rb') as f:
                     crc = zlib.crc32(f.read(), crc)
         crc = zlib.crc32(repr(sorted(featlib._std_vcco().items())).encode(),
                          crc)
-        # data files the features use (INT node maps) and feature switches
-        data = os.path.join(os.path.dirname(here), 'data')
-        if os.path.isdir(data):
-            for name in sorted(os.listdir(data)):
-                with open(os.path.join(data, name), 'rb') as f:
-                    crc = zlib.crc32(f.read(), crc)
-        crc = zlib.crc32(os.environ.get('URAY_PARK', '0').encode(), crc)
-        sk = zlib.crc32(pickle.dumps(
-            {k: v for k, v in vars(sitekeys).items()},
-            protocol=pickle.HIGHEST_PROTOCOL))
-        _CODE.clear()
-        _CODE[key] = (crc, sk)
+        for k in getattr(featlib, 'STAMP_ENV', ()):
+            crc = zlib.crc32(f'{k}={os.environ.get(k)}'.encode(), crc)
+        _CODE[key] = crc
     return _CODE[key]
 
 
-def feature_cache_path(d, sitekeys):
+def _feature_code_stamp(sitekeys):
+    """(feature inputs crc, 0, parse code crc, tiles_tsv crc) of a
+    SiteKeys (cached).  parse_dump() reads only the dump and the site key
+    map (from tiles_tsv): its cache key is its source digest and the
+    tiles_tsv content."""
+    key = ('code', sitekeys.tiles_tsv)
+    if key not in _CODE:
+        import zlib
+        here = os.path.dirname(os.path.abspath(featlib.__file__))
+        pcode = code_digest(os.path.join(here, 'features.py'),
+                            ['parse_dump'])
+        with open(sitekeys.tiles_tsv, 'rb') as f:
+            pkey = zlib.crc32(f.read())
+        _CODE[key] = (feature_inputs_stamp(sitekeys.tiles_tsv), 0, pcode,
+                      pkey)
+    return _CODE[key]
+
+
+def _cache_path(d, kind, code):
     real = os.path.realpath(d)
     parts = real.split(os.sep)
     if len(parts) < 5 or parts[-4] != 'designs':
         return None
-    code = _feature_code_stamp(sitekeys)[0]
-    return os.path.join(os.sep.join(parts[:-4]), 'cache', 'features',
+    return os.path.join(os.sep.join(parts[:-4]), 'cache', kind,
                         *parts[-3:]) + f'.{code:08x}.pkl'
+
+
+def feature_cache_path(d, sitekeys):
+    return _cache_path(d, 'features', _feature_code_stamp(sitekeys)[0])
+
+
+try:
+    import lz4.frame as _lz4
+except ImportError:  # zlib instead (slower)
+    _lz4 = None
+
+
+def _pack_feats(feats):
+    """{tile: set} -> {tile: '\\n'.join} (pickling millions of small
+    strings is slow)."""
+    return {t: '\n'.join(fs) for t, fs in feats.items()}
+
+
+def _unpack_feats(packed):
+    import collections
+    out = collections.defaultdict(set)
+    for t, v in packed.items():
+        out[t] = set(v.split('\n')) if v else set()
+    return out
+
+
+def _load(path, stamp):
+    """(the object saved with this stamp) or None."""
+    import pickle
+    import zlib
+    try:
+        with open(path, 'rb') as f:
+            if pickle.load(f) != stamp:
+                return None
+            kind = pickle.load(f)
+            data = f.read()
+        data = _lz4.decompress(data) if kind == 'lz4' else \
+            zlib.decompress(data)
+        return pickle.loads(data)
+    except (OSError, EOFError, pickle.UnpicklingError, ValueError,
+            zlib.error, RuntimeError, AttributeError):
+        return None
+
+
+def _save(path, stamp, obj):
+    import pickle
+    import zlib
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f'{path}.{os.getpid()}.tmp'
+        data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+        with open(tmp, 'wb') as f:
+            pickle.dump(stamp, f, protocol=pickle.HIGHEST_PROTOCOL)
+            if _lz4 is not None:
+                pickle.dump('lz4', f)
+                f.write(_lz4.compress(data, compression_level=0))
+            else:
+                pickle.dump('zlib', f)
+                f.write(zlib.compress(data, 1))
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f'# feature cache not written: {e}', flush=True)
 
 
 def load_features(d, sitekeys):
     """{tile: set(features)} of a design (cached, see above)."""
-    import pickle
-    import zlib
     src = os.path.join(d, 'design.features.gz')
     path = None
     if os.environ.get('URAY_FEATURE_CACHE', '1') != '0':
         path = feature_cache_path(d, sitekeys)
     if path is None:
         return featlib.tile_features(src, sitekeys)
+    code = _feature_code_stamp(sitekeys)
     st = os.stat(src)
-    stamp = (FEATURE_CACHE_VERSION, _feature_code_stamp(sitekeys),
-             st.st_mtime_ns, st.st_size)
-    try:
-        with open(path, 'rb') as f:
-            if pickle.load(f) == stamp:
-                return pickle.loads(zlib.decompress(f.read()))
-    except (OSError, EOFError, pickle.UnpicklingError, ValueError,
-            zlib.error):
-        pass
-    feats = featlib.tile_features(src, sitekeys)
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = f'{path}.{os.getpid()}.tmp'
-        with open(tmp, 'wb') as f:
-            pickle.dump(stamp, f, protocol=pickle.HIGHEST_PROTOCOL)
-            f.write(zlib.compress(pickle.dumps(
-                dict(feats), protocol=pickle.HIGHEST_PROTOCOL), 1))
-        os.replace(tmp, path)
-    except OSError as e:
-        print(f'# feature cache not written: {e}', flush=True)
+    stamp = (FEATURE_CACHE_VERSION, code[:2], st.st_mtime_ns, st.st_size)
+    packed = _load(path, stamp)
+    if packed is not None:
+        return _unpack_feats(packed)
+    # The parsed dump (reused across edits of the derived features).
+    ppath = _cache_path(d, 'parse', code[2])
+    pstamp = (FEATURE_CACHE_VERSION, code[2:], st.st_mtime_ns, st.st_size)
+    state = _load(ppath, pstamp)
+    if state is None:
+        state = featlib.parse_dump(src, sitekeys)
+        _save(ppath, pstamp, (_pack_feats(state[0]),) + tuple(state[1:]))
+    else:
+        state = (_unpack_feats(state[0]),) + tuple(state[1:])
+    feats = featlib.derive(state, sitekeys)
+    _save(path, stamp, _pack_feats(feats))
     return feats
