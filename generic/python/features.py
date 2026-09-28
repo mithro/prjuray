@@ -16,6 +16,8 @@ Feature naming (relative to the tile, prefixed by the tile type in the DB):
   <SITEKEY>.BANK.IOSTD=<std>       an I/O standard used in the pad's bank
   <SITEKEY>.BANK.VCCO=<volts>      the bank's VCCO (from its I/O standards)
   <SITEKEY>.PAD.PULLTYPE=<v>       pull resistor of a used pad
+  <SITEKEY>.PIN.<pin>=<how>        hard block input pin driven by a
+                                   SIGNAL or tied to GND / VCC
   <SITEKEY>.<BEL>.<CFG>=<v>@<STD>=<s>  I/O buffer setting together with its
                                    I/O standard (SLEW, DRIVE, IN_TERM, ...)
   <vector bit feature>@<W>=<v>     vector bit together with a WIDTH setting
@@ -477,6 +479,12 @@ def parse_dump(path, sitekeys):
                     feats[tile].add(f'{key}.BANK.{p[2]}={p[3]}')
                     if p[2] == 'IOSTD':
                         bank_stds[(tile, key)].add(p[3])
+            elif kind == 'pin':
+                # Hard block input pin: driven by a signal or tied to a
+                # constant (dump_features.tcl "pin <site> <pin> <how>").
+                if len(p) >= 4 and p[1] in site_map:
+                    tile, key = site_map[p[1]]
+                    feats[tile].add(f'{key}.PIN.{p[2]}={p[3]}')
             elif kind == 'cfg':
                 tile, key = site_map[p[1]]
                 value = ' '.join(p[4:])
