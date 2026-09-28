@@ -1,18 +1,37 @@
 # Project U-Ray
 
 Project U-Ray is an attempt at documenting the bitstream format for the
-[Xilinx Ultrascale and Ultrascale+ parts](https://www.xilinx.com/products/technology/ultrascale.html)
+[AMD (Xilinx) UltraScale and UltraScale+ parts](https://www.xilinx.com/products/technology/ultrascale.html)
 including all parts from the following lines;
- * Kintex Ultrascale
- * Virtex Ultrascale
- * Zynq UltraScale MPSoC
+ * Kintex UltraScale
+ * Virtex UltraScale
  * Kintex UltraScale+
+ * Artix UltraScale+
  * Virtex UltraScale+
  * Zynq UltraScale+ MPSoC
 
+Its architecture independent `generic/` flow also covers the 7-series
+(Spartan-7, Artix-7, Kintex-7 and Zynq-7000) parts, so that one pipeline
+produces bit databases for all three architectures.
+
 It takes a lot of the learning from
-[Project X-Ray](https://github.com/SymbiFlow/prjxray) and
-[Project Trellis](https://github.com/SymbiFlow/prjtrellis).
+[Project X-Ray](https://github.com/f4pga/prjxray) and
+[Project Trellis](https://github.com/f4pga/prjtrellis), and is part of
+[F4PGA](https://f4pga.org/) (formerly SymbiFlow). The upstream repository is
+[f4pga/prjuray](https://github.com/f4pga/prjuray).
+
+There are two flows in this repository:
+
+ * [`generic/`](generic/README.md): the current flow for **Vivado 2025.2**. It
+   uses random designs and feature correlation, with no per tile type code,
+   and covers every die in the WebPACK edition. The status below refers to
+   this flow.
+ * `fuzzers/`, `utils/`, `settings/`: the original hand written fuzzers for
+   **Vivado 2019.2**. These targeted the Zynq UltraScale+ ZU3EG and ZU7EV
+   (`settings/zynq_usp_3eg.sh`, `settings/zynq_usp_7ev.sh`), and their
+   database is published separately as
+   [f4pga/prjuray-db](https://github.com/f4pga/prjuray-db)
+   (`download-latest-db.sh`). They have not been ported to Vivado 2025.2.
 
 # Current status (2026-09-28)
 
@@ -87,84 +106,74 @@ regression (`generic/ci.sh`) and the rebuild scripts in `generic/runs/`.
 
 # Target Parts
 
-## Ultrascale
+The target is every part supported by the free Vivado **WebPACK** edition, so
+that anyone can reproduce the databases and contribute. In Vivado 2025.2 these
+are 102 devices on 29 distinct dies. Devices that share a die (a different
+speed grade, temperature grade, package, or feature subset such as CG/EG/EV)
+share its tile grid and bit database. All of them are covered by the
+`generic/` flow; see "Current status" above for how complete each database is.
+
+In the lists below, devices separated by `;` are on different dies and devices
+separated by `,` share a die. The die that the flow fuzzes is named first.
+`build/meta/die_groups.json` has the full mapping, including the packages
+used.
+
+## UltraScale
 
 ### Kintex UltraScale
 
-#### Parts
-
- * TBD
-
-#### Boards
-
- * TBD
+ * XCKU025; XCKU035
 
 ### Virtex UltraScale
 
-#### Parts
+ * None. Virtex UltraScale devices are not in WebPACK and are not targeted.
 
- * TBD
-
-#### Boards
-
- * TBD
-
-## Ultrascale+
+## UltraScale+
 
 ### Kintex UltraScale+
 
-#### Parts
+ * XCKU3P, XCKU5P
 
- * TBD - Targetting XCKU11P?
+### Artix UltraScale+
 
-#### Boards
-
- * TBD
+ * XAAU7P, XCAU7P; XAAU10P, XAAU15P, XCAU10P, XCAU15P; XCAU20P, XCAU25P
 
 ### Virtex UltraScale+
 
-#### Parts
+ * None. Virtex UltraScale+ devices are not in WebPACK and are not targeted.
 
- * TBD - Targetting XCVU13P?
+### Zynq UltraScale+ MPSoC (and the Kria and Alveo devices on the same dies)
 
-#### Boards
+ * XAZU1EG, XCZU1CG, XCZU1EG
+ * XAZU2EG, XAZU3EG, XCZU2CG, XCZU2EG, XCZU3CG, XCZU3EG, XCK24
+ * XAZU3TEG, XCZU3TCG, XCZU3TEG
+ * XCZU4CG, XCZU4EG, XCZU5CG, XCZU5EG
+ * XAZU4EV, XAZU5EV, XCZU4EV, XCZU5EV
+ * XCZU7CG, XCZU7EG
+ * XAZU7EV, XCZU7EV, XCU30
+ * XCK26 (Kria K26 SOM)
+ * XCU25
 
- * TBD
+## 7-series (generic flow only)
 
-### Zynq UltraScale+
+ * Spartan-7: XA7S15, XA7S6, XC7S15, XC7S6; XA7S25, XC7S25; XA7S50, XC7S50;
+   XA7S100, XA7S75, XC7S100, XC7S75
+ * Artix-7: XA7A12T, XA7A25T, XC7A12T, XC7A25T; XA7A15T, XA7A35T, XA7A50T,
+   XC7A15T, XC7A35T, XC7A50T; XA7A100T, XA7A75T, XC7A100T, XC7A75T; XC7A200T
+   (all with their -I/-L variants)
+ * Kintex-7: XC7K70T; XC7K160T
+ * Zynq-7000: XA7Z010, XC7Z007S, XC7Z010; XC7Z012S, XC7Z015; XA7Z020,
+   XC7Z014S, XC7Z020; XA7Z030, XC7Z030
 
-#### Parts
+## Boards
 
- * Zynq Ultrascale+ MPSoC - **ZU3EG**
+Some boards with parts on the covered dies:
 
-#### Boards
-
-| Board | Maker | Price | Part |
-| ----- | ----- | ----- | ---- |
-| [Ultra96-V2 Zynq UltraScale+ ZU3EG Development Board (ULTRA96-V2-G)](https://www.avnet.com/shop/us/products/avnet-engineering-services/aes-ultra96-v2-g-3074457345638646173/) | ??? | Xilinx Zynq UltraScale+ MPSoC ZU3EG | $USD249 |
-| [Genesys ZU: Zynq Ultrascale+ MPSoC Development Board](https://store.digilentinc.com/genesys-zu-zynq-ultrascale-mpsoc-development-board/) | Digilent | Xilinx Zynq UltraScale+ MPSoC ZU3EG | $USD1,149 |
-
-
-## WebPack Parts
-
-We have a goal of initially targeting parts supported by WebPack so that anyone
-can contribute.
-
-Vivado 2025.2 WebPACK supports the following UltraScale and UltraScale+
-devices. Devices on the same line share a die, and all of them are covered
-by the `generic/` flow:
- * Kintex UltraScale: XCKU025; XCKU035
- * Kintex UltraScale+: XCKU3P, XCKU5P
- * Artix UltraScale+: XCAU7P, XAAU7P; XCAU10P, XCAU15P, XAAU10P, XAAU15P;
-   XCAU20P, XCAU25P
- * Zynq UltraScale+ MPSoC: XCZU1CG, XCZU1EG, XAZU1EG; XCZU2CG, XCZU2EG,
-   XCZU3CG, XCZU3EG, XAZU2EG, XAZU3EG, XCK24; XCZU3TCG, XCZU3TEG, XAZU3TEG;
-   XCZU4CG, XCZU4EG, XCZU5CG, XCZU5EG; XCZU4EV, XCZU5EV, XAZU4EV, XAZU5EV;
-   XCZU7CG, XCZU7EG; XCZU7EV, XAZU7EV, XCU30; XCK26; XCU25
-
-It also includes all Spartan-7, Artix-7 (up to XC7A200T), Kintex-7 (XC7K70T,
-XC7K160T) and Zynq-7000 (up to XC7Z030) devices. See
-`build/meta/die_groups.json` for the full list of 102 devices.
+| Board | Maker | Part |
+| ----- | ----- | ---- |
+| [Ultra96-V2](https://www.avnet.com/wps/portal/us/products/avnet-boards/avnet-board-families/ultra96-v2/) | Avnet | Zynq UltraScale+ MPSoC ZU3EG |
+| [Genesys ZU](https://digilent.com/reference/programmable-logic/genesys-zu/start) | Digilent | Zynq UltraScale+ MPSoC ZU3EG |
+| [Kria KV260 Vision AI Starter Kit](https://www.amd.com/en/products/system-on-modules/kria/k26/kv260-vision-starter-kit.html) | AMD | Kria K26 SOM (XCK26) |
 
 # Contributing
 
@@ -174,7 +183,15 @@ listed here.
 ### Sending
 
 All contributions should be sent as
-[GitHub Pull requests](https://help.github.com/articles/creating-a-pull-request-from-a-fork/).
+[GitHub Pull requests](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/proposing-changes-to-your-work-with-pull-requests/creating-a-pull-request-from-a-fork)
+against [f4pga/prjuray](https://github.com/f4pga/prjuray).
+
+Changes to the `generic/` flow should keep the regression run unchanged,
+or improve it, on its three small test dies (xa7s15, xazu1eg, xcku025):
+run `generic/ci.sh`, and include its before/after table in the pull
+request whenever the numbers change. Run Vivado and the database tools
+through `generic/vrun.sh`, which gives each job its own memory capped
+systemd scope; see [`generic/README.md`](generic/README.md).
 
 ### License
 
@@ -186,9 +203,10 @@ All new contributions must also be released under this license.
 
 ### Code of Conduct
 
-By contributing you agree to the [code of conduct](CODE_OF_CONDUCT.md). We
-follow the open source best practice of using the [Contributor
-Covenant](https://www.contributor-covenant.org/) for our Code of Conduct.
+By contributing you agree to follow our code of conduct. We follow the
+open source best practice of using the
+[Contributor Covenant](https://www.contributor-covenant.org/) as our Code of
+Conduct.
 
 ### Sign your work
 
@@ -250,5 +268,6 @@ master:
 
 ### Contributing to the docs
 
-In addition to the above contribution guidelines, see the guide to
-[updating the Project U-Ray docs](UPDATING-THE-DOCS.md).
+The Sphinx documentation lives in [`docs/`](docs/). Build it with
+`make -C docs html` after installing `docs/requirements.txt` (or run
+`make env` at the top level, which installs both).
