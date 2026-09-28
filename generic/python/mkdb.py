@@ -537,6 +537,21 @@ def write_db(outdir, ttype, k, res):
 _COLLECTORS = {}
 
 
+def _collector(arch, dn):
+    """The Collector of a die in a worker.  Only the last die's is kept:
+    phase 1 workers see the dies one after the other (the work list is in
+    die order), and every Collector kept costs 100-200 MB (Series7)."""
+    if dn not in _COLLECTORS:
+        _COLLECTORS.clear()
+        import gc
+        gc.collect()
+        die = dieslib.load()[dn]
+        tg = json.load(open(os.path.join(dieslib.DB, arch, dn,
+                                         'tilegrid.json')))
+        _COLLECTORS[dn] = Collector(die, tg)
+    return _COLLECTORS[dn]
+
+
 def design_seed(d):
     """Seed of the per design sample thinning: stable across runs and build
     directory locations (hash() of a string changes every run)."""
@@ -548,13 +563,8 @@ def _collect_one(item):
     """Samples of one design [(tile type, region, features, bits)]."""
     import random
     arch, dn, d = item
-    if dn not in _COLLECTORS:
-        die = dieslib.load()[dn]
-        outdir = os.path.join(dieslib.DB, arch)
-        tg = json.load(open(os.path.join(outdir, dn, 'tilegrid.json')))
-        _COLLECTORS[dn] = Collector(die, tg)
     rng = random.Random(design_seed(d))
-    return list(_COLLECTORS[dn].samples(d, rng=rng))
+    return list(_collector(arch, dn).samples(d, rng=rng))
 
 
 # Per design sample cache.  One file per design: zlib compressed pickled
@@ -669,13 +679,9 @@ def _cache_one(item):
         except (OSError, ValueError, EOFError, pickle.UnpicklingError,
                 KeyError, IndexError):
             pass
-    if dn not in _COLLECTORS:
-        die = dieslib.load()[dn]
-        tg = json.load(open(os.path.join(dieslib.DB, arch, dn,
-                                         'tilegrid.json')))
-        _COLLECTORS[dn] = Collector(die, tg)
+    col = _collector(arch, dn)
     chunks = {}
-    for tt, k, fs, codes in _COLLECTORS[dn].sample_codes(
+    for tt, k, fs, codes in col.sample_codes(
             d, rng=random.Random(design_seed(d))):
         c = chunks.setdefault((tt, k), ([], []))
         if fs:
@@ -687,7 +693,7 @@ def _cache_one(item):
     keys = []
     with open(tmp, 'wb') as f:
         for key, c in chunks.items():
-            data = _encode_chunk(*c, _COLLECTORS[dn].rmap.names)
+            data = _encode_chunk(*c, col.rmap.names)
             keys.append((key, (f.tell(), len(data), len(c[0]), len(c[1]),
                                hashlib.blake2b(data,
                                                digest_size=16).hexdigest())))
@@ -698,6 +704,56 @@ def _cache_one(item):
         f.write(off.to_bytes(8, 'little'))
     os.replace(tmp, path)
     return [(k, v[2], v[3], v[4]) for k, v in keys]
+
+
+def _cache_task(item):
+    """Worker: _cache_one and the worker's peak memory (bytes)."""
+    keys = _cache_one(item)
+    return keys, resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+
+
+SAMPLE_PEAK_GUESS = 2 << 30
+
+
+def _sample_phase(work, jobs, budget_gib):
+    """Runs _cache_task on every work item; yields (index, keys) as they
+    complete.  With a memory budget, at most budget / (1.25 x largest
+    worker peak seen, at least SAMPLE_PEAK_GUESS) items run at once (the
+    pool only starts a process when no idle one is left, so this also
+    bounds the processes).  The work list is in die order and a worker
+    keeps only its current die's Collector."""
+    from concurrent.futures import ProcessPoolExecutor, FIRST_COMPLETED, wait
+    peak = SAMPLE_PEAK_GUESS
+
+    def limit():
+        if not budget_gib:
+            return jobs
+        return max(1, min(jobs, int(budget_gib * 2**30 // (peak * 1.25))))
+
+    lim = limit()
+    if budget_gib:
+        print(f'# sample phase: {lim} designs at once ({budget_gib} GiB, '
+              f'{peak / 2**30:.1f} GiB per worker assumed)', flush=True)
+    with ProcessPoolExecutor(jobs) as ex:
+        futs = {}
+        nxt = 0
+        while nxt < len(work) or futs:
+            while nxt < len(work) and len(futs) < lim:
+                futs[ex.submit(_cache_task, work[nxt])] = nxt
+                nxt += 1
+            done, _ = wait(futs, return_when=FIRST_COMPLETED)
+            for f in done:
+                i = futs.pop(f)
+                keys, p = f.result()
+                if budget_gib and p > peak:
+                    peak = p
+                    new = limit()
+                    if new != lim:
+                        print(f'# sample phase: worker peak '
+                              f'{p / 2**30:.2f} GiB: {new} designs at once',
+                              flush=True)
+                        lim = new
+                yield i, keys
 
 
 def _interned(rows, vmap, vocab, vids):
@@ -955,6 +1011,12 @@ def main():
     ap.add_argument('--sample-jobs', type=int, default=None,
                     help='processes of the per design sample phase (light: '
                     'can exceed --jobs; default --jobs)')
+    ap.add_argument('--sample-mem-budget', type=float, default=None,
+                    help='GiB for all sample phase workers: the number of '
+                    'designs processed at once (at most --sample-jobs) is '
+                    'the budget over the largest worker peak measured so '
+                    'far and a 2 GiB floor (x 1.25; measured Series7 up '
+                    'to ~1.3 GiB per worker)')
     ap.add_argument('--max-samples', type=int, default=50000)
     ap.add_argument('--exclude', action='append', default=[],
                     help='file of design directories to leave out, one per '
@@ -992,17 +1054,19 @@ def main():
     # Phase 1: one small task per design (cached across runs).
     t0 = time.time()
     per_key = {}  # key -> [(cache path, used, empty)], first seen order
-    with ProcessPoolExecutor(args.sample_jobs or args.jobs) as ex:
-        for n, (item, keys) in enumerate(
-                zip(work, ex.map(_cache_one, work, chunksize=2)), 1):
-            for key, nu, ne, dg in keys:
-                if only and key[0] not in only:
-                    continue
-                per_key.setdefault(key, []).append((item[3], nu, ne, dg))
-            if n % 50 == 0 or n == len(work):
-                el = time.time() - t0
-                print(f'# samples {n}/{len(work)} designs, {el:.0f} s, eta '
-                      f'{el / n * (len(work) - n):.0f} s', flush=True)
+    results = [None] * len(work)
+    for n, (i, keys) in enumerate(_sample_phase(
+            work, args.sample_jobs or args.jobs, args.sample_mem_budget), 1):
+        results[i] = keys
+        if n % 50 == 0 or n == len(work):
+            el = time.time() - t0
+            print(f'# samples {n}/{len(work)} designs, {el:.0f} s, eta '
+                  f'{el / n * (len(work) - n):.0f} s', flush=True)
+    for item, keys in zip(work, results):
+        for key, nu, ne, dg in keys:
+            if only and key[0] not in only:
+                continue
+            per_key.setdefault(key, []).append((item[3], nu, ne, dg))
     print(f'# samples of {len(work)} designs in {time.time() - t0:.0f} s',
           flush=True)
     # Bound the work per tile type: keep a random subset of the samples

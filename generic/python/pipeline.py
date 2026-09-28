@@ -145,8 +145,15 @@ def main():
     ap.add_argument('--jobs', type=int, default=24)
     ap.add_argument('--sample-jobs', type=int, default=None,
                     help='mkdb per design sample cache workers (mkdb '
-                    '--sample-jobs; default --jobs).  The phase is light '
-                    'per worker (Series7 ~0.3 GB, xcku025 ~2.4 GB)')
+                    '--sample-jobs; default --jobs).  Up to ~1.3 GiB per '
+                    'worker (Series7 xc7k160t), more on large US(+) dies: '
+                    'use --mem-budget with it')
+    ap.add_argument('--mem-budget', type=float, default=None,
+                    help='GiB for mkdb\'s sample phase (mkdb '
+                    '--sample-mem-budget): at most budget / (1.25 x the '
+                    'largest measured worker peak, >= 2 GiB) designs at '
+                    'once; set it below the vrun.sh cap (the phase 2 '
+                    'tasks are sized by --jobs as before)')
     args = ap.parse_args()
     alldies = dieslib.load()
     dlist = args.dies.split(',')
@@ -196,14 +203,20 @@ def main():
             if '--sample-jobs' not in f.read():
                 sys.exit('mkdb.py has no --sample-jobs')
         sj = ['--sample-jobs', str(args.sample_jobs)]
+    if args.mem_budget:
+        sj += ['--sample-mem-budget', str(args.mem_budget)]
     t0 = time.time()
+    mlog = os.path.join(logdir, f'mkdb_{arch}.log')
+    print(f'[{time.strftime("%H:%M:%S")}] mkdb started (progress in '
+          f'{mlog})', flush=True)
     rc = run([
         sys.executable,
         os.path.join(HERE, 'mkdb.py'), '--arch', arch, '--dies',
         args.dies, '--tag', args.tags, '--jobs',
         str(args.jobs)
-    ] + sj + exclude, os.path.join(logdir, f'mkdb_{arch}.log'))
-    print(f'mkdb {time.time() - t0:.0f} s', flush=True)
+    ] + sj + exclude, mlog)
+    print(f'[{time.strftime("%H:%M:%S")}] mkdb {time.time() - t0:.0f} s',
+          flush=True)
     print('build_db rc', rc, flush=True)
     # Checks of all dies in parallel, each checking its designs in
     # parallel with a share of --jobs proportional to its size (the tile
@@ -229,9 +242,11 @@ def main():
         return log
     from concurrent.futures import ThreadPoolExecutor
     t0 = time.time()
+    print(f'[{time.strftime("%H:%M:%S")}] checks started', flush=True)
     with ThreadPoolExecutor(len(dlist)) as ex:
         logs = list(ex.map(check, dlist))
-    print(f'checks {time.time() - t0:.0f} s (jobs per die '
+    print(f'[{time.strftime("%H:%M:%S")}] checks {time.time() - t0:.0f} s '
+          f'(jobs per die '
           f'{" ".join(f"{d}:{cjobs[d]}" for d in dlist)})', flush=True)
     for d, log in zip(dlist, logs):
         tail = open(log).read().strip().split('\n')
