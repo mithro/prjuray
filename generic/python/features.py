@@ -37,11 +37,15 @@ import numpy as np
 # files read by a derived pass).  features.py itself, generic/data/*,
 # clockgen_tables.json and the die's tiles / bonded files are always
 # covered.
-STAMP_ENV = ()
+STAMP_ENV = ('URAY_PARK',)
 
 
 def stamp_files(tiles_tsv):
-    return []
+    # the die's PIP list (build/meta/pips/<die>.txt): _gclk_feeds,
+    # parked_imux_features
+    meta = os.path.dirname(os.path.dirname(tiles_tsv))
+    name = os.path.splitext(os.path.basename(tiles_tsv))[0]
+    return [os.path.join(meta, 'pips', name + '.txt')]
 
 
 _XY = re.compile(r'^(.*)_X(\d+)Y(\d+)$')
@@ -726,6 +730,8 @@ def derive(state, sitekeys):
                 feats[tile].add(f'{key}.EFF_PULL={pull}')
                 feats[tile].add(f'{key}.EFF_PULLDOWN={int(pull == "DOWN")}')
     hclk_row_features(feats, sitekeys)
+    # (parked IMUX first: the leaf clock PIPs are implied, not routed)
+    parked_imux_features(feats, sitekeys)
     leaf_clock_features(feats, sitekeys)
     return feats
 
@@ -859,3 +865,106 @@ def _gclk_feeds(sitekeys):
                                 (int(m.group(1)), p[3]))
         _FEEDS[key] = dict(out)
     return _FEEDS[key]
+
+
+# Unused INT input multiplexers are parked by Vivado: an IMUX node no PIP
+# drives selects its first input by wire name (the all-zero setting, e.g.
+# BOUNCE_E_BLS_5_FTN for INT_NODE_IMUX_18), unless that input carries a
+# net; then it selects the first input (by name) that carries none.
+# xcku025 (Vivado, s315): IMUX_18 with BOUNCE_E_BLS_5 live -> the
+# INT_NODE_GLOBAL_7_OUT0 setting without its global stage bit (45_053
+# 47_053), with GLOBAL_7 live too -> NN2_E_END5's (45_053 48_052); IMUX_50
+# likewise (10_052 11_052 / 11_052 13_052).  Added as PARK.<input>-><node>.
+# Live wires: the ends of the tile's PIPs and, through the node map
+# (generic/data/int_nodes_<arch>.txt), those of the other INT tiles.
+_INT_XY = re.compile(r'^INT_X(\d+)Y(\d+)$')
+_IMUX = re.compile(r'^INT_NODE_IMUX_\d+_INT_OUT$')
+_PARK = {}
+
+
+def _park_data(sitekeys):
+    """(node map {wire: [(dx, dy, wire)]}, {IMUX node: sorted inputs}) of
+    the die's architecture, or None without a node map."""
+    key = id(sitekeys)
+    if key in _PARK:
+        return _PARK[key]
+    meta = os.path.dirname(os.path.dirname(sitekeys.tiles_tsv))
+    name = os.path.splitext(os.path.basename(sitekeys.tiles_tsv))[0]
+    import dies as dieslib
+    d = dieslib.load().get(name)
+    path = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), 'data',
+        f'int_nodes_{d.arch if d else None}.txt')
+    pips = os.path.join(meta, 'pips', name + '.txt')
+    if d is None or not os.path.exists(path) or not os.path.exists(pips):
+        _PARK[key] = None
+        return None
+    nodes = collections.defaultdict(list)
+    with open(path) as f:
+        for line in f:
+            if line.startswith('#'):
+                continue
+            w, dx, dy, w2 = line.split()
+            nodes[w].append((int(dx), int(dy), w2))
+    inputs = collections.defaultdict(set)
+    with open(pips) as f:
+        for line in f:
+            p = line.split()
+            if len(p) > 3 and p[0] == 'pip' and p[1] == 'INT' and \
+                    _IMUX.match(p[3]):
+                inputs[p[3]].add(p[2])
+    _PARK[key] = (dict(nodes), {n: sorted(v) for n, v in inputs.items()})
+    return _PARK[key]
+
+
+def parked_imux_features(feats, sitekeys):
+    """Adds PARK.<input>-><IMUX node> to INT tiles (see above);
+    URAY_PARK=0 disables it (A/B tests)."""
+    if os.environ.get('URAY_PARK', '1') == '0':
+        return
+    data = _park_data(sitekeys)
+    if data is None:
+        return
+    nodes, inputs = data
+    live = collections.defaultdict(set)
+    for tile, fs in list(feats.items()):
+        if sitekeys.tile_type.get(tile) != 'INT':
+            continue
+        m = _INT_XY.match(tile)
+        if not m:
+            continue
+        x, y = int(m.group(1)), int(m.group(2))
+        for f in fs:
+            if '->' not in f:
+                continue
+            a, b = f.split('->', 1)
+            if a.endswith('<'):
+                a = a[:-1]
+            if '.' in a:  # PARK / site features
+                continue
+            live[(x, y)].update((a, b))
+    spread = collections.defaultdict(set)
+    for (x, y), ws in live.items():
+        for w in ws:
+            for dx, dy, w2 in nodes.get(w, ()):
+                spread[(x + dx, y + dy)].add(w2)
+    for xy, ws in spread.items():
+        live[xy] |= ws
+    for (x, y), ws in live.items():
+        tile = f'INT_X{x}Y{y}'
+        if sitekeys.tile_type.get(tile) != 'INT':
+            continue
+        fs = feats[tile]
+        by = collections.defaultdict(set)  # node -> PIP sources driving it
+        for f in fs:
+            if '->' in f and not f.startswith('PARK'):
+                a, b = f.split('->', 1)
+                by[b].add(a.rstrip('<'))
+        for node, ins in inputs.items():
+            drv = by.get(node, set())
+            if drv or ins[0] not in ws:
+                continue
+            for src in ins[1:]:
+                if src not in ws:
+                    fs.add(f'PARK.{src}->{node}')
+                    break

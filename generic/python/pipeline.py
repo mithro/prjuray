@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tile grids + bit database + check for a set of dies of one architecture."""
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -20,10 +21,31 @@ def run(cmd, log):
     return r.returncode
 
 
+def tg_config(arch):
+    """The architecture's settings in generic/tilegrid_config.json."""
+    path = os.path.join(os.path.dirname(HERE), 'tilegrid_config.json')
+    with open(path) as f:
+        return json.load(f).get(arch, {})
+
+
+def colalign_extra(arch):
+    cfg = tg_config(arch)
+    out = []
+    if cfg.get('region_dies'):
+        out += ['--learn-exclude', ','.join(cfg['region_dies'])]
+    if cfg.get('init_dies'):
+        out += ['--init-dies', ','.join(cfg['init_dies'])]
+    return out
+
+
 def evidence(args):
     """Design activity evidence of a die (and its activity only tile grid,
     for comparison)."""
     die, arch, tags, jobs = args
+    cfg = tg_config(arch)
+    extra = []
+    if die in cfg.get('region_dies', ()) and cfg.get('max_matches'):
+        extra = ['--max-matches', str(cfg['max_matches'])]
     out = os.path.join(dieslib.DB, arch, die)
     os.makedirs(out, exist_ok=True)
     roots = ','.join(
@@ -34,7 +56,7 @@ def evidence(args):
         '--evidence',
         os.path.join(out, 'evidence.json'), '--out',
         os.path.join(out, 'tilegrid_activity.json'), '--jobs', str(jobs)
-    ], os.path.join(out, 'evidence.log'))
+    ] + extra, os.path.join(out, 'evidence.log'))
 
 
 def tilegrid(args):
@@ -175,7 +197,8 @@ def main():
             sys.executable,
             os.path.join(HERE, 'colalign.py'), '--arch', arch, '--exp',
             dieslib.DB, '--verbose'
-        ] + (['--supported'] if arch != 'Series7' else []),
+        ] + (['--supported'] if arch != 'Series7' else []) + colalign_extra(
+            arch),
             os.path.join(logdir, f'colalign_{arch}.log'))
         print('colalign rc', rc, flush=True)
         if args.probe_windows:

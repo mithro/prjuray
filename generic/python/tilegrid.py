@@ -158,11 +158,12 @@ class Grid:
             # next channel).
             s_lo, s_hi = w[1], w[1] + w[2]
             if not self.probe:
+                # (never into the tile's own grid row)
                 for o_lo, o_hi in self._column_learnt(t):
                     if o_lo >= hi and o_lo < s_hi:
-                        s_hi = o_lo
+                        s_hi = max(o_lo, base + self.bpr)
                     if o_hi <= lo and o_hi > s_lo:
-                        s_lo = o_hi
+                        s_lo = min(o_hi, base)
             lo, hi = min(lo, s_lo), max(hi, s_hi)
         if not self.probe:
             lo, hi = max(lo, 0), min(hi, self.frame_bits)
@@ -276,6 +277,7 @@ def probe_types(grid):
 
 
 PROBE_PER_ROW = 3
+MAX_MATCHES = None  # see --max-matches
 
 
 def frame_columns(dframes):
@@ -308,14 +310,16 @@ def _design_activity(d):
     return diff, used
 
 
-def activity(die, dframes, design_root, maxd=192, jobs=1):
+def activity(die, dframes, design_root, maxd=192, jobs=1,
+             mem_budget=None):
     """Design activity: (act, use, number of designs).
     act[frame index, bit offset, word] = mask of the designs in which that
     bit differs from the baseline; use[tile] = mask of the designs using the
     tile.  Up to maxd designs, newest tags first (later tags use larger
     parts of the die and better generators).  jobs: designs loaded in
     parallel (their features are the cold cost: large dies ~10-20 s each
-    without the feature cache)."""
+    without the feature cache); mem_budget (GiB): at most as many at once
+    as fit it (memsched.budget_map; xcu25 designs are large)."""
     sk = featlib.SiteKeys(die.tiles_tsv)
     roots = design_root.split(',') if isinstance(design_root, str) \
         else list(design_root)
@@ -331,18 +335,18 @@ def activity(die, dframes, design_root, maxd=192, jobs=1):
     use = collections.defaultdict(int)
     _ACT.update(dframes=dframes, sk=sk)
     if jobs > 1 and D > 1:
-        from concurrent.futures import ProcessPoolExecutor
-        ex = ProcessPoolExecutor(min(jobs, D))
-        results = ex.map(_design_activity, dirs)
+        import memsched
+        results = memsched.budget_map(
+            _design_activity, dirs, jobs, mem_budget, label='designs',
+            log=lambda m: print(m, flush=True))
     else:
-        ex = None
-        results = map(_design_activity, dirs)
-    for i, (diff, used) in enumerate(results):
+        results = enumerate(map(_design_activity, dirs))
+    # (bits are OR-ed and usage masks set per design: completion order
+    # does not matter)
+    for i, (diff, used) in results:
         flat[diff, i // 64] |= np.uint64(1 << (i % 64))
         for t in used:
             use[t] |= 1 << i
-    if ex:
-        ex.shutdown()
     return act, use, D
 
 
@@ -408,7 +412,7 @@ class _WindowScorer:
         return np.maximum(np.maximum(best, JW), 0.0)
 
 
-def collect(die, design_root, verbose=False, jobs=1):
+def collect(die, design_root, verbose=False, jobs=1, mem_budget=None):
     """Design activity evidence for the frame row / frame column learners.
 
     Returns a dict:
@@ -421,7 +425,8 @@ def collect(die, design_root, verbose=False, jobs=1):
     """
     grid = Grid(die)
     dframes = DD.DieFrames(die)
-    act, use, D = activity(die, dframes, design_root, jobs=jobs)
+    act, use, D = activity(die, dframes, design_root, jobs=jobs,
+                           mem_budget=mem_budget)
     NW = act.shape[2]
 
     cols = frame_columns(dframes)
@@ -487,9 +492,15 @@ def collect(die, design_root, verbose=False, jobs=1):
             t, _, (cr, _, _) = tiles_used[i]
             gx = grid.tiles[t]['gx']
             v = vec[i]
+            hit = v >= 0.95
+            # --max-matches: a usage pattern matching many frame columns
+            # says nothing about the tile's (region designs, where all tiles
+            # of a block of clock regions are used together).
+            if MAX_MATCHES and hit.sum() > MAX_MATCHES:
+                continue
             row = scores.setdefault(cr, {})
             acc = row.setdefault(gx, np.zeros(len(v)))
-            acc += (v >= 0.95) * v
+            acc += hit * v
     # 3. Block RAM content columns (block type 1), same scoring.
     votes1 = collections.defaultdict(collections.Counter)
     for (lo, n), idx in groups.items():
@@ -1007,11 +1018,20 @@ def main():
                     'windows from a bit database built with it')
     ap.add_argument('--probe-span', type=int, default=None)
     ap.add_argument('--out', required=True)
+    ap.add_argument('--max-matches', type=int, default=None,
+                    help='evidence: ignore tiles whose usage matches more '
+                    'frame columns (e.g. 3 for dies with only region designs)')
     ap.add_argument('--jobs', type=int, default=1,
                     help='designs loaded in parallel for --designs (each '
                     'worker holds one design\'s features: large dies '
                     '~1-2 GB)')
+    ap.add_argument('--mem-budget', type=float, default=None,
+                    help='GiB for the --jobs design loaders: at most budget '
+                    '/ (1.25 x largest measured loader peak, >= 2 GiB) at '
+                    'once, one until the first is measured (the parent\'s '
+                    'activity matrix comes on top)')
     args = ap.parse_args()
+    globals()['MAX_MATCHES'] = args.max_matches
     die = dieslib.load()[args.die]
     grid = Grid(die)
     grid.stack_re = stack_re(args.stacks)
@@ -1029,7 +1049,7 @@ def main():
     dframes = DD.DieFrames(die)
     cols = frame_columns(dframes)
     if args.designs:
-        ev = collect(die, args.designs, True, args.jobs)
+        ev = collect(die, args.designs, True, args.jobs, args.mem_budget)
         if args.evidence:
             save_evidence(ev, args.evidence)
             ev = load_evidence(args.evidence, cols)
