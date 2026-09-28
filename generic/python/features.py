@@ -37,7 +37,7 @@ import numpy as np
 # files read by a derived pass).  features.py itself, generic/data/*,
 # clockgen_tables.json and the die's tiles / bonded files are always
 # covered.
-STAMP_ENV = ('URAY_PARK',)
+STAMP_ENV = ('URAY_PARK', 'URAY_LEAFPAIR')
 
 
 def stamp_files(tiles_tsv):
@@ -838,6 +838,22 @@ def leaf_clock_features(feats, sitekeys):
             for n, wire in nodes:
                 if n == low and wire not in used:
                     fs.add(f'GCLK_B_0_{g}->{wire}')
+        # GCLK_B_0_g and GCLK_B_0_<g+8> feed the same two global nodes;
+        # the node settings depend on which of the pair is live (xcku025
+        # 27_060: GCLK_B_0_15 live without GCLK_B_0_7).  Off unless
+        # URAY_LEAFPAIR=1: mkdb then moves bits of the plain implied PIPs
+        # to the tagged copies (xcku025 ci: pred.missed +5.9k).
+        if os.environ.get('URAY_LEAFPAIR', '0') != '1':
+            continue
+        gs = {(2 * int(f[len('LEAF_CLK_OUT'):])) % 16 +
+              (1 if int(f[len('LEAF_CLK_OUT'):]) >= 8 else 0)
+              for f in fs if f.startswith('LEAF_CLK_OUT')}
+        for f in list(fs):
+            if f.startswith('GCLK_B_0_') and '@' not in f:
+                g = int(f[len('GCLK_B_0_'):].split('->')[0])
+                if g in gs:  # implied (or routed) from a live leaf clock
+                    both = g % 8 in gs and g % 8 + 8 in gs
+                    fs.add(f + ('@PAIR=BOTH' if both else '@PAIR=ONE'))
 
 
 _GNODE = re.compile(r'^INT_NODE_GLOBAL_(\d+)_(?:INT_)?OUT\d$')
