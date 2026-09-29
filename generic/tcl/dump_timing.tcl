@@ -1,6 +1,7 @@
 # Dump the timing model of a part: Vivado's speed models (delays, R/C
-# values), and for every tile type the speed model index of its pips and
-# wires, for every site type the speed model index of its site pins and the
+# values), and for every tile the speed model index of its pips and wires
+# (grouped per tile type into variants), for every site type the speed
+# model index of its site pins and the
 # timing arc models of its BELs.  Architecture independent: only generic
 # Vivado objects and properties are used.
 #
@@ -10,10 +11,11 @@
 # "models" is given, <outdir>/tile_timing.txt and <outdir>/site_timing.txt
 # (the same for every speed grade of a device).  Line formats (tab separated):
 #   speed_models.txt  M  name  speed_index  type  prop=value ...
-#   tile_timing.txt   T  tile_type  tile  [second tile]
-#                     P  pip  speed_index          (pip name without tile)
-#                     W  wire  speed_index
-#                     X  what  name  index  index2 (second tile disagrees)
+#   tile_timing.txt   T  tile_type  ntiles
+#                     V  pips|wires  variant          then its P or W lines
+#                     P  pip  speed_index             (pip name without tile)
+#                     W  wire  speed_index            (- if the tile lacks it)
+#                     A  pips|wires  tile  variant    (tile -> variant)
 #   site_timing.txt   S  site_type  site
 #                     I  site_pin  direction  speed_index
 #                     B  bel  bel_type  model ...  (NAME_INTERNAL of each)
@@ -49,42 +51,50 @@ proc strip {tile names} {
     return $out
 }
 
+# Speed models are per tile type on 7-series, but on UltraScale+ many pips
+# have instance specific models (different delays per tile).  So every tile
+# is read, tiles of a type are grouped by their speed index vector, and each
+# distinct vector ("variant") is written once, with a tile -> variant map.
 set f [open $outdir/tile_timing.txt w]
 puts $f "# part $part version [version -short]"
-# First and last tile of every type, in one pass (get_tile_types needs an
-# opened design).
-set first [dict create]
-set last [dict create]
+set tiles_of [dict create]
 set alltiles [get_tiles]
 foreach t $alltiles type [get_property TYPE $alltiles] {
-    if {![dict exists $first $type]} { dict set first $type $t }
-    dict set last $type $t
+    dict lappend tiles_of $type $t
 }
-foreach type [lsort [dict keys $first]] {
-    set t [dict get $first $type]
-    set t2 [dict get $last $type]
-    puts $f [join [list T $type $t $t2] "\t"]
+foreach type [lsort [dict keys $tiles_of]] {
+    set tiles [dict get $tiles_of $type]
+    set t0 [lindex $tiles 0]
+    puts $f [join [list T $type [llength $tiles]] "\t"]
     foreach kind {pips wires} tag {P W} {
-        set objs [get_$kind -quiet -of_objects $t]
-        if {![llength $objs]} continue
-        set names [strip $t $objs]
-        set idx [get_property SPEED_INDEX $objs]
-        foreach n $names i $idx { puts $f "$tag\t$n\t$i" }
-        # Cross-check against another tile of the type.
-        if {$t2 ne $t} {
-            set objs2 [get_$kind -quiet -of_objects $t2]
-            set m2 [dict create]
-            foreach n [strip $t2 $objs2] i [get_property SPEED_INDEX $objs2] {
-                dict set m2 $n $i
-            }
-            foreach n $names i $idx {
-                if {![dict exists $m2 $n]} {
-                    puts $f [join [list X $kind $n $i missing] "\t"]
-                } elseif {[dict get $m2 $n] ne $i} {
-                    puts $f [join [list X $kind $n $i [dict get $m2 $n]] "\t"]
+        set names0 [strip $t0 [get_$kind -quiet -of_objects $t0]]
+        if {![llength $names0]} continue
+        set variants [dict create]
+        set assign {}
+        foreach t $tiles {
+            set objs [get_$kind -quiet -of_objects $t]
+            set idx {}
+            if {[llength $objs]} { set idx [get_property SPEED_INDEX $objs] }
+            set names [strip $t $objs]
+            if {$names ne $names0} {
+                # Different order or set: align to the first tile's names.
+                set d [dict create]
+                foreach n $names i $idx { dict set d $n $i }
+                set idx {}
+                foreach n $names0 {
+                    lappend idx [expr {[dict exists $d $n] ? [dict get $d $n] : "-"}]
                 }
             }
+            if {![dict exists $variants $idx]} {
+                dict set variants $idx [dict size $variants]
+            }
+            lappend assign $t [dict get $variants $idx]
         }
+        dict for {idx v} $variants {
+            puts $f [join [list V $kind $v] "\t"]
+            foreach n $names0 i $idx { puts $f "$tag\t$n\t$i" }
+        }
+        foreach {t v} $assign { puts $f [join [list A $kind $t $v] "\t"] }
     }
 }
 close $f

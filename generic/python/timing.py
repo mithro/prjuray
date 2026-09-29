@@ -12,7 +12,11 @@ speed grade (grade strings as Vivado lists them, e.g. -1, -1I, -2, -1LV).
 json converts the raw dump into
 
   <out>/<arch>/<die>/tile_timing.json
-      {tile_type: {"pips": {pip: model}, "wires": {wire: model}}}
+      {tile_type: {"pips"|"wires": {"names": [pip...],
+                                     "variants": [[model...]...],
+                                     "tiles": {tile: variant}}}}
+      (the model of names[i] in a tile is variants[tiles[tile]][i]; 7-series
+      has one variant per type, UltraScale+ has instance specific pip models)
   <out>/<arch>/<die>/site_timing.json
       {site_type: {"pins": {pin: [direction, model]},
                    "bels": {bel: {"type": bel_type, "models": [model...]}}}}
@@ -161,18 +165,23 @@ def to_json(die):
     def model(i):
         return by_index.get(int(i))
 
-    tiles, mismatches = {}, 0
-    cur = None
+    tiles = {}
+    tt = var = None
     for line in open(os.path.join(raw, fuzz, 'tile_timing.txt')):
         f = line.rstrip('\n').split('\t')
         if f[0] == 'T':
-            cur = tiles.setdefault(f[1], {'pips': {}, 'wires': {}})
-        elif f[0] == 'P':
-            cur['pips'][f[1]] = model(f[2])
-        elif f[0] == 'W':
-            cur['wires'][f[1]] = model(f[2])
-        elif f[0] == 'X':
-            mismatches += 1
+            tt = tiles.setdefault(f[1], {})
+        elif f[0] == 'V':
+            k = tt.setdefault(f[1], {'names': [], 'variants': [], 'tiles': {}})
+            var = []
+            k['variants'].append(var)
+            fill_names = int(f[2]) == 0
+        elif f[0] in 'PW':
+            if fill_names:
+                k['names'].append(f[1])
+            var.append(None if f[2] == '-' else model(f[2]))
+        elif f[0] == 'A':
+            tt[f[1]]['tiles'][f[2]] = int(f[3])
     with open(os.path.join(dd, 'tile_timing.json'), 'w') as f:
         json.dump(tiles, f, sort_keys=True)
 
@@ -188,11 +197,15 @@ def to_json(die):
     with open(os.path.join(dd, 'site_timing.json'), 'w') as f:
         json.dump(sites, f, sort_keys=True)
 
-    npips = sum(len(t['pips']) for t in tiles.values())
-    nopip = sum(1 for t in tiles.values() for m in t['pips'].values() if m is None)
-    print(f'{die.name}: {len(tiles)} tile types ({npips} pips, {nopip} without '
-          f'a model), {len(sites)} site types, {len(grades)} speed grades in '
-          f'{len(tables)} distinct tables, {mismatches} cross-tile mismatches')
+    pips = [t['pips'] for t in tiles.values() if 'pips' in t]
+    npips = sum(len(p['names']) for p in pips)
+    nopip = sum(1 for p in pips for v in p['variants'] for m in v if m is None)
+    multi = sum(1 for p in pips if len(p['variants']) > 1)
+    nvar = sum(len(p['variants']) for p in pips)
+    print(f'{die.name}: {len(tiles)} tile types ({npips} pips; {multi} types '
+          f'with per tile variants, {nvar} pip variants in all; {nopip} pip '
+          f'entries without a model), {len(sites)} site types, {len(grades)} '
+          f'speed grades in {len(tables)} distinct tables')
 
 
 def main():
