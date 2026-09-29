@@ -69,13 +69,26 @@ foreach type [lsort [dict keys $tiles_of]] {
     foreach kind {pips wires} tag {P W} {
         set names0 [strip $t0 [get_$kind -quiet -of_objects $t0]]
         if {![llength $names0]} continue
+        set n0 [llength $names0]
+        set first0 [lindex $names0 0]
+        set last0 [lindex $names0 end]
         set variants [dict create]
         set assign {}
         foreach t $tiles {
             set objs [get_$kind -quiet -of_objects $t]
             set idx {}
             if {[llength $objs]} { set idx [get_property SPEED_INDEX $objs] }
-            set names [strip $t $objs]
+            # Fast path (the per name strip and compare dominate the run
+            # time on large dies): same count and same first and last name
+            # means the same list in the same order.
+            set k [expr {[string length $t] + 1}]
+            if {[llength $objs] == $n0 &&
+                [string range [lindex $objs 0] $k end] eq $first0 &&
+                [string range [lindex $objs end] $k end] eq $last0} {
+                set names $names0
+            } else {
+                set names [strip $t $objs]
+            }
             if {$names ne $names0} {
                 # Different order or set: align to the first tile's names.
                 set d [dict create]
