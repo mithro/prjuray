@@ -74,7 +74,8 @@ not used to build them (`check.py`).
 Coverage: all 29 distinct dies of the Vivado 2025.2 WebPACK edition (102
 devices; devices that share a die share its tile grid and database), grouped
 into three bit databases. 28 of these dies (100 devices) are also free in
-Vivado 2026.1; XCU25 is free in 2025.2 only (see "Target Parts").
+Vivado 2026.1; XCU25 and XCU30 are free in 2025.2 only. Parts free only in
+2026.1 are not covered yet (see "Target Parts").
 
 | Database | Dies |
 | -------- | ---- |
@@ -130,20 +131,25 @@ regression (`generic/ci.sh`) and the rebuild scripts in `generic/runs/`.
 
 # Target Parts
 
-The target is every part that is free in **both** supported Vivado versions,
-so that anyone can reproduce the databases and contribute: the WebPACK edition
-of Vivado 2025.2 and the (free, licensed) BASIC tier of Vivado 2026.1. These
-are 100 devices on 28 distinct dies, all covered by the `generic/` flow; see
-"Current status" above for how complete each database is. Devices that share
-a die (a different speed grade, temperature grade, package, or feature subset
-such as CG/EG/EV) share its tile grid and bit database.
+The target is every 7-series, UltraScale and UltraScale+ part that is free in
+**either** supported Vivado version, so that anyone can reproduce the
+databases and contribute: the WebPACK edition of Vivado 2025.2 or the (free,
+licensed) BASIC tier of Vivado 2026.1. These are 157 devices: 100 free in
+both, 9 in 2025.2 only (marked †) and 48 in 2026.1 only (marked ‡). Devices
+that share a die (a different speed grade, temperature grade, package, or
+feature subset such as CG/EG/EV) share its tile grid and bit database.
+
+The `generic/` flow covers 102 of them, on 29 distinct dies (see "Current
+status" above for how complete each database is); the others are listed
+under "Not yet covered".
 
 Which devices are free was checked per version (2026-09-29): in 2025.2 from
 the parts' `LICENSE` property (`Webpack`, or no licence for the older 7-series
-parts); in 2026.1, where every part reports `LICENSE=Full` and the tier is
-decided by the licence, by synthesising a small design on every installed
-device with the BASIC licence (all 148 installed devices pass) and taking a
-few of the larger ones through to a bitstream.
+parts, except XC7Z045, which synthesis rejects without a licence); in 2026.1,
+where every part reports `LICENSE=Full` and the tier is decided by the
+licence, by synthesising a small design on every installed device with the
+BASIC licence (all 148 installed devices pass) and taking a few of the larger
+ones through to a bitstream.
 
 In the lists below, devices separated by `;` are on different dies and devices
 separated by `,` share a die. The die that the flow fuzzes is named first.
@@ -172,9 +178,9 @@ used.
 
 ### Virtex UltraScale+
 
- * None. Virtex UltraScale+ devices are not free and are not targeted.
+ * None as such; the Alveo cards below use Virtex UltraScale+ dies.
 
-### Zynq UltraScale+ MPSoC (and the Kria devices on the same dies)
+### Zynq UltraScale+ MPSoC (and the Kria and Alveo devices on the same dies)
 
  * XAZU1EG, XCZU1CG, XCZU1EG
  * XAZU2EG, XAZU3EG, XCZU2CG, XCZU2EG, XCZU3CG, XCZU3EG, XCK24
@@ -182,8 +188,9 @@ used.
  * XCZU4CG, XCZU4EG, XCZU5CG, XCZU5EG
  * XAZU4EV, XAZU5EV, XCZU4EV, XCZU5EV
  * XCZU7CG, XCZU7EG
- * XAZU7EV, XCZU7EV
+ * XAZU7EV, XCZU7EV, XCU30†
  * XCK26 (Kria K26 SOM)
+ * XCU25† (Alveo)
 
 ## 7-series
 
@@ -196,25 +203,25 @@ used.
  * Zynq-7000: XA7Z010, XC7Z007S, XC7Z010; XC7Z012S, XC7Z015; XA7Z020,
    XC7Z014S, XC7Z020; XA7Z030, XC7Z030
 
-## Free in only one version
+## Not yet covered
 
-Free in Vivado 2025.2 only (not part of the 2026.1 install):
+Free parts the `generic/` flow does not build databases for yet (their dies
+have not been grouped or fuzzed):
 
- * Alveo: XCU25 (its own die, covered by the flow), XCU30 (on the XAZU7EV die),
-   XCU26, XCUX35, XCU50, XCU55C, XCU55N, XCU200, XCU250 (not targeted)
- * Versal: XCV80 (not targeted)
-
-Free in Vivado 2026.1 only (BASIC tier), not yet covered by the flow:
-
- * Spartan UltraScale+: XCSU10P, XCSU25P, XCSU35P, XASU35P, XCSU45P, XCSU60P,
+ * Spartan UltraScale+‡: XCSU10P, XCSU25P, XCSU35P, XASU35P, XCSU45P, XCSU60P,
    XCSU150P, XCSU200P (a new architecture family for the flow)
- * Kintex-7: XC7K325T, XC7K355T, XC7K410T, XC7K420T, XC7K480T (with -I/-L
+ * Kintex-7‡: XC7K325T, XC7K355T, XC7K410T, XC7K420T, XC7K480T (with -I/-L
    variants), XQ7K325T(L), XQ7K410T(L)
- * Zynq-7000: XC7Z035, XC7Z045, XC7Z100 (with -I variants), XQ7Z045, XQ7Z100
- * Zynq UltraScale+ MPSoC: XCZU6CG, XCZU6EG
- * Variants of devices on dies the flow already covers (by device name; the
+ * Zynq-7000‡: XC7Z035, XC7Z045, XC7Z100 (with -I variants), XQ7Z045, XQ7Z100
+ * Zynq UltraScale+ MPSoC‡: XCZU6CG, XCZU6EG
+ * Alveo† (Virtex UltraScale+, HBM and 58G dies; large, multi-SLR): XCU26,
+   XCUX35, XCU50, XCU55C, XCU55N, XCU200, XCU250
+ * Variants‡ of devices on dies the flow already covers (by device name; the
    die grouping has not been run with 2026.1): XA7K160T, XQ7A50T, XQ7A100T,
    XQ7A200T, XQ7Z020, XQ7Z030, XQKU5P, XQZU3EG, XQZU4EG, XQZU5EV, XQZU7EV
+
+The † parts are not part of the 2026.1 install, the ‡ parts not part of the
+2025.2 WebPACK edition. The Versal XCV80 (free in 2025.2) is not targeted.
 
 ## Boards
 
