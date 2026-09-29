@@ -1,8 +1,9 @@
 # Generic bitstream documentation flow
 
 This directory holds an architecture independent flow that documents the
-configuration bits of Xilinx 7-series, UltraScale and UltraScale+ devices
-using Vivado 2025.2 (any part available in the WebPACK edition).
+configuration bits and the timing of Xilinx 7-series, UltraScale and
+UltraScale+ devices, with Vivado 2025.2 or 2026.1 (every part of the free
+tier: WebPACK in 2025.2, BASIC in 2026.1).
 
 Unlike the hand written fuzzers in `fuzzers/`, nothing here is specific to a
 tile type: random designs are generated for every die, Vivado reports which
@@ -23,6 +24,7 @@ the bitstream.
 | Checking / decoding | `python/check.py` | undocumented bit report, FASM |
 | Tile grid A/B test | `tg_eval.sh <variant> <die> <tilegrid.json>` (single die DBs, `check.py`, `python/check_cmp.py`) | `build/tilegrid_exp/dbeval/{inst,<variant>}_<die>/` |
 | Bit encoding analysis | `python/explain_bit.py`, `python/bit_xtab.py` (features x bit values table) | stdout |
+| Timing data | `tcl/dump_timing.tcl`, run by `python/timing.py` | `build/timing/<Vivado version>/<arch>/<die>/` |
 
 ### Random designs
 
@@ -275,6 +277,52 @@ from the frame contents, and not part of any tile.
   summary in `<build>/ci/golden/<die>` (database content hash, check and
   prediction totals, per tile type changes).  Exit 0: identical, 1:
   changed, 2: failed; `-u` makes the results golden.
+
+## Vivado versions
+
+The flow runs with Vivado 2025.2 and 2026.1, and both are kept working.
+`URAY_VIVADO_SETTINGS` selects the Vivado (default
+`/opt/xilinx/Vivado/2025.2/settings64.sh`) for `run_designs.py`,
+`timing.py` and the metadata dumps.
+
+* 2025.2 needs no licence (WebPACK).
+* 2026.1 needs a licence file even for the free tier (BASIC, node locked to
+  a network interface, renewed yearly), so Vivado must see the host network
+  (no private network namespace).  It adds Spartan UltraScale+ to the free
+  parts.
+
+`runs/v2026_1_check.sh <dies>` runs the same design seeds with both versions
+and checks both against the databases (built from 2025.2 designs).  On
+xa7s15, xazu1eg and xcku025 (2026-09-29) the tile grids and tile / site type
+dumps are identical, 2026.1 bitstreams set the same bits within 0.3% and
+have the same or fewer undocumented bits and no unowned bits, and the
+failure modes (intermittent `route_design` crashes, xcku025 place/route
+failures) are the ones 2025.2 has.
+
+## Timing data
+
+`python/timing.py dump <die>` runs `tcl/dump_timing.tcl` (architecture
+independent: Vivado's speed models, no designs needed) and
+`python/timing.py json <die>` converts the output; `runs/timing_test.sh`
+makes test data for the CI dies (`DIES`, `GRADES=fuzz` to redo only the
+tile and site data).  Output in `build/timing/<Vivado version>/<arch>/<die>/`:
+
+* `speed_models/<n>.json`, `grades.json`: every speed model (delays: `FAST_MIN`
+  .. `SLOW_MAX`, `DELAY`; wire `WIRE_RES` / `WIRE_CAP`; pin `CAP`; switch
+  and buffer models) of every speed grade, one file per distinct table.
+* `tile_timing.npz`: the speed model of every pip and wire of every tile, per
+  tile type as the distinct rows of speed indices plus a tile -> row map.
+  7-series pips have one model per tile type; UltraScale(+) pips have
+  instance specific models (xcku025: 11880 INT tiles, all different;
+  xazu1eg: 21 tile types with per tile rows).
+* `site_timing.json`: per site type the site pin models and the timing arc
+  models (setup, hold, clock to out, ...) of every BEL.
+
+Sizes: xa7s15 0.6 MB, xazu1eg 4.9 MB, xcku025 8.1 MB of tile timing.  A die
+takes 1 (xa7s15) to 17 (xcku025) minutes, 4 GiB at most.  2025.2 and 2026.1
+give identical tile and site timing on the three test dies; the only speed
+model changes are four ICAP clock minimum pulse width models on xazu1eg
+(2.275 -> 1.75 ns).  Only test data exists so far (no full run).
 
 ## Configuration registers and bitstream options
 
