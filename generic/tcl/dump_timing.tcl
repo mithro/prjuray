@@ -1,8 +1,7 @@
 # Dump the timing model of a part: Vivado's speed models (delays, R/C
-# values), and for every tile the speed model index of its pips and wires
-# (grouped per tile type into variants), for every site type the speed
-# model index of its site pins and the
-# timing arc models of its BELs.  Architecture independent: only generic
+# values), and for every tile the speed model index of its pips and wires,
+# for every site type the speed model index of its site pins and the timing
+# arc models of its BELs.  Architecture independent: only generic
 # Vivado objects and properties are used.
 #
 #   vivado -mode batch -source dump_timing.tcl -tclargs <part> <outdir> [models]
@@ -12,10 +11,9 @@
 # (the same for every speed grade of a device).  Line formats (tab separated):
 #   speed_models.txt  M  name  speed_index  type  prop=value ...
 #   tile_timing.txt   T  tile_type  ntiles
-#                     V  pips|wires  variant          then its P or W lines
-#                     P  pip  speed_index             (pip name without tile)
-#                     W  wire  speed_index            (- if the tile lacks it)
-#                     A  pips|wires  tile  variant    (tile -> variant)
+#                     N  pips|wires  name ...          (names without tile)
+#                     R  tile  speed_index ...         (space separated, in
+#                                                        N order; -1 missing)
 #   site_timing.txt   S  site_type  site
 #                     I  site_pin  direction  speed_index
 #                     B  bel  bel_type  model ...  (NAME_INTERNAL of each)
@@ -51,10 +49,10 @@ proc strip {tile names} {
     return $out
 }
 
-# Speed models are per tile type on 7-series, but on UltraScale+ many pips
-# have instance specific models (different delays per tile).  So every tile
-# is read, tiles of a type are grouped by their speed index vector, and each
-# distinct vector ("variant") is written once, with a tile -> variant map.
+# Speed models are per tile type on 7-series, but on UltraScale(+) many
+# pips have instance specific models (xcku025: every INT tile differs).  So
+# every tile is written as one row of speed indices, in the order of the
+# type's name list; python/timing.py packs the rows into integer matrices.
 set f [open $outdir/tile_timing.txt w]
 puts $f "# part $part version [version -short]"
 set tiles_of [dict create]
@@ -66,48 +64,33 @@ foreach type [lsort [dict keys $tiles_of]] {
     set tiles [dict get $tiles_of $type]
     set t0 [lindex $tiles 0]
     puts $f [join [list T $type [llength $tiles]] "\t"]
-    foreach kind {pips wires} tag {P W} {
+    foreach kind {pips wires} {
         set names0 [strip $t0 [get_$kind -quiet -of_objects $t0]]
         if {![llength $names0]} continue
         set n0 [llength $names0]
         set first0 [lindex $names0 0]
         set last0 [lindex $names0 end]
-        set variants [dict create]
-        set assign {}
+        puts $f [join [concat N $kind $names0] "\t"]
         foreach t $tiles {
             set objs [get_$kind -quiet -of_objects $t]
             set idx {}
             if {[llength $objs]} { set idx [get_property SPEED_INDEX $objs] }
-            # Fast path (the per name strip and compare dominate the run
-            # time on large dies): same count and same first and last name
-            # means the same list in the same order.
+            # Fast path: same count and same first and last name means the
+            # same list in the same order (the per name strip is slow).
             set k [expr {[string length $t] + 1}]
-            if {[llength $objs] == $n0 &&
-                [string range [lindex $objs 0] $k end] eq $first0 &&
-                [string range [lindex $objs end] $k end] eq $last0} {
-                set names $names0
-            } else {
-                set names [strip $t $objs]
-            }
-            if {$names ne $names0} {
+            if {!([llength $objs] == $n0 &&
+                  [string range [lindex $objs 0] $k end] eq $first0 &&
+                  [string range [lindex $objs end] $k end] eq $last0)} {
                 # Different order or set: align to the first tile's names.
                 set d [dict create]
-                foreach n $names i $idx { dict set d $n $i }
+                foreach n [strip $t $objs] i $idx { dict set d $n $i }
                 set idx {}
                 foreach n $names0 {
-                    lappend idx [expr {[dict exists $d $n] ? [dict get $d $n] : "-"}]
+                    lappend idx [expr {[dict exists $d $n] ? [dict get $d $n] : -1}]
                 }
             }
-            if {![dict exists $variants $idx]} {
-                dict set variants $idx [dict size $variants]
-            }
-            lappend assign $t [dict get $variants $idx]
+            puts $f "R\t$t\t[join $idx " "]"
         }
-        dict for {idx v} $variants {
-            puts $f [join [list V $kind $v] "\t"]
-            foreach n $names0 i $idx { puts $f "$tag\t$n\t$i" }
-        }
-        foreach {t v} $assign { puts $f [join [list A $kind $t $v] "\t"] }
     }
 }
 close $f

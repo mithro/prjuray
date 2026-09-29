@@ -11,12 +11,13 @@ die's fuzz part, and the speed model table only for one part of every other
 speed grade (grade strings as Vivado lists them, e.g. -1, -1I, -2, -1LV).
 json converts the raw dump into
 
-  <out>/<arch>/<die>/tile_timing.json
-      {tile_type: {"pips"|"wires": {"names": [pip...],
-                                     "variants": [[model...]...],
-                                     "tiles": {tile: variant}}}}
-      (the model of names[i] in a tile is variants[tiles[tile]][i]; 7-series
-      has one variant per type, UltraScale+ has instance specific pip models)
+  <out>/<arch>/<die>/tile_timing.npz  (numpy, per tile type T and kind K
+      in pips/wires):  T:K:names  pip or wire names (without the tile),
+      T:K:tiles  tile names, T:K:variants  [n variants x n names] speed
+      indices (-1: the tile lacks it), T:K:tile_variant  variant of each
+      tile; model_index / model_name map speed indices to model names.
+      7-series has one variant per type; UltraScale(+) pips have instance
+      specific models (xcku025: every INT tile differs).
   <out>/<arch>/<die>/site_timing.json
       {site_type: {"pins": {pin: [direction, model]},
                    "bels": {bel: {"type": bel_type, "models": [model...]}}}}
@@ -39,6 +40,8 @@ import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
 
 import dies as dieslib
 
@@ -165,25 +168,49 @@ def to_json(die):
     def model(i):
         return by_index.get(int(i))
 
-    tiles = {}
-    tt = var = None
+    # Tile timing: one row of speed indices per tile, packed per tile type
+    # and kind into the distinct rows ("variants") and a tile -> variant map.
+    arrays = {}
+    stats = collections.Counter()
+
+    def flush(key, names, tile_names, rows):
+        if not rows:
+            return
+        m = np.stack(rows)
+        variants, inverse = np.unique(m, axis=0, return_inverse=True)
+        arrays[f'{key}:names'] = np.array(names)
+        arrays[f'{key}:tiles'] = np.array(tile_names)
+        arrays[f'{key}:variants'] = variants.astype(np.int32)
+        arrays[f'{key}:tile_variant'] = inverse.reshape(-1).astype(np.int32)
+        stats['entries'] += m.size
+        stats['types_multi'] += len(variants) > 1
+        stats['variants'] += len(variants)
+        known = np.isin(variants, list(by_index)) | (variants == -1)
+        stats['unknown'] += int((~known).sum())
+
+    key = names = None
+    tile_names, rows = [], []
     for line in open(os.path.join(raw, fuzz, 'tile_timing.txt')):
-        f = line.rstrip('\n').split('\t')
-        if f[0] == 'T':
-            tt = tiles.setdefault(f[1], {})
-        elif f[0] == 'V':
-            k = tt.setdefault(f[1], {'names': [], 'variants': [], 'tiles': {}})
-            var = []
-            k['variants'].append(var)
-            fill_names = int(f[2]) == 0
-        elif f[0] in ('P', 'W'):
-            if fill_names:
-                k['names'].append(f[1])
-            var.append(None if f[2] == '-' else model(f[2]))
-        elif f[0] == 'A':
-            tt[f[1]]['tiles'][f[2]] = int(f[3])
-    with open(os.path.join(dd, 'tile_timing.json'), 'w') as f:
-        json.dump(tiles, f, sort_keys=True)
+        if line[0] == 'R':
+            _, t, idx = line.rstrip('\n').split('\t')
+            tile_names.append(t)
+            rows.append(np.array(idx.split(), dtype=np.int64))
+        elif line[0] == 'T':
+            ttype = line.rstrip('\n').split('\t')[1]
+        elif line[0] == 'N':
+            flush(key, names, tile_names, rows)
+            f = line.rstrip('\n').split('\t')
+            key, names = f'{ttype}:{f[1]}', f[2:]
+            tile_names, rows = [], []
+    flush(key, names, tile_names, rows)
+    idx_items = sorted(by_index.items())
+    arrays['model_index'] = np.array([i for i, _ in idx_items], dtype=np.int32)
+    arrays['model_name'] = np.array([n for _, n in idx_items])
+    np.savez_compressed(os.path.join(dd, 'tile_timing.npz'), **arrays)
+    old = os.path.join(dd, 'tile_timing.json')  # earlier format
+    if os.path.exists(old):
+        os.remove(old)
+    tiles = {k.split(':')[0] for k in arrays if k.count(':') == 2}
 
     sites = {}
     for line in open(os.path.join(raw, fuzz, 'site_timing.txt')):
@@ -197,15 +224,11 @@ def to_json(die):
     with open(os.path.join(dd, 'site_timing.json'), 'w') as f:
         json.dump(sites, f, sort_keys=True)
 
-    pips = [t['pips'] for t in tiles.values() if 'pips' in t]
-    npips = sum(len(p['names']) for p in pips)
-    nopip = sum(1 for p in pips for v in p['variants'] for m in v if m is None)
-    multi = sum(1 for p in pips if len(p['variants']) > 1)
-    nvar = sum(len(p['variants']) for p in pips)
-    print(f'{die.name}: {len(tiles)} tile types ({npips} pips; {multi} types '
-          f'with per tile variants, {nvar} pip variants in all; {nopip} pip '
-          f'entries without a model), {len(sites)} site types, {len(grades)} '
-          f'speed grades in {len(tables)} distinct tables')
+    print(f'{die.name}: {len(tiles)} tile types ({stats["entries"]} pip/wire '
+          f'entries; {stats["types_multi"]} type/kinds with per tile variants, '
+          f'{stats["variants"]} variants in all; {stats["unknown"]} indices '
+          f'without a model), {len(sites)} site types, {len(grades)} speed '
+          f'grades in {len(tables)} distinct tables')
 
 
 def main():
