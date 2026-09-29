@@ -176,7 +176,7 @@ def to_json(die):
             var = []
             k['variants'].append(var)
             fill_names = int(f[2]) == 0
-        elif f[0] in 'PW':
+        elif f[0] in ('P', 'W'):
             if fill_names:
                 k['names'].append(f[1])
             var.append(None if f[2] == '-' else model(f[2]))
